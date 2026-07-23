@@ -1,0 +1,3 @@
+/home/cfenati/projects/MasterThesis/FullPipeline/OptrixThermalCamera/AcquireImg/oop/build/CMakeFiles/irimager_show_oop.dir
+/home/cfenati/projects/MasterThesis/FullPipeline/OptrixThermalCamera/AcquireImg/oop/build/CMakeFiles/edit_cache.dir
+/home/cfenati/projects/MasterThesis/FullPipeline/OptrixThermalCamera/AcquireImg/oop/build/CMakeFiles/rebuild_cache.dir

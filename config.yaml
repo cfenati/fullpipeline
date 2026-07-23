@@ -1,0 +1,30 @@
+output_dir: captures
+
+rgb:
+  cam1: /dev/v4l/by-path/pci-0000:67:00.0-usb-0:1.1.1:1.0-video-index0
+  cam2: /dev/v4l/by-path/pci-0000:67:00.0-usb-0:1.1.2:1.0-video-index0
+  width: 1280
+  height: 720
+  fps: 15
+
+thermal:
+  config_xml: OptrixThermalCamera/config/generic.xml
+  warmup_seconds: 3
+
+blackfly:
+  enabled: true
+  camera_index: 0
+  serial: null
+  timeout_ms: 1000
+  gain_auto: true
+  gain: null
+
+stability:
+  preview_interval_ms: 66
+  recover_rgb: true
+  recover_settle_s: 2.0
+  warmup_rgb: false
+  open_rgb_before_thermal: true
+
+gui:
+  window_size: "1400x920"
