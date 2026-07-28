@@ -2,3 +2,7 @@ numpy>=1.24
 opencv-python>=4.8
 Pillow>=10.0
 PyYAML>=6.0
+
+# Multi-camera rig design (design/, design_rig.py)
+pyvista>=0.44
+matplotlib>=3.7
