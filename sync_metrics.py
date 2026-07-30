@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import statistics
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Optional
 
@@ -22,6 +23,7 @@ class GrabTimings:
     rgb1_end_s: float
     rgb2_end_s: float
     blackfly_end_s: Optional[float] = None
+    parallel: bool = False
 
     @classmethod
     def from_stamps(
@@ -32,8 +34,17 @@ class GrabTimings:
         rgb1_end_s: float,
         rgb2_end_s: float,
         blackfly_end_s: Optional[float] = None,
+        parallel: bool = False,
     ) -> "GrabTimings":
-        return cls(origin_s, thermal_end_s, rgb_grab_end_s, rgb1_end_s, rgb2_end_s, blackfly_end_s)
+        return cls(
+            origin_s,
+            thermal_end_s,
+            rgb_grab_end_s,
+            rgb1_end_s,
+            rgb2_end_s,
+            blackfly_end_s,
+            parallel,
+        )
 
     def _ms(self, start: float, end: float) -> float:
         return round((end - start) * 1000.0, 3)
@@ -44,7 +55,12 @@ class GrabTimings:
             thermal_hw = int(thermal_frame.metadata.counterHW)
 
         payload = {
-            "grab_order": "thermal -> rgb_grab -> rgb1_retrieve -> rgb2_retrieve",
+            "grab_mode": "parallel" if self.parallel else "sequential",
+            "grab_order": (
+                "parallel(thermal, rgb_pair, blackfly)"
+                if self.parallel
+                else "thermal -> rgb_grab -> rgb1_retrieve -> rgb2_retrieve"
+            ),
             "durations_ms": {
                 "thermal_grab": self._ms(self.origin_s, self.thermal_end_s),
                 "rgb_grab": self._ms(self.thermal_end_s, self.rgb_grab_end_s),
@@ -79,28 +95,16 @@ class GrabTimings:
         return payload
 
 
-def grab_all_timed(
+def _grab_rgb_pair_timed(
     cam1: RGBCamera,
     cam2: RGBCamera,
-    thermal: ThermalCamera,
-    blackfly: Optional[BlackflyCamera] = None,
-) -> tuple[
-    Optional[object],
-    Optional[object],
-    Optional[ThermalFrame],
-    Optional[np.ndarray],
-    GrabTimings,
-]:
+) -> tuple[Optional[object], Optional[object], float, float, float, float]:
     origin_s = time.perf_counter()
-
-    thermal_frame = thermal.grab()
-    thermal_end_s = time.perf_counter()
-
     frame1 = None
     frame2 = None
-    rgb_grab_end_s = thermal_end_s
-    rgb1_end_s = thermal_end_s
-    rgb2_end_s = thermal_end_s
+    rgb_grab_end_s = origin_s
+    rgb1_end_s = origin_s
+    rgb2_end_s = origin_s
 
     for _ in range(GRAB_PAIR_MAX_ATTEMPTS):
         if cam1.grab_only() and cam2.grab_only():
@@ -116,6 +120,90 @@ def grab_all_timed(
         rgb1_end_s = rgb_grab_end_s
         rgb2_end_s = rgb_grab_end_s
 
+    return frame1, frame2, origin_s, rgb_grab_end_s, rgb1_end_s, rgb2_end_s
+
+
+def grab_all_timed(
+    cam1: RGBCamera,
+    cam2: RGBCamera,
+    thermal: ThermalCamera,
+    blackfly: Optional[BlackflyCamera] = None,
+    parallel: bool = True,
+) -> tuple[
+    Optional[object],
+    Optional[object],
+    Optional[ThermalFrame],
+    Optional[np.ndarray],
+    GrabTimings,
+]:
+    if not parallel:
+        return _grab_all_timed_sequential(cam1, cam2, thermal, blackfly)
+
+    origin_s = time.perf_counter()
+    thermal_frame: Optional[ThermalFrame] = None
+    frame1 = None
+    frame2 = None
+    blackfly_frame = None
+    thermal_end_s = origin_s
+    rgb_grab_end_s = origin_s
+    rgb1_end_s = origin_s
+    rgb2_end_s = origin_s
+    blackfly_end_s = None
+
+    def grab_thermal() -> None:
+        nonlocal thermal_frame, thermal_end_s
+        thermal_frame = thermal.grab()
+        thermal_end_s = time.perf_counter()
+
+    def grab_rgb() -> None:
+        nonlocal frame1, frame2, rgb_grab_end_s, rgb1_end_s, rgb2_end_s
+        frame1, frame2, _, rgb_grab_end_s, rgb1_end_s, rgb2_end_s = _grab_rgb_pair_timed(
+            cam1, cam2
+        )
+
+    def grab_blackfly() -> None:
+        nonlocal blackfly_frame, blackfly_end_s
+        blackfly_frame = blackfly.grab()
+        blackfly_end_s = time.perf_counter()
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = [executor.submit(grab_thermal), executor.submit(grab_rgb)]
+        if blackfly is not None:
+            futures.append(executor.submit(grab_blackfly))
+        for future in futures:
+            future.result()
+
+    timings = GrabTimings.from_stamps(
+        origin_s,
+        thermal_end_s,
+        rgb_grab_end_s,
+        rgb1_end_s,
+        rgb2_end_s,
+        blackfly_end_s,
+        parallel=True,
+    )
+    return frame1, frame2, thermal_frame, blackfly_frame, timings
+
+
+def _grab_all_timed_sequential(
+    cam1: RGBCamera,
+    cam2: RGBCamera,
+    thermal: ThermalCamera,
+    blackfly: Optional[BlackflyCamera] = None,
+) -> tuple[
+    Optional[object],
+    Optional[object],
+    Optional[ThermalFrame],
+    Optional[np.ndarray],
+    GrabTimings,
+]:
+    origin_s = time.perf_counter()
+    thermal_frame = thermal.grab()
+    thermal_end_s = time.perf_counter()
+    frame1, frame2, _, rgb_grab_end_s, rgb1_end_s, rgb2_end_s = _grab_rgb_pair_timed(
+        cam1, cam2
+    )
+
     blackfly_frame = None
     blackfly_end_s = None
     if blackfly is not None:
@@ -129,6 +217,7 @@ def grab_all_timed(
         rgb1_end_s,
         rgb2_end_s,
         blackfly_end_s,
+        parallel=False,
     )
     return frame1, frame2, thermal_frame, blackfly_frame, timings
 
@@ -138,6 +227,7 @@ def format_timings(timings: GrabTimings, thermal_frame: Optional[ThermalFrame] =
     pair = data["pair_offsets_ms"]
     durations = data["durations_ms"]
     return (
+        f"mode={data['grab_mode']} | "
         f"spread={data['spread_ms']:.1f} ms | "
         f"rgb1-rgb2={pair['rgb1_vs_rgb2']:.1f} ms | "
         f"thermal-rgb1={pair['thermal_vs_rgb1']:.1f} ms | "
