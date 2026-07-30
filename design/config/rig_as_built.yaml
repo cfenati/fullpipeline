@@ -1,0 +1,55 @@
+# As-built geometry: measured extrinsics instead of design intent.
+#
+# This is an overlay. Everything not restated here - intrinsics, target,
+# analysis settings, the thermal camera - is inherited from rig.yaml, so the two
+# files cannot drift apart. Run it with:
+#     python design_rig.py --rig design/config/rig_as_built.yaml info
+#
+# Source: auto-updated by stereo_calibrate.py (rgb_cam1/rgb_cam2)
+#   views used              21
+#   stereo RMS              0.678 px
+#   epipolar RMS            0.509 px
+#   baseline                51.25 mm
+#   optical axis angle      22.29 deg
+#
+#   rgb_cam2 is 32.4 mm from its designed position;
+#   baseline is 51.3 mm rather than 80.0 mm.
+#
+# rgb_cam1 is the world-frame anchor (its pose restates the design
+# intent). Cameras without a measured pair keep their design poses via extends.
+
+extends: rig.yaml
+name: rgb2_thermal1_as_built
+cameras:
+- name: rgb_cam1
+  pose:
+    position:
+    - -0.04
+    - 0.0
+    - 0.282
+    R:
+    - - 0.0
+      - -0.987139589
+      - 0.159860662
+    - - -1.0
+      - -0.0
+      - 0.0
+    - - 0.0
+      - -0.159860662
+      - -0.987139589
+- name: rgb_cam2
+  pose:
+    position:
+    - 0.009864
+    - 0.001922
+    - 0.270311
+    R:
+    - - -0.080242686
+      - 0.970791182
+      - -0.226109693
+    - - 0.996775284
+      - 0.078064552
+      - -0.018573053
+    - - -0.000379405
+      - -0.226870905
+      - -0.973924765

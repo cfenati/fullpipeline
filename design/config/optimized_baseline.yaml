@@ -1,0 +1,30 @@
+extends: /home/cfenati/projects/MasterThesis/FullPipeline/design/config/rig_as_built.yaml
+name: rgb2_thermal1_as_built_optimised
+cameras:
+- name: rgb_cam1
+  pose:
+    position:
+    - -0.059946
+    - -0.000769
+    - 0.276155
+    azimuth_deg: 0.7348
+    elevation_deg: -78.8441
+    roll_deg: -0.0
+- name: rgb_cam2
+  pose:
+    position:
+    - 0.02981
+    - 0.002691
+    - 0.276155
+    azimuth_deg: -174.8421
+    elevation_deg: -78.8441
+    roll_deg: 0.0
+- name: thermal
+  pose:
+    position:
+    - 0.0
+    - 0.0
+    - 0.285
+    azimuth_deg: 0.0
+    elevation_deg: -90.0
+    roll_deg: -90.0

@@ -1,0 +1,30 @@
+extends: rig_as_built.yaml
+name: rgb2_thermal1_as_built_optimised
+cameras:
+- name: rgb_cam1
+  pose:
+    position:
+    - -0.074955
+    - -0.001349
+    - 0.3
+    azimuth_deg: 1.0307
+    elevation_deg: -74.204
+    roll_deg: -0.0
+- name: rgb_cam2
+  pose:
+    position:
+    - 0.044955
+    - 0.003278
+    - 0.3
+    azimuth_deg: -175.8301
+    elevation_deg: -80.3468
+    roll_deg: 0.0
+- name: thermal
+  pose:
+    position:
+    - 0.0
+    - 0.0
+    - 0.308849
+    azimuth_deg: 0.0
+    elevation_deg: -90.0
+    roll_deg: -90.0

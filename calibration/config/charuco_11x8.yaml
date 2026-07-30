@@ -1,0 +1,17 @@
+# ChArUco target used for the RGB / thermal / Blackfly calibration captures.
+# Detected in captures/calib_rgb1: DICT_4X4_50, 44 markers (ids 0-43), 11x8 squares.
+target_type: charuco
+squares_x: 11
+squares_y: 8
+
+# Physical print size. Intrinsics (focal length, principal point, distortion) are
+# scale invariant, so only board/camera pose translations depend on these values.
+# Marker side measured at 0.72 of the square via per-view homography.
+square_size_m: 0.004
+marker_size_m: 0.002933
+
+dictionary: DICT_4X4_50
+
+# Boards generated before OpenCV 4.6 place the markers with the pre-4.6 layout.
+# This board does: detection yields 32/33 usable views with true, 5/33 with false.
+legacy_pattern: true
