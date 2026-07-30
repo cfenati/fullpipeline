@@ -7,13 +7,13 @@ Each stage of the workflow has exactly one command-line entry point:
 
 | Stage | Script | What it produces |
 | --- | --- | --- |
-| Design the rig | `design_rig.py` | coverage / stereo / lens studies, poses, STLs |
 | Check the hardware | `check_cameras.py` | pass/fail per camera |
 | Capture | `capture_pipeline.py` | `captures/<session>/<timestamp>/` |
 | Color uniformity | `check_color.py` | uniformity plots + flat-field gain maps |
 | Intrinsics | `calibrate_cameras.py` | `calibration/results/<camera>/intrinsics.json` |
 | Clean up a calibration set | `prune_calibration.py` | deletes the worst capture sessions |
-| Extrinsics | `stereo_calibrate.py` | `calibration/results/stereo_<a>_<b>/extrinsics.json` |
+| Extrinsics | `stereo_calibrate.py` | `calibration/results/stereo_<a>_<b>/extrinsics.json` (+ updates `rig_as_built.yaml`) |
+| Evaluate / optimize the rig | `design_rig.py` | coverage / stereo / lens studies on the measured geometry |
 
 Everything reads defaults from `config.yaml`, so most commands run with no
 arguments at all. Command-line flags always win over the config file.
@@ -43,6 +43,10 @@ If you only want the geometry study in `design_rig.py`, `numpy`, `matplotlib`,
 
 ## Typical order of operations
 
+Calibrate first (intrinsics → extrinsics), then evaluate or optimize the
+measured rig. `design_rig.py` is last: it consumes `rig_as_built.yaml` written
+by stereo calibration.
+
 ```bash
 python check_cameras.py                                        # 1. hardware alive?
 python capture_pipeline.py --output calib_rgb1                 # 2. shoot the board
@@ -51,8 +55,9 @@ python prune_calibration.py --camera rgb_cam1 --count 5        # 4. drop bad vie
 python prune_calibration.py --camera rgb_cam1 --count 5 --apply
 python calibrate_cameras.py --camera rgb_cam1                  # 5. re-fit on the clean set
 python calibrate_cameras.py --camera rgb_cam2                  # 6. same for the other camera
-python stereo_calibrate.py --camera-a rgb_cam1 --camera-b rgb_cam2   # 7. extrinsics
-python design_rig.py report                                    # 8. what the rig can do
+python stereo_calibrate.py --camera-a rgb_cam1 --camera-b rgb_cam2   # 7. extrinsics (+ rig_as_built.yaml)
+python design_rig.py --rig design/config/rig_as_built.yaml report     # 8. evaluate measured geometry
+python design_rig.py --rig design/config/rig_as_built.yaml optimize   # 9. refine baseline / height / aim
 ```
 
 ---
@@ -283,21 +288,22 @@ paste over `design/config/rig.yaml`), the figures `fit_quality.png`,
 
 ---
 
-## 7. `design_rig.py` — design and evaluate the rig geometry
+## 7. `design_rig.py` — evaluate and optimize the measured rig
 
-Pure geometry, no hardware. Reads a rig YAML and answers what the cameras cover,
-what a lens change would do, and where to put things. Every subcommand accepts
-the global flags `--rig <yaml>` (default `design/config/rig.yaml`), `--out <dir>`
-(default `design/out`), `--voxel <m>` and `--style frustum|pyramid`.
+Run this **after** intrinsics and stereo calibration. Pure geometry, no hardware:
+it reads a rig YAML (normally `design/config/rig_as_built.yaml`, auto-updated by
+`stereo_calibrate.py`) and answers what the cameras cover, what a layout change
+would do, and where to move things. Every subcommand accepts the global flags
+`--rig <yaml>` (default `design/config/rig.yaml`), `--out <dir>` (default
+`design/out`), `--voxel <m>` and `--style frustum|pyramid`.
 
 ```bash
-python design_rig.py info                       # intrinsics, FOV, GSD, coverage
-python design_rig.py optics                     # where each intrinsic comes from + datasheet cross-check
-python design_rig.py view                       # interactive 3D frustum editor
-python design_rig.py plot --multiview --save    # static 2x2 figure to design/out/rig_views.png
-python design_rig.py report --render            # text report + analysis figures
-python design_rig.py export                     # poses (JSON/CSV/YAML) + frustum STLs
-python design_rig.py --rig design/config/rig_as_built.yaml info    # evaluate the measured rig
+python design_rig.py --rig design/config/rig_as_built.yaml info
+python design_rig.py --rig design/config/rig_as_built.yaml optics
+python design_rig.py --rig design/config/rig_as_built.yaml view
+python design_rig.py --rig design/config/rig_as_built.yaml report --render
+python design_rig.py --rig design/config/rig_as_built.yaml optimize
+python design_rig.py --rig design/config/rig_as_built.yaml export
 ```
 
 | Subcommand | Key flags |
@@ -309,27 +315,29 @@ python design_rig.py --rig design/config/rig_as_built.yaml info    # evaluate th
 | `report` | `--render`, `--coverage`, `--common` |
 | `export` | `--no-stl` |
 | `lens` | `--camera thermal`, `--focal 5 7.7 12`, `--pitch 17`, `--from-focal` |
-| `stereo` | `--cameras A B`, `--axis x\|y`, `--baseline MIN MAX` (mm), `--standoff MIN MAX` (m), `--triangulation MIN MAX` (deg), `--steps N` |
+| `optimize` (`stereo`) | `--cameras A B`, `--baseline MIN MAX` (mm), `--height MIN MAX` (m), `--elevation MIN MAX` (deg), `--aim look-at\|elevation\|hold`, `--triangulation MIN MAX`, `--steps N`, `--write PATH` |
 | `sweep` | positional `param start stop`, then `--steps`, `--camera`, `--look-at-target` |
 
 More examples:
 
 ```bash
-python design_rig.py lens                                  # the four Optris Xi 400 lenses
+python design_rig.py --rig design/config/rig_as_built.yaml optimize \
+    --baseline 40 120 --height 0.25 0.32 --steps 7 \
+    --write design/config/rig_optimized.yaml
+python design_rig.py --rig design/config/rig_as_built.yaml optimize \
+    --aim elevation --baseline 51.3 51.3 --height 0.276 0.276 \
+    --elevation -90 -60
 python design_rig.py lens --camera rgb_cam1 --focal 5 6.5 8 12
-python design_rig.py stereo --axis x --baseline 40 200 --standoff 0.2 0.45
-python design_rig.py stereo --triangulation 10 35 --steps 9
 python design_rig.py sweep z 0.25 0.40 --steps 10 --camera thermal
-python design_rig.py sweep elevation -90 -45 --camera thermal
 ```
 
 `sweep` varies one degree of freedom of one camera: `x`, `y`, `z` and `far` are
 in metres, `azimuth`, `elevation` and `roll` in degrees.
 
-Poses in `rig.yaml` are the geometry you *intend* to build, so every coverage and
-registration number is a prediction. Once the rig exists, paste the pose blocks
-from `stereo_calibrate.py`'s `rig_pose.yaml` into the rig file (or use
-`design/config/rig_as_built.yaml`) to re-run the same studies against reality.
+`design/config/rig.yaml` is the *intended* geometry (useful for what-if studies
+before hardware exists). After calibration, prefer
+`design/config/rig_as_built.yaml`: stereo writes measured RGB poses into it, and
+`optimize` / `report` / `view` should be run against that file.
 
 ---
 
