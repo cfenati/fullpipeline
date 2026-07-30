@@ -3,24 +3,65 @@ output_dir: captures
 rgb:
   cam1: /dev/v4l/by-path/pci-0000:67:00.0-usb-0:1.1.1:1.0-video-index0
   cam2: /dev/v4l/by-path/pci-0000:67:00.0-usb-0:1.1.2:1.0-video-index0
-  width: 1280
-  height: 720
-  fps: 15
+  # Full IMX298 sensor (MJPG). At 4656x3496 the camera tops out at 10 fps;
+  # 30 fps is only available up to 2320x1744.
+  width: 4656
+  height: 3496
+  fps: 10
+  # GUI/live preview only — saved captures stay at width x height above.
+  preview_max_width: 1280
+  color_correction:
+    enabled: true
+    blur_sigma_fraction: 0.08
+    border_fraction: 0.12
+    # Partial correction avoids blue/color blow-out at borders on real objects.
+    strength: 1.0
+    max_gain: 1.6
+    min_gain: 0.85
+    neutralize_white: false
+    preview_corrected: true
+    on_the_fly_fallback: true
+    # Generate with: python check_color.py --image <white_ref.jpg> --save-flat-field
+    flat_field_cam1: color_calibration/rgb_cam1_flat_field.npz
+    flat_field_cam2: color_calibration/rgb_cam2_flat_field.npz
+
+geometric_calibration:
+  # Generate with: python calibrate_cameras.py --captures captures/calib_rgb1 --camera rgb_cam1
+  board: calibration/config/charuco_11x8.yaml
+  output_dir: calibration/results
+  intrinsics_rgb_cam1: calibration/results/rgb_cam1/intrinsics.json
+  intrinsics_rgb_cam2: calibration/results/rgb_cam2/intrinsics.json
+  # Sessions used by stereo_calibrate.py, which needs the board visible in both
+  # cameras at the same instant. An intrinsics set can be reused - every camera of
+  # a trigger goes into one session folder - but only by accident: a set aimed at
+  # covering one camera's own frame pushes the board to the edges, which is where
+  # the other camera loses it. A folder recorded for the pair, board central and at
+  # several distances, is the one that gives a good extrinsic fit.
+  # Generate with: python stereo_calibrate.py --camera-a rgb_cam1 --camera-b rgb_cam2
+  stereo_captures:
+    - captures/calib_rgb1
+  extrinsics_rgb_cam1_rgb_cam2: calibration/results/stereo_rgb_cam1_rgb_cam2/extrinsics.json
 
 thermal:
   config_xml: OptrixThermalCamera/config/generic.xml
-  warmup_seconds: 3
+  warmup_seconds: 1
 
 blackfly:
   enabled: true
   camera_index: 0
   serial: null
   timeout_ms: 1000
+  # null = do not cap AcquisitionFrameRate (camera runs at its max for the mode).
+  # Saves always use full sensor; preview_max_width only affects the GUI stream.
+  max_fps: null
+  preview_max_width: 1280
+  stream_newest_only: true
   gain_auto: true
   gain: null
 
 stability:
-  preview_interval_ms: 66
+  preview_interval_ms: 33
+  parallel_grab: true
   recover_rgb: true
   recover_settle_s: 2.0
   warmup_rgb: false

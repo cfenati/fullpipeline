@@ -20,6 +20,7 @@ from cameras.blackfly_camera import BlackflyCamera
 from cameras.rgb_camera import RGBCamera
 from cameras.thermal_camera import ThermalCamera, ThermalFrame
 from gui import CaptureGUI
+from color_correction import RGBColorCorrector, load_rgb_color_corrector
 from sync_metrics import (
     GrabTimings,
     SyncSummary,
@@ -41,6 +42,39 @@ def load_config(config_path: Path) -> dict:
         PROJECT_ROOT / config["thermal"]["config_xml"]
     ).resolve()
     return config
+
+
+def preview_frame(
+    frame: Optional[np.ndarray],
+    max_width: Optional[int],
+) -> Optional[np.ndarray]:
+    """Downscale a frame for the GUI only; capture/save paths keep full resolution."""
+    if frame is None or not max_width:
+        return frame
+    height, width = frame.shape[:2]
+    if width <= max_width:
+        return frame
+    scale = max_width / float(width)
+    return cv2.resize(
+        frame,
+        (max(1, int(width * scale)), max(1, int(height * scale))),
+        interpolation=cv2.INTER_AREA,
+    )
+
+
+def resolve_capture_output_dir(base_output_dir: Path, output: Optional[str]) -> Path:
+    """Resolve --output to a directory under captures (or an absolute path)."""
+    if not output:
+        return base_output_dir
+
+    path = Path(output).expanduser()
+    if path.is_absolute():
+        return path.resolve()
+
+    if path.parts and path.parts[0] == "captures":
+        return (PROJECT_ROOT / path).resolve()
+
+    return (base_output_dir / path).resolve()
 
 
 class TerminalInput:
@@ -140,6 +174,9 @@ def open_blackfly(config: dict) -> Optional[BlackflyCamera]:
         timeout_ms=int(blackfly_config.get("timeout_ms", 1000)),
         gain_auto=bool(blackfly_config.get("gain_auto", False)),
         gain=blackfly_config.get("gain"),
+        max_fps=blackfly_config.get("max_fps"),
+        preview_max_width=blackfly_config.get("preview_max_width", 1280),
+        stream_newest_only=bool(blackfly_config.get("stream_newest_only", True)),
     )
     blackfly.open()
     return blackfly
@@ -152,6 +189,7 @@ def get_stability_config(config: dict) -> dict:
         "recover_settle_s": 2.0,
         "warmup_rgb": False,
         "open_rgb_before_thermal": True,
+        "parallel_grab": True,
     }
     return {**defaults, **config.get("stability", {})}
 
@@ -206,6 +244,7 @@ def save_capture(
     sync_timings: Optional[GrabTimings] = None,
     blackfly_frame: Optional[np.ndarray] = None,
     blackfly: Optional[BlackflyCamera] = None,
+    color_corrector: Optional[RGBColorCorrector] = None,
 ) -> Path:
     session_dir = output_dir / timestamp
     session_dir.mkdir(parents=True, exist_ok=True)
@@ -218,8 +257,14 @@ def save_capture(
     thermal_temp_npy_path = session_dir / "thermal_temperature.npy"
     metadata_path = session_dir / "metadata.json"
 
-    cv2.imwrite(str(rgb1_path), frame1, JPEG_PARAMS)
-    cv2.imwrite(str(rgb2_path), frame2, JPEG_PARAMS)
+    save_frame1 = frame1
+    save_frame2 = frame2
+    if color_corrector is not None:
+        save_frame1 = color_corrector.correct_cam1(frame1)
+        save_frame2 = color_corrector.correct_cam2(frame2)
+
+    cv2.imwrite(str(rgb1_path), save_frame1, JPEG_PARAMS)
+    cv2.imwrite(str(rgb2_path), save_frame2, JPEG_PARAMS)
     if blackfly_frame is not None:
         cv2.imwrite(str(blackfly_path), blackfly_frame, JPEG_PARAMS)
 
@@ -243,6 +288,9 @@ def save_capture(
         "rgb": {
             "cam1": cam1.info(),
             "cam2": cam2.info(),
+            "color_correction": (
+                color_corrector.info() if color_corrector is not None else None
+            ),
         },
         "thermal": {
             **thermal.info(),
@@ -286,6 +334,7 @@ def grab_all(
     cam2: RGBCamera,
     thermal: ThermalCamera,
     blackfly: Optional[BlackflyCamera] = None,
+    parallel: bool = True,
 ) -> Tuple[
     Optional[np.ndarray],
     Optional[np.ndarray],
@@ -294,7 +343,7 @@ def grab_all(
     GrabTimings,
 ]:
     frame1, frame2, thermal_frame, blackfly_frame, timings = grab_all_timed(
-        cam1, cam2, thermal, blackfly
+        cam1, cam2, thermal, blackfly, parallel=parallel
     )
     return frame1, frame2, thermal_frame, blackfly_frame, timings
 
@@ -423,16 +472,19 @@ def run_pipeline(
     show_preview: bool = True,
     sync_metrics: bool = False,
     sync_print: bool = False,
+    output: Optional[str] = None,
 ) -> int:
     config = load_config(config_path)
-    output_dir = config["output_dir"]
+    output_dir = resolve_capture_output_dir(config["output_dir"], output)
     output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Capture output: {output_dir}")
     stability = get_stability_config(config)
 
     cam1 = cam2 = thermal = blackfly = None
     gui: Optional[CaptureGUI] = None
     last_auto_capture = 0.0
     blackfly_enabled = get_blackfly_config(config) is not None
+    color_corrector = load_rgb_color_corrector(config, PROJECT_ROOT)
 
     try:
         if show_preview:
@@ -474,19 +526,37 @@ def run_pipeline(
         preview_interval_s = stability["preview_interval_ms"] / 1000.0
         recover_rgb = stability["recover_rgb"]
         recover_settle_s = stability["recover_settle_s"]
+        parallel_grab = stability["parallel_grab"]
 
         try:
             while True:
+                loop_start_s = time.perf_counter()
                 if gui is not None and not gui.is_open():
                     print("GUI closed.")
                     break
 
                 frame1, frame2, thermal_frame, blackfly_frame, grab_timings = grab_all(
-                    cam1, cam2, thermal, blackfly
+                    cam1,
+                    cam2,
+                    thermal,
+                    blackfly,
+                    parallel=parallel_grab,
                 )
 
                 if gui is not None:
-                    gui.update_frames(frame1, frame2, thermal_frame, blackfly_frame)
+                    preview_max_width = config["rgb"].get("preview_max_width")
+                    preview_frame1 = preview_frame(frame1, preview_max_width)
+                    preview_frame2 = preview_frame(frame2, preview_max_width)
+                    if color_corrector is not None:
+                        preview_frame1, preview_frame2 = color_corrector.preview_frames(
+                            preview_frame1, preview_frame2
+                        )
+                    gui.update_frames(
+                        preview_frame1,
+                        preview_frame2,
+                        thermal_frame,
+                        blackfly_frame,
+                    )
 
                 if blackfly is not None and blackfly_frame is None:
                     blackfly_miss_count += 1
@@ -543,6 +613,15 @@ def run_pipeline(
 
                 if should_capture:
                     timestamp = time.strftime("%Y%m%d_%H%M%S")
+                    save_blackfly_frame = blackfly_frame
+                    if (
+                        blackfly is not None
+                        and blackfly.preview_max_width
+                        and blackfly_frame is not None
+                    ):
+                        full_res_frame = blackfly.grab(full_resolution=True)
+                        if full_res_frame is not None:
+                            save_blackfly_frame = full_res_frame
                     session_dir = save_capture(
                         output_dir,
                         timestamp,
@@ -553,8 +632,9 @@ def run_pipeline(
                         cam2,
                         thermal,
                         sync_timings=grab_timings if sync_metrics else None,
-                        blackfly_frame=blackfly_frame,
+                        blackfly_frame=save_blackfly_frame,
                         blackfly=blackfly,
+                        color_corrector=color_corrector,
                     )
                     if sync_print:
                         print(format_timings(grab_timings, thermal_frame))
@@ -566,7 +646,11 @@ def run_pipeline(
                 if should_quit:
                     break
 
-                time.sleep(preview_interval_s)
+                if preview_interval_s > 0:
+                    elapsed_s = time.perf_counter() - loop_start_s
+                    remaining_s = preview_interval_s - elapsed_s
+                    if remaining_s > 0:
+                        time.sleep(remaining_s)
         finally:
             if terminal_input is not None:
                 terminal_input.__exit__(None, None, None)
@@ -640,6 +724,15 @@ def parse_args() -> argparse.Namespace:
         help="Optional JSON output path for --sync-test summary",
     )
     parser.add_argument(
+        "--output",
+        default=None,
+        help=(
+            "Subfolder under captures/ for saved sessions "
+            "(e.g. --output experiment1 -> captures/experiment1/<timestamp>/). "
+            "Absolute paths are also accepted."
+        ),
+    )
+    parser.add_argument(
         "--sync-metrics",
         action="store_true",
         help="Store per-capture grab timings in metadata.json",
@@ -684,6 +777,7 @@ def main() -> int:
         show_preview=show_preview,
         sync_metrics=sync_metrics,
         sync_print=sync_print,
+        output=args.output,
     )
 
 
