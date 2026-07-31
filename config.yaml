@@ -42,6 +42,13 @@ geometric_calibration:
     - captures/calib_rgb1
   extrinsics_rgb_cam1_rgb_cam2: calibration/results/stereo_rgb_cam1_rgb_cam2/extrinsics.json
 
+registration:
+  # Generate with: python register_pipeline.py --session captures/<session>
+  output_dir: registration/results
+  # Working-plane hint for stereo matching and fallback fill (metres).
+  default_depth: 0.30
+  rig: design/config/rig_as_built.yaml
+
 thermal:
   config_xml: OptrixThermalCamera/config/generic.xml
   warmup_seconds: 1

@@ -97,23 +97,6 @@ ELP_USB16MP01 = Sensor("Sony IMX298 (1/2.8 in)", 4656, 3496, 1.12)
 ELP_USB16MP01_ZOOM_MM: Tuple[float, float] = (5.0, 50.0)
 
 
-def optris_lens(label_or_focal) -> Lens:
-    """Look up an Xi 400 lens by label (``"29x22"``) or focal length (``12.7``)."""
-    key = str(label_or_focal)
-    for lens in OPTRIS_XI400_LENSES:
-        if lens.label == key or abs(lens.focal_mm - _as_float(key)) < 1e-6:
-            return lens
-    raise KeyError(f"unknown Xi 400 lens {label_or_focal!r}; have "
-                   f"{[l.label for l in OPTRIS_XI400_LENSES]}")
-
-
-def _as_float(value: str) -> float:
-    try:
-        return float(value)
-    except ValueError:
-        return float("nan")
-
-
 # --------------------------------------------------------------------------- #
 # Conversions
 # --------------------------------------------------------------------------- #
@@ -131,22 +114,6 @@ def fov_from_focal(sensor: Sensor, focal_mm: float,
     half_h = h_px * sensor.pitch_um / 2000.0
     return (float(np.degrees(2 * np.arctan(half_w / focal_mm))),
             float(np.degrees(2 * np.arctan(half_h / focal_mm))))
-
-
-def focal_from_fov(sensor: Sensor, hfov_deg: float,
-                   resolution: Optional[Sequence[int]] = None) -> float:
-    """Focal length in mm implied by a horizontal field of view."""
-    w_px = sensor.width_px if resolution is None else int(resolution[0])
-    half_w = w_px * sensor.pitch_um / 2000.0
-    return float(half_w / np.tan(np.radians(hfov_deg) / 2.0))
-
-
-def focal_from_fx(sensor: Sensor, fx_px: float) -> float:
-    """Focal length in mm from a calibrated ``fx``, at the sensor's native pitch.
-
-    ``fx`` must be expressed in pixels of that pitch, i.e. at full resolution.
-    """
-    return float(fx_px * sensor.pitch_um / 1000.0)
 
 
 def zoom_table(sensor: Sensor, focal_lengths: Sequence[float],

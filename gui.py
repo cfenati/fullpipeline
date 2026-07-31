@@ -35,11 +35,9 @@ class CaptureGUI:
     def __init__(
         self,
         output_dir: Path,
-        capture_once: bool = False,
         window_size: str = "1400x920",
     ) -> None:
         self.output_dir = output_dir
-        self.capture_once = capture_once
         self._closed = False
         self._save_requested = False
         self._quit_requested = False
@@ -79,13 +77,6 @@ class CaptureGUI:
             text="Open Output Folder",
             command=self.open_output_folder,
         ).pack(side=tk.LEFT, padx=(0, 6))
-
-        if self.capture_once:
-            ttk.Button(
-                toolbar,
-                text="Save && Quit",
-                command=self.request_save_and_quit,
-            ).pack(side=tk.LEFT, padx=(0, 6))
 
         ttk.Button(
             toolbar,
@@ -149,10 +140,6 @@ class CaptureGUI:
         self._save_requested = True
 
     def request_quit(self) -> None:
-        self._quit_requested = True
-
-    def request_save_and_quit(self) -> None:
-        self._save_requested = True
         self._quit_requested = True
 
     def consume_save_request(self) -> bool:

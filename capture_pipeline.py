@@ -467,8 +467,6 @@ def smoke_test(config_path: Path) -> int:
 
 def run_pipeline(
     config_path: Path,
-    capture_once: bool = False,
-    interval: Optional[float] = None,
     show_preview: bool = True,
     sync_metrics: bool = False,
     sync_print: bool = False,
@@ -482,7 +480,6 @@ def run_pipeline(
 
     cam1 = cam2 = thermal = blackfly = None
     gui: Optional[CaptureGUI] = None
-    last_auto_capture = 0.0
     blackfly_enabled = get_blackfly_config(config) is not None
     color_corrector = load_rgb_color_corrector(config, PROJECT_ROOT)
 
@@ -491,7 +488,6 @@ def run_pipeline(
             window_size = config.get("gui", {}).get("window_size", "1400x920")
             gui = CaptureGUI(
                 output_dir=output_dir,
-                capture_once=capture_once,
                 window_size=window_size,
             )
             gui.set_blackfly_enabled(blackfly_enabled)
@@ -510,8 +506,6 @@ def run_pipeline(
 
         if gui is not None:
             gui.set_status("Ready — Save button, S in terminal, or Ctrl+S")
-        elif capture_once:
-            print("Pipeline ready. Press s to capture once, q to quit.")
         else:
             print("Pipeline ready.")
             print("Keys: s = save | q = quit (in this terminal)")
@@ -605,12 +599,6 @@ def run_pipeline(
                     if key == ord("q"):
                         should_quit = True
 
-                if interval is not None:
-                    now = time.time()
-                    if now - last_auto_capture >= interval:
-                        should_capture = True
-                        last_auto_capture = now
-
                 if should_capture:
                     timestamp = time.strftime("%Y%m%d_%H%M%S")
                     save_blackfly_frame = blackfly_frame
@@ -640,8 +628,6 @@ def run_pipeline(
                         print(format_timings(grab_timings, thermal_frame))
                     if gui is not None:
                         gui.note_capture_saved(session_dir)
-                    if capture_once:
-                        break
 
                 if should_quit:
                     break
@@ -689,17 +675,6 @@ def parse_args() -> argparse.Namespace:
         "--smoke-test",
         action="store_true",
         help="Open all cameras, grab one frame, and exit",
-    )
-    parser.add_argument(
-        "--capture-once",
-        action="store_true",
-        help="Preview until you press s, capture once, then exit",
-    )
-    parser.add_argument(
-        "--interval",
-        type=float,
-        default=None,
-        help="Automatically capture every N seconds (implies --no-preview)",
     )
     parser.add_argument(
         "--no-preview",
@@ -759,12 +734,6 @@ def main() -> int:
             print_each=args.sync_print,
         )
 
-    show_preview = not args.no_preview and args.interval is None
-    if args.interval is not None:
-        show_preview = False
-    if args.capture_once:
-        show_preview = True
-
     sync_metrics = args.sync_metrics
     sync_print = args.sync_print
     if sync_print and not sync_metrics and not args.sync_test:
@@ -772,9 +741,7 @@ def main() -> int:
 
     return run_pipeline(
         config_path=args.config,
-        capture_once=args.capture_once,
-        interval=args.interval,
-        show_preview=show_preview,
+        show_preview=not args.no_preview,
         sync_metrics=sync_metrics,
         sync_print=sync_print,
         output=args.output,

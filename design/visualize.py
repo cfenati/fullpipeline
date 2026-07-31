@@ -96,10 +96,6 @@ def camera_axes(cam: Camera, scale: float = 0.05) -> List[Tuple[pv.PolyData, str
     return out
 
 
-def optical_axis_line(cam: Camera) -> pv.PolyData:
-    return pv.Line(cam.t, cam.t + cam.optical_axis * cam.far)
-
-
 # --------------------------------------------------------------------------- #
 # Scene assembly
 # --------------------------------------------------------------------------- #

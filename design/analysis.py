@@ -96,9 +96,6 @@ class CoverageResult:
     def uncovered_points(self, k: int = 1) -> np.ndarray:
         return self.points[self.n_views < k]
 
-    def all_camera_intersection_measure(self) -> float:
-        return self.measure_at_least(len(self.names))
-
 
 def volume_coverage(rig: Rig, pitch: Optional[float] = None,
                     margin_px: Optional[float] = None) -> CoverageResult:

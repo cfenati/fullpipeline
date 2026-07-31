@@ -5,8 +5,6 @@
     python design_rig.py view                     # interactive 3D frustum editor
     python design_rig.py plot --multiview         # static figure (iso/top/front/side)
     python design_rig.py report                   # text report + analysis figures
-    python design_rig.py export                   # poses (JSON/CSV/YAML) + frustum STLs
-    python design_rig.py lens --focal 7.7         # try another thermal lens
     python design_rig.py sweep elevation -20 -60  # parametric study of one angle
     python design_rig.py --rig design/config/rig_as_built.yaml optimize
                                                   # refine baseline / height / aim
@@ -27,8 +25,6 @@ import yaml
 
 from design import Rig, evaluate
 from design.analysis import stereo_pairs, volume_coverage
-from design.camera import K_from_fov, K_from_sensor
-from design.export import export_all
 from design.optics import (ELP_USB16MP01, OPTRIS_XI400, OPTRIS_XI400_LENSES,
                            fov_from_focal, verify_optris_lenses, zoom_table)
 from design.report import write_report
@@ -75,7 +71,7 @@ def cmd_view(args) -> int:
           "panel to edit poses or type exact values.")
     print("keys:  r = full report   e = export   c = coverage cloud   "
           "i = common volume   t = reset view\n", flush=True)
-    run_viewer(rig, style=args.style, export_dir=str(args.out))
+    run_viewer(rig, export_dir=str(args.out))
     return 0
 
 
@@ -84,9 +80,7 @@ def cmd_plot(args) -> int:
     rig = load(args)
     out = Path(args.output) if args.output else (args.out / "rig_views.png")
     plot_rig(rig, screenshot=str(out) if args.save else None,
-             off_screen=args.save, show_coverage=args.coverage,
-             show_intersection=args.common, coverage_min_views=args.min_views,
-             multiview=args.multiview, style=args.style)
+             off_screen=args.save, multiview=args.multiview)
     if args.save:
         print(f"wrote {out}")
     return 0
@@ -100,65 +94,11 @@ def cmd_report(args) -> int:
     if args.render:
         from design.visualize import plot_rig
         plot_rig(rig, screenshot=str(args.out / "rig_views.png"), off_screen=True,
-                 multiview=True, show_coverage=args.coverage,
-                 show_intersection=args.common, style=args.style)
+                 multiview=True)
         paths.append(args.out / "rig_views.png")
     print("\nwrote:")
     for p in paths:
         print("  " + str(p))
-    return 0
-
-
-def cmd_export(args) -> int:
-    rig = load(args)
-    for p in export_all(rig, args.out, stl=not args.no_stl):
-        print("  " + str(p))
-    return 0
-
-
-def cmd_lens(args) -> int:
-    """Compare lens options for one camera at its current mounting position.
-
-    Defaults to the four Optris Xi 400 lenses using their datasheet fields of
-    view; ``--from-focal`` instead derives the FOV from a rectilinear pinhole,
-    which under-predicts the two wide IR lenses.
-    """
-    rig = load(args)
-    cam = rig.by_name(args.camera)
-    dist = float(np.linalg.norm(rig.target.center - cam.t))
-    # Prefer the pitch declared for this camera over the thermal default.
-    pitch = args.pitch if args.pitch is not None else (cam.pixel_pitch_um or 17.0)
-
-    if args.focal:
-        options = [(f"f={f:g}", f, None, None) for f in args.focal]
-    else:
-        options = [(l.label, l.focal_mm, l.hfov_deg, l.vfov_deg)
-                   for l in OPTRIS_XI400_LENSES]
-
-    print(f"{cam.name} at {dist:.3f} m from the target centre, "
-          f"{cam.width}x{cam.height} px"
-          + (f", pitch {pitch} um" if args.from_focal or args.focal
-             else ", datasheet FOV"))
-    print()
-    header = (f"{'lens':>8s}{'f [mm]':>8s}{'HFOV':>8s}{'VFOV':>8s}{'GSD':>11s}"
-              f"{'footprint':>17s}{'target vol':>12s}{'all cams':>11s}")
-    print(header)
-    print("-" * len(header))
-
-    for label, focal, hfov, vfov in options:
-        if args.from_focal or hfov is None:
-            cam.K = K_from_sensor(cam.width, cam.height, focal,
-                                  pixel_pitch_um=pitch)
-        else:
-            cam.K = K_from_fov(cam.width, cam.height, hfov, vfov)
-        gx, _ = cam.gsd(dist)
-        fw, fh = cam.footprint(dist)
-        cov = volume_coverage(rig)
-        frac = cov.per_camera_fraction()[cam.name]
-        all_c = cov.fraction_seen_by_at_least(len(rig))
-        print(f"{label:>8s}{focal:8.1f}{cam.hfov_deg:8.1f}{cam.vfov_deg:8.1f}"
-              f"{gx * 1000:9.3f}mm{fw * 100:8.1f}x{fh * 100:.1f}cm"
-              f"{frac * 100:11.1f}%{all_c * 100:10.1f}%")
     return 0
 
 
@@ -472,10 +412,6 @@ def cmd_optimize(args) -> int:
     return 0
 
 
-# Backwards-compatible name used in older docs / muscle memory.
-cmd_stereo = cmd_optimize
-
-
 _SWEEP_PARAMS = ("x", "y", "z", "azimuth", "elevation", "roll", "far")
 
 
@@ -528,8 +464,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", type=Path, default=DEFAULT_OUT, help="output directory")
     p.add_argument("--voxel", type=float, default=None,
                    help="override the sampling pitch in metres")
-    p.add_argument("--style", choices=["frustum", "pyramid"], default="frustum",
-                   help="draw the near-clipped frustum or a full pyramid")
     sub = p.add_subparsers(dest="command", required=True)
 
     sub.add_parser("info", help="print intrinsics, FOV and coverage").set_defaults(
@@ -543,34 +477,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("-o", "--output", default=None)
     sp.add_argument("--save", action="store_true", help="render off-screen to a file")
     sp.add_argument("--multiview", action="store_true", help="2x2 iso/top/front/side")
-    sp.add_argument("--coverage", action="store_true", help="overlay the voxel cloud")
-    sp.add_argument("--common", action="store_true",
-                    help="draw the volume all cameras see as a solid body")
-    sp.add_argument("--min-views", type=int, default=1,
-                    help="only show voxels seen by at least this many cameras")
     sp.set_defaults(func=cmd_plot)
 
     sp = sub.add_parser("report", help="text report and analysis figures")
     sp.add_argument("--render", action="store_true",
                     help="also render the 3D views off-screen")
-    sp.add_argument("--coverage", action="store_true")
-    sp.add_argument("--common", action="store_true")
     sp.set_defaults(func=cmd_report)
-
-    sp = sub.add_parser("export", help="write poses and CAD geometry")
-    sp.add_argument("--no-stl", action="store_true")
-    sp.set_defaults(func=cmd_export)
-
-    sp = sub.add_parser("lens", help="compare lens options for one camera")
-    sp.add_argument("--camera", default="thermal")
-    sp.add_argument("--focal", type=float, nargs="*", default=None,
-                    help="focal lengths in mm (default: the four Xi 400 lenses)")
-    sp.add_argument("--pitch", type=float, default=None,
-                    help="pixel pitch in um (default: the camera's own)")
-    sp.add_argument("--from-focal", action="store_true",
-                    help="derive the FOV from the focal length instead of the "
-                         "datasheet angles")
-    sp.set_defaults(func=cmd_lens)
 
     opt_help = (
         "refine baseline, mount height and camera aim around the loaded poses "
@@ -589,39 +501,38 @@ def build_parser() -> argparse.ArgumentParser:
         "  design_rig.py --rig design/config/rig_as_built.yaml optimize "
         "--baseline 40 120 --height 0.25 0.32 --steps 7\n"
         "  design_rig.py --rig design/config/rig_as_built.yaml optimize "
-        "--write design/config/rig_optimised.yaml"
+        "--write design/config/optimized_baseline.yaml"
     )
-    for name in ("optimize", "stereo"):
-        sp = sub.add_parser(
-            name, help=opt_help,
-            formatter_class=argparse.RawDescriptionHelpFormatter,
-            epilog=opt_epilog)
-        sp.add_argument("--cameras", nargs=2, default=None,
-                        help="the pair (default: the first two RGB cameras)")
-        sp.add_argument("--baseline", type=float, nargs=2, default=None,
-                        metavar=("MIN", "MAX"),
-                        help="baseline range in mm (default: 0.6x-1.8x current)")
-        sp.add_argument("--height", type=float, nargs=2, default=None,
-                        metavar=("MIN", "MAX"),
-                        help="mount height range in m (default: current +- 50 mm)")
-        sp.add_argument("--elevation", type=float, nargs=2, default=None,
-                        metavar=("MIN", "MAX"),
-                        help="elevation range in deg (only with --aim elevation)")
-        sp.add_argument("--aim", choices=["look-at", "elevation", "hold"],
-                        default="look-at",
-                        help="how to set rotations: re-aim at the target "
-                             "(default), sweep elevation, or keep loaded R")
-        sp.add_argument("--move-others", action="store_true",
-                        help="also shift non-pair cameras in z with the mount")
-        sp.add_argument("--triangulation", type=float, nargs=2,
-                        default=[15.0, 30.0], metavar=("MIN", "MAX"),
-                        help="acceptable triangulation angle in deg "
-                             "(default 15 30)")
-        sp.add_argument("--steps", type=int, default=7,
-                        help="samples per axis (default 7)")
-        sp.add_argument("--write", type=Path, default=None,
-                        help="write the best layout as a YAML overlay")
-        sp.set_defaults(func=cmd_optimize)
+    sp = sub.add_parser(
+        "optimize", help=opt_help,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=opt_epilog)
+    sp.add_argument("--cameras", nargs=2, default=None,
+                    help="the pair (default: the first two RGB cameras)")
+    sp.add_argument("--baseline", type=float, nargs=2, default=None,
+                    metavar=("MIN", "MAX"),
+                    help="baseline range in mm (default: 0.6x-1.8x current)")
+    sp.add_argument("--height", type=float, nargs=2, default=None,
+                    metavar=("MIN", "MAX"),
+                    help="mount height range in m (default: current +- 50 mm)")
+    sp.add_argument("--elevation", type=float, nargs=2, default=None,
+                    metavar=("MIN", "MAX"),
+                    help="elevation range in deg (only with --aim elevation)")
+    sp.add_argument("--aim", choices=["look-at", "elevation", "hold"],
+                    default="look-at",
+                    help="how to set rotations: re-aim at the target "
+                         "(default), sweep elevation, or keep loaded R")
+    sp.add_argument("--move-others", action="store_true",
+                    help="also shift non-pair cameras in z with the mount")
+    sp.add_argument("--triangulation", type=float, nargs=2,
+                    default=[15.0, 30.0], metavar=("MIN", "MAX"),
+                    help="acceptable triangulation angle in deg "
+                         "(default 15 30)")
+    sp.add_argument("--steps", type=int, default=7,
+                    help="samples per axis (default 7)")
+    sp.add_argument("--write", type=Path, default=None,
+                    help="write the best layout as a YAML overlay")
+    sp.set_defaults(func=cmd_optimize)
 
     sp = sub.add_parser(
         "sweep", help="parametric study of one degree of freedom",

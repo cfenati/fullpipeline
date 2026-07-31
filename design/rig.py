@@ -244,12 +244,6 @@ class Rig:
     def of_modality(self, modality: str) -> List[Camera]:
         return [c for c in self.cameras if c.modality == modality]
 
-    def aim_all_at_target(self, roll_deg: float = 0.0) -> "Rig":
-        """Re-point every camera at the target centre, keeping positions."""
-        for cam in self.cameras:
-            cam.look_at(self.target.center, roll_deg)
-        return self
-
     def aim_errors_deg(self) -> Dict[str, float]:
         """Angle between each optical axis and the direction to the target centre.
 

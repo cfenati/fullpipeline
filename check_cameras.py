@@ -61,6 +61,9 @@ def check_blackfly(config: dict) -> bool:
         timeout_ms=int(blackfly_config.get("timeout_ms", 1000)),
         gain_auto=bool(blackfly_config.get("gain_auto", True)),
         gain=blackfly_config.get("gain"),
+        max_fps=blackfly_config.get("max_fps"),
+        preview_max_width=blackfly_config.get("preview_max_width", 1280),
+        stream_newest_only=bool(blackfly_config.get("stream_newest_only", True)),
     )
     try:
         cam.open()

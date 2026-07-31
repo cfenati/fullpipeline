@@ -138,27 +138,6 @@ class RGBCamera:
         ok2 = cam2.recover(settle_s)
         return ok1 and ok2
 
-    @staticmethod
-    def recover_failed(
-        cam1: "RGBCamera",
-        cam2: "RGBCamera",
-        frame1: Optional[np.ndarray],
-        frame2: Optional[np.ndarray],
-        settle_s: float = 1.0,
-    ) -> bool:
-        """Reopen only the RGB camera(s) that failed to grab."""
-        if frame1 is not None and frame2 is not None:
-            return True
-
-        ok = True
-        if frame1 is None:
-            ok = cam1.recover(settle_s) and ok
-        if frame2 is None:
-            if frame1 is None:
-                time.sleep(0.3)
-            ok = cam2.recover(settle_s) and ok
-        return ok
-
     def info(self) -> dict:
         return {
             "name": self.name,

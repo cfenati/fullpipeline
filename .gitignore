@@ -1,4 +1,15 @@
 __pycache__/
-captures/
 *.pyc
+captures/
 design/out/
+.matplotlib_cache/
+
+# Calibration / stereo outputs
+calibration/results/
+
+# Color flat-field maps and reports
+color_calibration/
+color_reports/
+
+# Registration outputs (keep registration/*.py source)
+registration/results/
