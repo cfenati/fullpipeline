@@ -1128,6 +1128,33 @@ def _fit_rigid(source: np.ndarray, target: np.ndarray) -> Tuple[np.ndarray, np.n
     return R, target_center - R @ source_center, scale
 
 
+def _triangulate_observation(
+    observation: StereoObservation,
+    projection_a: np.ndarray,
+    projection_b: np.ndarray,
+    camera_matrix_a: np.ndarray,
+    distortion_a: np.ndarray,
+    camera_matrix_b: np.ndarray,
+    distortion_b: np.ndarray,
+) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Triangulated 3D corners and their known board-space coordinates.
+
+    Points whose triangulated homogeneous weight is too small to trust are
+    dropped. Returns ``None`` when fewer than 4 points survive — too few to
+    say anything about the view.
+    """
+    points_a = _undistorted_pixels(observation.left_points, camera_matrix_a, distortion_a)
+    points_b = _undistorted_pixels(observation.right_points, camera_matrix_b, distortion_b)
+    homogeneous = cv2.triangulatePoints(projection_a, projection_b, points_a.T, points_b.T)
+    w = homogeneous[3]
+    valid = np.abs(w) > 1e-12
+    if valid.sum() < 4:
+        return None
+    points_3d = (homogeneous[:3, valid] / w[valid]).T
+    board_points = observation.object_points.reshape(-1, 3)[valid]
+    return points_3d, board_points
+
+
 def triangulation_closure(
     extrinsics: StereoExtrinsics,
     observations: Sequence[StereoObservation],
@@ -1149,15 +1176,13 @@ def triangulation_closure(
     residuals: List[np.ndarray] = []
 
     for observation in observations:
-        points_a = _undistorted_pixels(observation.left_points, K_a, extrinsics.distortion_a)
-        points_b = _undistorted_pixels(observation.right_points, K_b, extrinsics.distortion_b)
-        homogeneous = cv2.triangulatePoints(projection_a, projection_b, points_a.T, points_b.T)
-        w = homogeneous[3]
-        valid = np.abs(w) > 1e-12
-        if valid.sum() < 4:
+        result = _triangulate_observation(
+            observation, projection_a, projection_b,
+            K_a, extrinsics.distortion_a, K_b, extrinsics.distortion_b,
+        )
+        if result is None:
             continue
-        points_3d = (homogeneous[:3, valid] / w[valid]).T
-        board_points = observation.object_points.reshape(-1, 3)[valid]
+        points_3d, board_points = result
 
         R, t, scale = _fit_rigid(board_points, points_3d)
         fitted = board_points @ R.T + t
@@ -1170,7 +1195,7 @@ def triangulation_closure(
                 "rms_mm": float(np.sqrt(np.mean(error ** 2)) * 1000.0),
                 "max_mm": float(error.max() * 1000.0),
                 "scale": scale,
-                "points": int(valid.sum()),
+                "points": int(len(points_3d)),
             }
         )
 
@@ -1183,6 +1208,98 @@ def triangulation_closure(
         "max_mm": float(all_residuals.max() * 1000.0) if all_residuals.size else float("nan"),
         "scale_mean": float(scales.mean()) if scales.size else float("nan"),
         "scale_std": float(scales.std(ddof=1)) if scales.size > 1 else 0.0,
+    }
+
+
+def adjacent_corner_distance_errors(
+    extrinsics: StereoExtrinsics,
+    observations: Sequence[StereoObservation],
+    board: TargetBoard,
+    tolerance_fraction: float = 0.1,
+) -> Dict[str, Any]:
+    """Triangulated corner-to-corner distance vs. the board's printed square size.
+
+    :func:`triangulation_closure` fits a rigid transform, plus a free scale,
+    onto the known board and reports what is left over — a systematic scale
+    error is exactly what that fitted scale is built to absorb, so it barely
+    moves the residual. This instead compares the triangulated distance
+    between every pair of corners one square apart directly against
+    ``board.square_size_m``, with nothing fitted that could hide a scale bias.
+
+    Run on views that were never part of the stereo fit (see
+    ``cross_validate_stereo.py``), this is a genuine out-of-sample check of
+    the metric scale baked into ``extrinsics.T`` — the one thing in-sample
+    reprojection error cannot see, because it is graded on the same poses
+    that set the scale in the first place.
+
+    ``tolerance_fraction`` selects pairs whose *known* board-space distance is
+    within that fraction of one square size; a diagonal pair differs by ~41%
+    and a two-square pair by 100%, so the default of 0.1 cleanly picks out
+    only true grid-adjacent (horizontal or vertical) pairs.
+    """
+    K_a, K_b = extrinsics.camera_matrix_a, extrinsics.camera_matrix_b
+    projection_a = K_a @ np.hstack([np.eye(3), np.zeros((3, 1))])
+    projection_b = K_b @ np.hstack([extrinsics.R, extrinsics.T.reshape(3, 1)])
+    tolerance_m = tolerance_fraction * board.square_size_m
+
+    per_view: List[Dict[str, Any]] = []
+    all_errors_mm: List[np.ndarray] = []
+
+    for observation in observations:
+        result = _triangulate_observation(
+            observation, projection_a, projection_b,
+            K_a, extrinsics.distortion_a, K_b, extrinsics.distortion_b,
+        )
+        if result is None:
+            continue
+        points_3d, board_points = result
+        if len(points_3d) < 2:
+            continue
+
+        known = np.linalg.norm(
+            board_points[:, None, :] - board_points[None, :, :], axis=-1
+        )
+        measured = np.linalg.norm(
+            points_3d[:, None, :] - points_3d[None, :, :], axis=-1
+        )
+        rows, cols = np.triu_indices(len(points_3d), k=1)
+        known_pairs = known[rows, cols]
+        measured_pairs = measured[rows, cols]
+
+        adjacent = np.abs(known_pairs - board.square_size_m) < tolerance_m
+        if not adjacent.any():
+            continue
+
+        errors_mm = (measured_pairs[adjacent] - known_pairs[adjacent]) * 1000.0
+        all_errors_mm.append(errors_mm)
+        per_view.append(
+            {
+                "label": observation.label,
+                "pairs": int(adjacent.sum()),
+                "mean_error_mm": float(errors_mm.mean()),
+                "rms_error_mm": float(np.sqrt(np.mean(errors_mm ** 2))),
+                "max_abs_error_mm": float(np.abs(errors_mm).max()),
+            }
+        )
+
+    all_errors = np.concatenate(all_errors_mm) if all_errors_mm else np.zeros(0)
+    square_mm = board.square_size_m * 1000.0
+    return {
+        "square_size_mm": square_mm,
+        "tolerance_mm": tolerance_m * 1000.0,
+        "per_view": per_view,
+        "pairs_total": int(all_errors.size),
+        "mean_error_mm": float(all_errors.mean()) if all_errors.size else float("nan"),
+        "rms_error_mm": float(np.sqrt(np.mean(all_errors ** 2))) if all_errors.size else float("nan"),
+        "max_abs_error_mm": float(np.abs(all_errors).max()) if all_errors.size else float("nan"),
+        "std_error_mm": float(all_errors.std(ddof=1)) if all_errors.size > 1 else 0.0,
+        "mean_relative_error_pct": (
+            float(all_errors.mean() / square_mm * 100.0) if all_errors.size else float("nan")
+        ),
+        "rms_relative_error_pct": (
+            float(np.sqrt(np.mean(all_errors ** 2)) / square_mm * 100.0)
+            if all_errors.size else float("nan")
+        ),
     }
 
 

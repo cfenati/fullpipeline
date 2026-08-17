@@ -35,17 +35,10 @@ class TargetBoard:
         return self.corners_x * self.corners_y
 
     @classmethod
-    def from_yaml(cls, path: Path) -> "TargetBoard":
-        path = Path(path)
-        if not path.exists():
-            raise FileNotFoundError(f"Board config not found: {path}")
-
-        with path.open("r", encoding="utf-8") as config_file:
-            data = yaml.safe_load(config_file) or {}
-
+    def from_dict(cls, data: Dict[str, Any]) -> "TargetBoard":
         target_type = str(data.get("target_type", "charuco")).lower()
         if target_type != "charuco":
-            raise ValueError(f"Unsupported target_type '{target_type}' in {path}")
+            raise ValueError(f"Unsupported target_type '{target_type}'")
 
         return cls(
             squares_x=int(data["squares_x"]),
@@ -55,6 +48,20 @@ class TargetBoard:
             dictionary=str(data.get("dictionary", "DICT_4X4_50")),
             legacy_pattern=bool(data.get("legacy_pattern", True)),
         )
+
+    @classmethod
+    def from_yaml(cls, path: Path) -> "TargetBoard":
+        path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(f"Board config not found: {path}")
+
+        with path.open("r", encoding="utf-8") as config_file:
+            data = yaml.safe_load(config_file) or {}
+
+        try:
+            return cls.from_dict(data)
+        except ValueError as exc:
+            raise ValueError(f"{exc} in {path}") from exc
 
     def aruco_dictionary(self) -> Any:
         if not hasattr(cv2.aruco, self.dictionary):
