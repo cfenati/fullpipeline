@@ -12,6 +12,7 @@ flags override them. Run `python <script>.py --help` for full options.
 | Intrinsics | `calibrate_cameras.py` | `calibration/results/<cam>/intrinsics.json` |
 | Prune bad views | `prune_calibration.py` | deletes worst capture sessions |
 | Extrinsics | `stereo_calibrate.py` | `calibration/results/stereo_<a>_<b>/` (+ `rig_as_built.yaml`) |
+| Cross-validation    | `cross_validate_stereo.py` | `calibration/results/stereo_<a>_<b>/cross_validation/` |
 | Rig eval / optimize | `design_rig.py` | coverage studies on measured geometry |
 | Registration | `register_pipeline.py` | depth-aware warp between cameras |
 
@@ -84,6 +85,19 @@ sessions (`--force` overrides), and needs a fresh report (re-calibrate or
 `--allow-stale`). Stereo holds intrinsics fixed and writes `extrinsics.json`,
 figures, and measured poses into `rig_as_built.yaml`.
 
+```bash
+python cross_validate_stereo.py --camera-a rgb_cam1 --camera-b rgb_cam2
+```
+
+Checks the fitted extrinsics against a second, independently captured
+checkerboard pose set (`captures/cross-validation` by default) instead of the
+set they were fit from. Triangulates held-out corners through the frozen
+`R`/`T`/intrinsics and compares the reconstructed corner-to-corner distances
+to the board's known square size — catching overfitting to `stereo_captures`
+that in-sample reprojection/epipolar error can't see, since that error is
+graded on the very poses that set the scale. Read-only: never rewrites
+`extrinsics.json`; results land in a separate `cross_validation/` subfolder.
+
 ## Rig design
 
 ```bash
@@ -114,7 +128,7 @@ Outputs under `registration/results/<session>/`.
 | `rgb.cam1` / `cam2` | Prefer `/dev/v4l/by-path/...` |
 | `rgb.width` / `height` | Must match calibration resolution |
 | `rgb.color_correction` | Flat-field enable + map paths |
-| `geometric_calibration.*` | Board, results dir, stereo capture dirs |
+| `geometric_calibration.*` | Board, results dir, stereo + cross-validation capture dirs |
 | `thermal` / `blackfly` | Device enablement and settings |
 
 ## Layout
