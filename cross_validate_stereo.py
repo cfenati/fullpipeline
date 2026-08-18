@@ -34,6 +34,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+import numpy as np
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -63,6 +65,24 @@ DEFAULT_CROSS_VALIDATION_CAPTURES = "captures/cross-validation"
 # reproducing the training board's geometry rather than the true metric
 # scale; see adjacent_corner_distance_errors in calibration/stereo.py.
 WARN_RELATIVE_ERROR_PCT = 1.0
+
+
+def _essential_from_pose(R: np.ndarray, T: np.ndarray) -> np.ndarray:
+    """E = [T]_x @ R, the essential matrix implied by the pose alone.
+
+    Used as a fallback when a loaded extrinsics.json has essential left at
+    its all-zero default (e.g. a hand-edited or pre-`essential`-field file):
+    a zero E silently makes epipolar_residuals report a perfect 0.0000 px
+    residual for every corner, which is exactly the kind of impossibly-good
+    number this tool exists to catch.
+    """
+    t = T.reshape(3)
+    skew = np.array([
+        [0.0, -t[2], t[1]],
+        [t[2], 0.0, -t[0]],
+        [-t[1], t[0], 0.0],
+    ])
+    return skew @ R
 
 
 def parse_args() -> argparse.Namespace:
@@ -212,13 +232,13 @@ def write_report(
 
     if (
         corner_errors["pairs_total"] > 0
-        and abs(corner_errors["rms_relative_error_pct"]) > WARN_RELATIVE_ERROR_PCT
+        and abs(corner_errors["mean_relative_error_pct"]) > WARN_RELATIVE_ERROR_PCT
     ):
         add("Quality warning")
         add(rule)
-        add(f"  RMS relative error is {corner_errors['rms_relative_error_pct']:.2f} %, above the "
-            f"{WARN_RELATIVE_ERROR_PCT:.1f} % that a 1 % error in the printed square implies for "
-            "the baseline (see the calibration/stereo.py module docstring). The fit may be "
+        add(f"  Mean relative error is {corner_errors['mean_relative_error_pct']:+.2f} %, above "
+            f"the {WARN_RELATIVE_ERROR_PCT:.1f} % that a 1 % error in the printed square implies "
+            "for the baseline (see the calibration/stereo.py module docstring). The fit may be "
             "overfitting stereo_captures rather than measuring the true rig geometry.")
         add("")
 
@@ -274,6 +294,8 @@ def main() -> int:
     if extrinsics.name_a != args.camera_a or extrinsics.name_b != args.camera_b:
         print(f"Note: extrinsics file names the pair {extrinsics.name_a}/{extrinsics.name_b}; "
               f"validating it as {args.camera_a}/{args.camera_b}.")
+    if not np.any(extrinsics.essential):
+        extrinsics.essential = _essential_from_pose(extrinsics.R, extrinsics.T)
 
     board = board_from_extrinsics(extrinsics, extrinsics_path)
 
@@ -366,7 +388,7 @@ def main() -> int:
           f"{corner_errors['square_size_mm']:.2f} mm square)")
     if (
         corner_errors["pairs_total"] > 0
-        and abs(corner_errors["rms_relative_error_pct"]) > WARN_RELATIVE_ERROR_PCT
+        and abs(corner_errors["mean_relative_error_pct"]) > WARN_RELATIVE_ERROR_PCT
     ):
         print(f"  WARNING: exceeds the {WARN_RELATIVE_ERROR_PCT:.1f} % noticeable-bias threshold")
     print("")
