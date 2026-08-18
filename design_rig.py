@@ -17,8 +17,12 @@ For redesign from measured extrinsics, pass the as-built overlay.
 from __future__ import annotations
 
 import argparse
+import itertools
+import os
 import sys
 from pathlib import Path
+
+os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
 import numpy as np
 import yaml
@@ -120,6 +124,35 @@ def cmd_optics(args) -> int:
               f"{cam.fx:10.1f}"
               + (f"{pitch:7.2f}um" if pitch else f"{'-':>8s}")
               + (f"{f_mm:8.2f}mm" if f_mm else f"{'-':>10s}"))
+
+    rgb_cameras = list(rig.of_modality("rgb"))
+    if len(rgb_cameras) >= 2:
+        print("\nRGB INTRINSICS CROSS-CHECK: are the two cameras actually matched?")
+        dist_names = ["k1", "k2", "p1", "p2", "k3", "k4", "k5", "k6"]
+        for cam_a, cam_b in itertools.combinations(rgb_cameras, 2):
+            print(f"  {cam_a.name} vs {cam_b.name}")
+            print(f"    {'':10s}{cam_a.name:>14s}{cam_b.name:>14s}{'delta':>10s}")
+            for label, va, vb in [
+                ("fx", cam_a.fx, cam_b.fx),
+                ("fy", cam_a.fy, cam_b.fy),
+                ("cx", cam_a.cx, cam_b.cx),
+                ("cy", cam_a.cy, cam_b.cy),
+                ("HFOV deg", cam_a.hfov_deg, cam_b.hfov_deg),
+                ("VFOV deg", cam_a.vfov_deg, cam_b.vfov_deg),
+            ]:
+                delta = 100.0 * (va - vb) / vb if vb else float("nan")
+                print(f"    {label:10s}{va:14.2f}{vb:14.2f}{delta:9.2f}%")
+            dist_a = np.asarray(cam_a.distortion).reshape(-1)
+            dist_b = np.asarray(cam_b.distortion).reshape(-1)
+            n = min(len(dist_a), len(dist_b))
+            if n:
+                print(f"    {'distortion':10s}{cam_a.name:>14s}{cam_b.name:>14s}")
+                for i in range(n):
+                    label = dist_names[i] if i < len(dist_names) else f"d{i}"
+                    print(f"    {label:10s}{dist_a[i]:14.4f}{dist_b[i]:14.4f}")
+            if len(dist_a) != len(dist_b):
+                print(f"    (distortion model length differs: "
+                      f"{len(dist_a)} vs {len(dist_b)} terms)")
 
     print("\nRGB ZOOM: the ELP 5-50 mm ring is a design variable")
     print(f"  {ELP_USB16MP01.name}, {ELP_USB16MP01.width_px}x{ELP_USB16MP01.height_px}, "

@@ -2,7 +2,8 @@
 """Estimate RGB camera intrinsics from ChArUco capture sessions.
 
 Example:
-    python calibrate_cameras.py --captures captures/calib_rgb1 --camera rgb_cam1
+    python calibrate_cameras.py --in captures/calib_rgb1 --camera rgb_cam1
+    python calibrate_cameras.py --captures captures/calib_rgb1 --camera rgb_cam1 --out calibration/results
 """
 
 from __future__ import annotations
@@ -181,8 +182,13 @@ def parse_args() -> argparse.Namespace:
         description="Estimate camera intrinsics from ChArUco capture sessions.",
     )
     parser.add_argument(
+        "--in",
         "--captures",
-        help="Directory holding capture session subfolders (default: captures/calib_<camera>).",
+        dest="captures",
+        help=(
+            "Directory holding capture session subfolders "
+            "(default: geometric_calibration.intrinsics_captures, else captures/calib_<camera>)."
+        ),
     )
     parser.add_argument(
         "--camera",
@@ -194,7 +200,9 @@ def parse_args() -> argparse.Namespace:
         help=f"ChArUco board YAML (default: geometric_calibration.board, else {DEFAULT_BOARD_CONFIG}).",
     )
     parser.add_argument(
+        "--out",
         "--output",
+        dest="output",
         help=(
             "Directory for calibration results "
             f"(default: geometric_calibration.output_dir, else {DEFAULT_OUTPUT_DIR})."
@@ -253,7 +261,11 @@ def main() -> int:
     board_path = args.board or calibration_config.get("board", DEFAULT_BOARD_CONFIG)
     output_root = args.output or calibration_config.get("output_dir", DEFAULT_OUTPUT_DIR)
 
-    capture_dir = resolve_path(args.captures or default_capture_dir(args.camera))
+    capture_dir = resolve_path(
+        args.captures
+        or calibration_config.get("intrinsics_captures")
+        or default_capture_dir(args.camera)
+    )
     output_dir = resolve_path(output_root) / args.camera
     output_dir.mkdir(parents=True, exist_ok=True)
 

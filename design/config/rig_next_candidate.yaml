@@ -1,0 +1,43 @@
+# Candidate redesign to fix RGB<->RGB dense-stereo registration.
+#
+# Root cause (see /home/cfenati/.claude/plans/floating-inventing-lobster.md):
+#   - as-built baseline (85.6 mm) gives triangulation angle 33-45 deg across
+#     the confirmed 0.13-0.19 m working range - past the 30 deg limit where
+#     dense SGBM correspondence works at all (confirmed: dense_valid_fraction
+#     was 0.0 in every register_pipeline.py run, regardless of disparity
+#     search-window width).
+#   - separately, the RGB lens is currently set to ~12mm equivalent focal
+#     length (24.5 deg HFOV, per calibration/results/rgb_cam1/intrinsics.json),
+#     narrower than design/config/rig.yaml's own stated intent of "roughly
+#     6.5mm". At that narrow FOV, no baseline in a 40-90mm sweep reaches full
+#     target coverage at 0.13 m - independent of the triangulation problem.
+#
+# This overlay only changes pose (baseline ~71mm, height ~130mm), chosen with:
+#   python design_rig.py --rig <wide-lens test rig> optimize \
+#       --baseline 40 90 --height 0.13 0.19 --aim look-at --steps 9
+# using a simulated ~40 deg HFOV lens to confirm the coverage constraint clears
+# once the zoom ring is opened up. Result at this pose: 100.0% coverage in
+# both RGB cameras, 29.3 deg triangulation, at the worst-case 0.13 m point.
+#
+# Still required before this is real: physically open the zoom ring toward
+# ~6.5-7mm equivalent (matches rig.yaml's original intent), remount at this
+# pose, then re-run calibrate_cameras.py (intrinsics change with the zoom
+# ring) and stereo_calibrate.py (extrinsics change with the remount) -
+# capturing the ChArUco set across the full 0.13-0.19 m band at 3+ distinct
+# distances, not clustered as stereo_9 was.
+
+extends: rig_as_built.yaml
+name: rgb2_thermal1_next_candidate
+cameras:
+- name: rgb_cam1
+  pose:
+    position: [-0.0403, 0.0084, 0.1300]
+    azimuth_deg: -11.84
+    elevation_deg: -71.79
+    roll_deg: -0.0
+- name: rgb_cam2
+  pose:
+    position: [-0.0381, -0.0628, 0.1300]
+    azimuth_deg: 58.72
+    elevation_deg: -59.56
+    roll_deg: 0.0

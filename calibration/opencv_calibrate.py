@@ -24,11 +24,19 @@ MIN_VIEWS_AFTER_REJECTION = 8
 REJECT_FLOOR_PX = 1.0
 
 # Above this RMS the corner detections are dominated by blur / compression noise
-# rather than by the lens model.
+# rather than by the lens model. Tuned at HD width; scale with image width so a
+# 1 px residual at 4K is not treated as twice as bad as 0.5 px at 1280.
 GOOD_RMS_PX = 0.5
+REFERENCE_IMAGE_WIDTH = 1280.0
 # A principal point further than this (fraction of the frame) from the centre is
 # almost always a fitting artefact rather than a real lens decentring.
 PRINCIPAL_POINT_TOLERANCE = 0.1
+
+
+def scaled_px(budget_px: float, image_size: Tuple[int, int]) -> float:
+    """Scale a pixel-error budget with image width relative to HD."""
+    width = float(image_size[0]) if image_size else REFERENCE_IMAGE_WIDTH
+    return budget_px * (width / REFERENCE_IMAGE_WIDTH)
 
 
 @dataclass
@@ -322,6 +330,7 @@ def outlier_threshold(
     per_view_errors: np.ndarray,
     reject_sigma: float,
     max_view_error_px: Optional[float],
+    image_size: Optional[Tuple[int, int]] = None,
 ) -> float:
     """Robust cut-off relative to the noise floor of this particular dataset.
 
@@ -333,7 +342,12 @@ def outlier_threshold(
         return max_view_error_px
     median = float(np.median(per_view_errors))
     deviation = float(np.median(np.abs(per_view_errors - median)))
-    return max(median + reject_sigma * 1.4826 * deviation, REJECT_FLOOR_PX)
+    floor = (
+        scaled_px(REJECT_FLOOR_PX, image_size)
+        if image_size is not None
+        else REJECT_FLOOR_PX
+    )
+    return max(median + reject_sigma * 1.4826 * deviation, floor)
 
 
 def calibrate_intrinsics(
@@ -373,7 +387,9 @@ def calibrate_intrinsics(
         if not reject_outliers:
             break
 
-        threshold = outlier_threshold(per_view_errors, reject_sigma, max_view_error_px)
+        threshold = outlier_threshold(
+            per_view_errors, reject_sigma, max_view_error_px, image_size=image_size
+        )
         worst = int(np.argmax(per_view_errors))
         if (
             per_view_errors[worst] <= threshold
@@ -432,11 +448,13 @@ def quality_warnings(
     warnings: List[str] = []
     width, height = intrinsics.image_size
 
-    if intrinsics.reprojection_error_px > GOOD_RMS_PX:
+    rms_limit = scaled_px(GOOD_RMS_PX, (width, height))
+    if intrinsics.reprojection_error_px > rms_limit:
         warnings.append(
             f"RMS reprojection error is {intrinsics.reprojection_error_px:.2f} px "
-            f"(expected below {GOOD_RMS_PX:.1f} px). The corner detections are limited by "
-            "focus, lighting or JPEG compression, not by the lens model."
+            f"(expected below {rms_limit:.1f} px at {width}x{height}). The corner "
+            "detections are limited by focus, lighting or JPEG compression, not by "
+            "the lens model."
         )
 
     offset_x = abs(intrinsics.cx - width / 2.0) / width

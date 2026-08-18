@@ -1,0 +1,154 @@
+# Multi-camera rig design: 2 x ELP-USB16MP01-MFV (16 MP RGB) + Optris Xi 400 LT USB.
+#
+# Frames and units
+#   world  : right-handed, metres, +Z up, origin on the table under the subject
+#   camera : OpenCV, +X image right, +Y image down, +Z optical axis
+#   angles : degrees
+#
+# Mounting angles
+#   azimuth   heading of the optical axis in the XY plane, 0 = +X, 90 = +Y
+#   elevation tilt out of the XY plane, positive up, -90 = looking straight down
+#   roll      rotation of the image about the optical axis
+# Use either azimuth/elevation/roll or `look_at: [x, y, z]` (plus optional roll_deg).
+#
+# ---------------------------------------------------------------------------- #
+# HOW TO CHOOSE THE INTRINSICS SOURCE
+#
+# Nothing here is arbitrary. Pick in this order of preference:
+#
+#   1. source: calibration   calibration parameters from calibrate_cameras.py.
+#      `resolution` rescales the calibrated K by the width
+#      ratio, preserving horizontal FOV and re-centring the principal point.
+#      Caveat: that rescaling assumes the calibrated mode and the target mode
+#      share a horizontal field of view. For these ELP cameras 1280x720 is
+#      believed to be a vertical crop of the 4:3 sensor, which preserves it.
+#      To remove the assumption, calibrate at the resolution you will capture at.
+#
+#   2. source: fov           Use when the vendor publishes angles and you have no
+#      calibration - the Optris case. 
+#
+#   3. source: sensor        Derive from focal length + pixel pitch. Correct only
+#      for a rectilinear lens. Handy for exploring a lens you do not own yet.
+#
+# The `sensor:` block below is metadata: it lets the tool report the physical
+# focal length behind a calibrated fx (i.e. where to set a zoom ring) and the
+# multi-pixel spot size a thermal detector needs. It never changes the geometry.
+# Inspect all of this with:  python design_rig.py optics
+# ---------------------------------------------------------------------------- #
+
+name: rgb2_thermal1
+
+target:
+  # The measurement volume every camera should cover.
+  # `center` is the centre, not the base: an object of height h resting on the
+  # table at z = 0 has center z = h/2, otherwise half of it sits below the table.
+  type: box            # box | plane | cylinder | sphere
+  center: [0.0, 0.0, 0.005]
+  size: [0.05, 0.05, 0.01]
+  # The face resting on the table can never be imaged, so keep it out of the
+  # surface statistics instead of reporting it as a blind spot.
+  exclude_normals: [[0, 0, -1]]
+
+analysis:
+  voxel_pitch: 0.006             # m, volume coverage sampling
+  surface_pitch: 0.005           # m, surface coverage sampling
+  interactive_voxel_pitch: 0.015 # m, coarse grid used for the live readout
+  max_incidence_deg: 65.0        # views more oblique than this do not count
+  margin_px: 0.0                 # shrink the usable sensor rectangle
+  registration_depth: 0.168       # m, depth the thermal/RGB overlay is calibrated at
+  # was 0.213, set before the confirmed 0.13-0.19 m subject working range;
+  # 0.168 is that range's midpoint and matches stereo_10's measured board mean.
+  disparity_noise_px: 0.3        # matching noise for the depth-uncertainty estimate
+
+cameras:
+  # ---- 16 MP RGB, left -------------------------------------------------- #
+  # ELP-USB16MP01-MFV: Sony IMX298, 1/2.8 in, 4656x3496, 1.12 um pitch,
+  # 5-50 mm manual zoom CS lens.
+  # The zoom ring is a design variable: at full resolution the lens spans
+  # 55.1x42.8 deg (5 mm) down to 6.0x4.5 deg (50 mm). The calibration below
+  # corresponds to roughly 6.5 mm. Explore alternatives with:
+  #   python design_rig.py lens --camera rgb_cam1 --focal 5 6.5 8 12
+  - name: rgb_cam1
+    modality: rgb
+    color: "#2563eb"
+    intrinsics:
+      source: calibration
+      file: calibration/results/rgb_cam1/intrinsics.json
+      resolution: [4656, 3496]   # full-sensor 16 MP mode (calibrated at 1280x720)
+    sensor:
+      model: Sony IMX298 (1/2.8 in)
+      pixel_pitch_um: 1.12
+      zoom_range_mm: [5.0, 50.0]
+    range: [0.10, 0.30]          # near = closest usable focus, far = working limit
+    # Real operating envelope: the wound target can land anywhere in this
+    # band, not at one fixed distance. Neither 0.10 near nor 0.30 far has
+    # been directly verified in focus yet.
+    pose:
+      # z anchored from the ChArUco board's own measured distance to rgb_cam1
+      # (observed_depth_m mean = 0.1896 m, captures/stereo_8) plus target
+      # centre z (0.005 m) — the calibration itself is the source of truth
+      # for this fixed rig, not a hand measurement or lens spec. Re-anchor
+      # here only if the physical position changes again.
+      position: [-0.04, 0.0, 0.1946]
+      look_at: target        # 'target' tracks the target centre; or give [x, y, z]
+      roll_deg: 0.0
+
+  # ---- 16 MP RGB, right ------------------------------------------------- #
+  - name: rgb_cam2
+    modality: rgb
+    color: "#16a34a"
+    intrinsics:
+      source: calibration
+      file: calibration/results/rgb_cam2/intrinsics.json
+      resolution: [4656, 3496]
+    sensor:
+      model: Sony IMX298 (1/2.8 in)
+      pixel_pitch_um: 1.12
+      zoom_range_mm: [5.0, 50.0]
+    range: [0.10, 0.30]          # same lens/module as rgb_cam1, matches its operating envelope
+    pose:
+      position: [0.04, 0.0, 0.282]
+      look_at: target        # 'target' tracks the target centre; or give [x, y, z]
+      roll_deg: 0.0
+
+  # ---- Optris Xi 400 LT USB thermal ------------------------------------- #
+  # 382 x 288 uncooled bolometer, 17 um pitch, 8-14 um, 80 Hz.
+  # From the "OPTICAL" table of the datasheet:
+  #   FOV       18x14      29x22      53x38      80x54    deg
+  #   focal      20.0       12.7        7.7        5.7    mm
+  #   min dist    350        350        250        200    mm  -> sets `near`
+  #   IFOV        0.3        0.5        0.7        0.8    mm at min distance
+  #   MFOV        0.9        1.5        2.1        2.4    mm (3x3 px)
+  # Angles are taken from the FOV row rather than computed from the focal length:
+  # the datasheet's own IFOV column only reconciles with the published angles.
+  # Compare all four lenses with:  python design_rig.py lens
+  # Fitted lens: 53 x 38 deg (f = 7.7 mm), part number ...F08...
+  # This is one of the two non-rectilinear lenses, so `source: fov` matters here:
+  # a pinhole of f = 7.7 mm would predict only 45.7 x 35.3 deg. Using the
+  # published angles puts the frustum boundary in the right place, which is what
+  # the coverage analysis needs, at the cost of understating the scale near the
+  # optical axis. `paraxial_focal_length_mm` below lets the tool report that
+  # on-axis figure too, so the two bracket reality until the thermal lens
+  # distortion is actually measured.
+  - name: thermal
+    modality: thermal
+    color: "#dc2626"
+    intrinsics:
+      source: fov
+      resolution: [382, 288]
+      hfov_deg: 53.0             # 53 x 38 deg lens, f = 7.7 mm
+      vfov_deg: 38.0
+    sensor:
+      model: Optris Xi 400 LT USB (uncooled bolometer)
+      pixel_pitch_um: 17.0
+      paraxial_focal_length_mm: 7.7
+      # A single bolometer pixel is not radiometrically trustworthy; Optris
+      # specifies 3x3 pixels as the smallest measurable spot (MFOV).
+      measurement_pixels: 3
+    # near comes from the datasheet minimum distance to target for this lens
+    # (250 mm for 53x38; 350 mm for 18x14 and 29x22, 200 mm for 80x54).
+    range: [0.25, 1.00]
+    pose:
+      position: [0.0, 0.0, 0.285]
+      look_at: target        # 'target' tracks the target centre; or give [x, y, z]
+      roll_deg: 0.0

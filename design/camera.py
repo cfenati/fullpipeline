@@ -78,6 +78,9 @@ def K_from_calibration(path, resolution: Optional[Sequence[int]] = None
     by the width ratio, which preserves the horizontal field of view. The
     principal point is re-centred because the crop offset of the other sensor
     mode is unknown; vertical FOV therefore follows the requested aspect ratio.
+    When ``resolution`` matches the calibrated one exactly, there is no crop
+    ambiguity, so the measured principal point is kept as-is rather than
+    discarded.
     """
     data = json.loads(Path(path).read_text())
     K = np.asarray(data["camera_matrix"], dtype=float)
@@ -88,6 +91,8 @@ def K_from_calibration(path, resolution: Optional[Sequence[int]] = None
         return K, (cal_w, cal_h), dist
 
     out_w, out_h = int(resolution[0]), int(resolution[1])
+    if out_w == cal_w and out_h == cal_h:
+        return K, (out_w, out_h), dist
     scale = out_w / float(cal_w)
     cx, cy = _principal_point(out_w, out_h)
     K_out = make_K(K[0, 0] * scale, K[1, 1] * scale, cx, cy)

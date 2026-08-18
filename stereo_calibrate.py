@@ -8,7 +8,8 @@ the pair is usable at a given working distance: coverage overlap, stereo
 baseline, triangulation angle and the depth-dependent registration error.
 
     python stereo_calibrate.py
-    python stereo_calibrate.py --captures captures/calib_rgb1 --reference-depth 0.28
+    python stereo_calibrate.py --in captures/calib_rgb1 --reference-depth 0.28
+    python stereo_calibrate.py --captures captures/calib_rgb1 --out calibration/results
     python stereo_calibrate.py --depth-range 0.15 0.80 --disparity-noise 0.5
 
 Outputs land in ``calibration/results/stereo_<a>_<b>/``: ``extrinsics.json`` for
@@ -261,6 +262,7 @@ def update_as_built_yaml(
 
 
 def parse_args() -> argparse.Namespace:
+    reg_config = load_config().get("registration", {}) or {}
     parser = argparse.ArgumentParser(
         description="Measure the extrinsics of a camera pair and evaluate its geometry.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -270,7 +272,9 @@ def parse_args() -> argparse.Namespace:
                "per-camera intrinsics can usually be reused here.",
     )
     parser.add_argument(
+        "--in",
         "--captures",
+        dest="captures",
         nargs="+",
         help="Directories holding capture session subfolders "
              "(default: geometric_calibration.stereo_captures, else captures/calib_<a>).",
@@ -285,7 +289,7 @@ def parse_args() -> argparse.Namespace:
                              f"else {DEFAULT_BOARD_CONFIG}).")
     parser.add_argument("--intrinsics-a", help="Override the intrinsics JSON for camera A.")
     parser.add_argument("--intrinsics-b", help="Override the intrinsics JSON for camera B.")
-    parser.add_argument("--output",
+    parser.add_argument("--out", "--output", dest="output",
                         help=f"Directory for results (default: geometric_calibration.output_dir, "
                              f"else {DEFAULT_OUTPUT_DIR}).")
     parser.add_argument("--rig", default=DEFAULT_RIG_CONFIG,
@@ -345,9 +349,15 @@ def parse_args() -> argparse.Namespace:
                              "(default: %(default)s).")
     parser.add_argument("--grid", type=int, default=DEFAULT_GRID,
                         help="Samples per axis on each evaluated plane (default: %(default)s).")
-    parser.add_argument("--alpha", type=float, default=0.0,
-                        help="stereoRectify alpha: 0 crops to valid pixels, 1 keeps all "
-                             "(default: %(default)s).")
+    parser.add_argument(
+        "--alpha", type=float,
+        default=reg_config.get("rectification_alpha", 1.0),
+        help="stereoRectify alpha for the report's rectified.jpg/row-misalignment "
+             "check: 0 crops to valid pixels, 1 keeps all. Matches what "
+             "register_pipeline.py actually uses by default, so the preview reflects "
+             "real registration output instead of a stricter, more-cropped view "
+             "(default: registration.rectification_alpha in config, else %(default)s).",
+    )
     parser.add_argument("--no-figures", action="store_true",
                         help="Skip the matplotlib figures.")
     return parser.parse_args()
@@ -535,7 +545,11 @@ def main() -> int:
         blocks=block_summaries,
     )
     suspect = suspect_views(
-        views, epipolar, sigma=args.flag_sigma, max_epipolar_px=args.max_epipolar
+        views,
+        epipolar,
+        sigma=args.flag_sigma,
+        max_epipolar_px=args.max_epipolar,
+        image_size=extrinsics.image_size_a,
     )
 
     report = StereoReport(
@@ -610,6 +624,67 @@ def main() -> int:
         print("Quality warnings:")
         for warning in warnings:
             print(f"  - {warning}")
+
+    # Persist a short audit next to extrinsics so registration can point at it.
+    depth_min = scatter.get("depth_min_m")
+    depth_max = scatter.get("depth_max_m")
+    depth_span_ok = (
+        depth_min and depth_max and depth_max / max(depth_min, 1e-9) >= 1.3
+    )
+    epi_bad = epipolar["rms_px"] > 2.0
+    needs_recapture = (not depth_span_ok) or epi_bad or rectification.degenerate
+    audit_path = output_dir / "quality_audit.txt"
+    roll = getattr(extrinsics, "rotation_xyz_deg", None)
+    audit_lines = [
+        "Stereo calibration quality audit",
+        "=" * 40,
+        f"views_used: {extrinsics.views_used}",
+        f"reprojection_error_px: {extrinsics.reprojection_error_px:.3f}",
+        f"epipolar_rms_px: {epipolar['rms_px']:.3f}",
+        f"rectified_vertical_rms_px: {rectified['vertical_rms_px']:.3f}",
+        f"rotation_angle_deg: {extrinsics.rotation_angle_deg:.3f}",
+        f"rotation_xyz_deg: {roll}",
+        f"baseline_m: {extrinsics.baseline_m:.6f}",
+        f"baseline_axis_angle_deg: {extrinsics.baseline_axis_angle_deg:.2f}",
+        f"optical_axis_angle_deg: {extrinsics.optical_axis_angle_deg:.2f}",
+        f"observed_depth_m: {extrinsics.observed_depth_m}",
+        f"rectify.degenerate: {rectification.degenerate}",
+        f"rectify.valid_fraction: {getattr(rectification, 'valid_fraction', None)}",
+        "",
+    ]
+    if needs_recapture:
+        audit_lines += [
+            "ACTION REQUIRED — recapture stereo ChArUco:",
+            "  1. Board central in BOTH cameras at every shot.",
+            "  2. Several distances spanning the working range (e.g. 0.15-0.50 m),",
+            "     not a single distance. Need depth max/min > ~1.3 (prefer ~2x).",
+            "  3. Verify physical mount orientation (large relative roll may be a",
+            "     flipped mount — confirm it is intentional).",
+            "  4. Target after re-fit: epipolar / rectified vertical RMS < ~2 px;",
+            "     prefer non-degenerate rectify if the layout can be more side-by-side.",
+            "",
+        ]
+        print("")
+        print("ACTION REQUIRED: stereo calibration is not registration-ready.")
+        if not depth_span_ok:
+            print(
+                f"  - Board depth span is too narrow "
+                f"({depth_min:.3f}-{depth_max:.3f} m); recapture at multiple distances."
+            )
+        if epi_bad:
+            print(
+                f"  - Epipolar RMS is {epipolar['rms_px']:.2f} px "
+                "(want < ~2 px); dense SGBM will miss correspondences."
+            )
+        if rectification.degenerate:
+            print(
+                "  - Rectification is DEGENERATE; registration falls back to sparse "
+                "triangulation / plane warps until the geometry or calib improves."
+            )
+    audit_lines.append("Warnings from stereo_quality_warnings:")
+    audit_lines += [f" - {w}" for w in warnings] if warnings else [" - (none)"]
+    audit_path.write_text("\n".join(audit_lines) + "\n", encoding="utf-8")
+    written.append(audit_path)
 
     image_paths = {
         observation.label: (observation.left.image_path, observation.right.image_path)

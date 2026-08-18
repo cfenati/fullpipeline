@@ -4,20 +4,20 @@ cameras:
 - name: rgb_cam1
   pose:
     position:
-    - -0.06
-    - -0.000772
-    - 0.27615
-    azimuth_deg: 0.7368
-    elevation_deg: -78.8073
+    - -0.040699
+    - -2.7e-05
+    - 0.276
+    azimuth_deg: 0.0379
+    elevation_deg: -80.0
     roll_deg: -0.0
 - name: rgb_cam2
   pose:
     position:
-    - 0.03
-    - 0.002701
-    - 0.27615
-    azimuth_deg: -174.8561
-    elevation_deg: -78.8073
+    - 0.010563
+    - 0.001949
+    - 0.276
+    azimuth_deg: -169.5461
+    elevation_deg: -80.0
     roll_deg: -0.0
 - name: thermal
   pose:

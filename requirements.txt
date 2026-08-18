@@ -1,5 +1,5 @@
 numpy>=1.24
-opencv-python>=4.8
+opencv-contrib-python>=4.8  # contrib for cv2.aruco (ChArUco board detection)
 Pillow>=10.0
 PyYAML>=6.0
 

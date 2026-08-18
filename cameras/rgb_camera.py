@@ -1,11 +1,24 @@
+import subprocess
 import time
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import cv2
 import numpy as np
 
 STARTUP_FRAMES_TO_DISCARD = 8
 GRAB_PAIR_MAX_ATTEMPTS = 8
+# Auto toggles must be switched off before their manual counterpart becomes
+# writable (v4l2 reports e.g. exposure_time_absolute as "inactive" while
+# auto_exposure is in Aperture Priority).
+CONTROL_ORDER_FIRST = ("white_balance_automatic", "auto_exposure")
+
+
+def controls_for(rgb_config: Dict[str, Any], key: str) -> Dict[str, Any]:
+    """Merge rgb.controls.common with the per-camera overrides for ``key``."""
+    controls_config = rgb_config.get("controls") or {}
+    merged: Dict[str, Any] = dict(controls_config.get("common") or {})
+    merged.update(controls_config.get(key) or {})
+    return merged
 
 
 class RGBCamera:
@@ -16,12 +29,14 @@ class RGBCamera:
         width: int = 1280,
         height: int = 720,
         fps: int = 30,
+        controls: Optional[Dict[str, Any]] = None,
     ):
         self.device = device
         self.name = name
         self.width = width
         self.height = height
         self.fps = fps
+        self.controls = dict(controls or {})
         self._cap = None
 
     def open(self) -> None:
@@ -52,7 +67,36 @@ class RGBCamera:
         )
 
         self._cap = cap
+        self._apply_controls()
         self._discard_startup_frames()
+
+    def _apply_controls(self) -> None:
+        """Push v4l2 controls from config; they do not survive a replug/reboot."""
+        if not self.controls:
+            return
+
+        ordered = sorted(
+            self.controls.items(),
+            key=lambda item: (
+                CONTROL_ORDER_FIRST.index(item[0])
+                if item[0] in CONTROL_ORDER_FIRST
+                else len(CONTROL_ORDER_FIRST)
+            ),
+        )
+
+        for control, value in ordered:
+            command = ["v4l2-ctl", "-d", self.device, "-c", f"{control}={value}"]
+            try:
+                subprocess.run(command, check=True, capture_output=True, text=True)
+            except FileNotFoundError:
+                print(f"{self.name}: v4l2-ctl not found, skipping controls")
+                return
+            except subprocess.CalledProcessError as error:
+                detail = (error.stderr or error.stdout or "").strip()
+                print(f"{self.name}: could not set {control}={value} ({detail})")
+
+        summary = ", ".join(f"{name}={value}" for name, value in ordered)
+        print(f"{self.name} controls: {summary}")
 
     def _discard_startup_frames(self) -> None:
         if self._cap is None:

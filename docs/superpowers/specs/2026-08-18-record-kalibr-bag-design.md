@@ -5,7 +5,7 @@
 
 ## Purpose
 
-A new standalone entry-point script that records a ROS1 `.bag` file containing
+A new standalone entry-point script that records two mp4 from my cameras containing
 two synchronized image topics, one per RGB camera, formatted for consumption
 by the [Kalibr](https://github.com/ethz-asl/kalibr) camera calibration
 toolbox. This is separate from and does not replace this repo's own
@@ -15,19 +15,7 @@ toolbox. This is separate from and does not replace this repo's own
 
 Grab frames directly from hardware (reusing `cameras/rgb_camera.py`'s
 `RGBCamera`, the same class `capture_pipeline.py` uses) and write them
-straight into the bag via the offline `rosbag` Python API. No `roscore` and no
-ROS driver nodes involved — the script itself is the only thing that needs a
-ROS1 Python environment available.
-
-## Requirements / environment
-
-Needs ROS1's Python packages (`rospy`, `rosbag`, `sensor_msgs`) importable —
-normally via `source /opt/ros/<distro>/setup.bash` before running. These are
-not installed in this dev environment, so — consistent with this repo's other
-hardware/vendor-SDK-dependent scripts (Optris `libirimager`, FLIR `PySpin`) —
-this script cannot be executed or import-tested here. Validation is limited to
-a static/syntax read-through; this will be stated explicitly rather than
-claiming it runs.
+straight into a mp4 format. 
 
 ## Config & CLI
 
@@ -42,28 +30,6 @@ New CLI flag:
 
 Recording runs until interrupted with Ctrl+C (no duration/frame-count flags).
 
-## Topic mapping
-
-| Camera (config.yaml) | ROS topic        |
-|-----------------------|-------------------|
-| `rgb.cam1`             | `/cam0/image_raw` |
-| `rgb.cam2`             | `/cam1/image_raw` |
-
-These match Kalibr's own `bagcreator` default naming, so
-`kalibr_calibrate_cameras` needs no extra `--topics` flag.
-
-## Message format
-
-`sensor_msgs/Image`, constructed by hand (no `cv_bridge`, which is often
-broken outside a fully ROS-sourced Python environment):
-
-- `encoding = "bgr8"`
-- `height`, `width` from the captured frame's shape
-- `step = width * 3`
-- `data = frame.tobytes()`
-- `header.frame_id = "cam0"` / `"cam1"`
-- `header.stamp` built from `time.time()` via `rospy.Time(secs, nsecs)`
-  (avoids `rospy.Time.now()`, which can require an initialized node/roscore)
 
 ## Loop & lifecycle
 
@@ -75,9 +41,4 @@ broken outside a fully ROS-sourced Python environment):
    release both cameras and close the bag so it isn't left corrupted.
 
 ## Out of scope
-
-- No `rosbag record` wrapping of externally-published topics (frames come
-  straight from hardware).
-- No duration/frame-count stop conditions — Ctrl+C only.
-- No `CompressedImage` variant — raw `bgr8` only.
-- No changes to `config.yaml` schema — reuses the existing `rgb` section.
+save two mp4 files from cameras rgb1 and 2 that are syncronized and that will next feed the kalibr pipeline

@@ -38,26 +38,6 @@ def center_patch(image: np.ndarray, border_fraction: float = DEFAULT_BORDER_FRAC
     ]
 
 
-def neutralize_center_white(
-    image: np.ndarray,
-    border_fraction: float = DEFAULT_BORDER_FRACTION,
-) -> np.ndarray:
-    """Scale BGR channels so the center patch has equal channel means."""
-    patch = center_patch(image, border_fraction=border_fraction).reshape(-1, 3).astype(np.float32)
-    b_mean, g_mean, r_mean = patch.mean(axis=0)
-    gray_target = float((b_mean + g_mean + r_mean) / 3.0)
-    scale = np.array(
-        [
-            gray_target / (b_mean + 1e-6),
-            gray_target / (g_mean + 1e-6),
-            gray_target / (r_mean + 1e-6),
-        ],
-        dtype=np.float32,
-    )
-    corrected = np.clip(image.astype(np.float32) * scale, 0, 255)
-    return corrected.astype(np.uint8)
-
-
 @dataclass
 class FlatFieldMaps:
     gain_b: np.ndarray
@@ -66,12 +46,12 @@ class FlatFieldMaps:
     blur_sigma_px: float
     source_width: int
     source_height: int
+    # True when a fixed white balance was folded into the gains at build time.
+    white_balanced: bool = False
 
     def apply(
         self,
         image: np.ndarray,
-        border_fraction: float = DEFAULT_BORDER_FRACTION,
-        neutralize_white: bool = False,
         strength: float = DEFAULT_CORRECTION_STRENGTH,
         max_gain: float = DEFAULT_MAX_GAIN,
         min_gain: float = DEFAULT_MIN_GAIN,
@@ -87,11 +67,7 @@ class FlatFieldMaps:
         image_f = image.astype(np.float32)
         channels = cv2.split(image_f)
         corrected = cv2.merge([channel * gain for channel, gain in zip(channels, gains)])
-        corrected = np.clip(corrected, 0, 255).astype(np.uint8)
-
-        if neutralize_white:
-            corrected = neutralize_center_white(corrected, border_fraction=border_fraction)
-        return corrected
+        return np.clip(corrected, 0, 255).astype(np.uint8)
 
     def _gains_for_shape(self, shape: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         height, width = shape
@@ -115,6 +91,7 @@ class FlatFieldMaps:
             blur_sigma_px=np.array([self.blur_sigma_px], dtype=np.float32),
             source_width=np.array([self.source_width], dtype=np.int32),
             source_height=np.array([self.source_height], dtype=np.int32),
+            white_balanced=np.array([self.white_balanced], dtype=bool),
         )
 
     @classmethod
@@ -131,6 +108,10 @@ class FlatFieldMaps:
             blur_sigma_px=float(data["blur_sigma_px"][0]),
             source_width=int(data["source_width"][0]),
             source_height=int(data["source_height"][0]),
+            # Maps built before white balancing existed carry no such key.
+            white_balanced=bool(data["white_balanced"][0])
+            if "white_balanced" in data
+            else False,
         )
 
     @classmethod
@@ -139,17 +120,33 @@ class FlatFieldMaps:
         image: np.ndarray,
         blur_sigma_fraction: float = DEFAULT_BLUR_SIGMA_FRACTION,
         border_fraction: float = DEFAULT_BORDER_FRACTION,
+        white_balance: bool = False,
     ) -> "FlatFieldMaps":
+        """Build gain maps from a white/gray reference.
+
+        Each channel is normalised to a target level. With ``white_balance``
+        the target is shared across channels instead of per-channel, which
+        folds a fixed white balance into the maps: the reference comes out
+        neutral, and because the target is the *weakest* channel every channel
+        is scaled down at the centre, so nothing is amplified (no added noise,
+        no clipping). Measured once here, it is scene-independent -- unlike a
+        per-frame balance, it cannot shift when the subject moves.
+        """
         height, width = image.shape[:2]
         sigma = max(8.0, min(height, width) * blur_sigma_fraction)
         image_f = image.astype(np.float32)
         center = center_patch(image_f, border_fraction=border_fraction)
         center_means = center.reshape(-1, 3).mean(axis=0)
 
+        if white_balance:
+            targets = np.full(3, float(center_means.min()), dtype=np.float32)
+        else:
+            targets = center_means.astype(np.float32)
+
         gain_maps = []
         for channel_index, channel in enumerate(cv2.split(image_f)):
             shading = cv2.GaussianBlur(channel, (0, 0), sigmaX=sigma, sigmaY=sigma)
-            gain_maps.append((center_means[channel_index] / (shading + 1e-6)).astype(np.float32))
+            gain_maps.append((targets[channel_index] / (shading + 1e-6)).astype(np.float32))
 
         return cls(
             gain_b=gain_maps[0],
@@ -158,6 +155,7 @@ class FlatFieldMaps:
             blur_sigma_px=sigma,
             source_width=width,
             source_height=height,
+            white_balanced=bool(white_balance),
         )
 
 
@@ -165,12 +163,14 @@ def compute_flat_field_from_white(
     image: np.ndarray,
     blur_sigma_fraction: float = DEFAULT_BLUR_SIGMA_FRACTION,
     border_fraction: float = DEFAULT_BORDER_FRACTION,
+    white_balance: bool = False,
 ) -> FlatFieldMaps:
     """Build per-channel gain maps from a uniform white/gray reference frame."""
     return FlatFieldMaps.from_white_reference(
         image,
         blur_sigma_fraction=blur_sigma_fraction,
         border_fraction=border_fraction,
+        white_balance=white_balance,
     )
 
 
@@ -179,27 +179,27 @@ def apply_flat_field_correction(
     flat_field: Optional[FlatFieldMaps] = None,
     blur_sigma_fraction: float = DEFAULT_BLUR_SIGMA_FRACTION,
     border_fraction: float = DEFAULT_BORDER_FRACTION,
-    neutralize_white: bool = True,
     strength: float = 1.0,
     max_gain: float = DEFAULT_MAX_GAIN,
     min_gain: float = DEFAULT_MIN_GAIN,
+    white_balance: bool = False,
 ) -> Tuple[np.ndarray, FlatFieldMaps]:
     """Correct vignetting and color tint using flat-field division.
 
     If ``flat_field`` is omitted, gain maps are estimated from ``image`` itself
-    (useful for one-off correction of a white reference capture).
+    (useful for one-off correction of a white reference capture). ``white_balance``
+    only applies to that estimation step; saved maps already carry it baked in.
     """
     if flat_field is None:
         flat_field = compute_flat_field_from_white(
             image,
             blur_sigma_fraction=blur_sigma_fraction,
             border_fraction=border_fraction,
+            white_balance=white_balance,
         )
 
     corrected = flat_field.apply(
         image,
-        border_fraction=border_fraction,
-        neutralize_white=neutralize_white,
         strength=strength,
         max_gain=max_gain,
         min_gain=min_gain,
@@ -216,7 +216,6 @@ class RGBColorCorrector:
     blur_sigma_fraction: float = DEFAULT_BLUR_SIGMA_FRACTION
     border_fraction: float = DEFAULT_BORDER_FRACTION
     on_the_fly_fallback: bool = True
-    neutralize_white: bool = False
     preview_corrected: bool = True
     strength: float = DEFAULT_CORRECTION_STRENGTH
     max_gain: float = DEFAULT_MAX_GAIN
@@ -245,8 +244,6 @@ class RGBColorCorrector:
         if flat_field is not None:
             return flat_field.apply(
                 frame,
-                border_fraction=self.border_fraction,
-                neutralize_white=self.neutralize_white,
                 strength=self.strength,
                 max_gain=self.max_gain,
                 min_gain=self.min_gain,
@@ -259,7 +256,6 @@ class RGBColorCorrector:
             frame,
             blur_sigma_fraction=self.blur_sigma_fraction,
             border_fraction=self.border_fraction,
-            neutralize_white=self.neutralize_white,
             strength=self.strength,
             max_gain=self.max_gain,
             min_gain=self.min_gain,
@@ -273,7 +269,6 @@ class RGBColorCorrector:
             "blur_sigma_fraction": self.blur_sigma_fraction,
             "border_fraction": self.border_fraction,
             "on_the_fly_fallback": self.on_the_fly_fallback,
-            "neutralize_white": self.neutralize_white,
             "preview_corrected": self.preview_corrected,
             "strength": self.strength,
             "max_gain": self.max_gain,
@@ -326,7 +321,6 @@ def load_rgb_color_corrector(config: dict, project_root: Path) -> Optional[RGBCo
         ),
         border_fraction=float(correction_config.get("border_fraction", DEFAULT_BORDER_FRACTION)),
         on_the_fly_fallback=bool(correction_config.get("on_the_fly_fallback", True)),
-        neutralize_white=bool(correction_config.get("neutralize_white", False)),
         preview_corrected=bool(correction_config.get("preview_corrected", True)),
         strength=float(correction_config.get("strength", DEFAULT_CORRECTION_STRENGTH)),
         max_gain=float(correction_config.get("max_gain", DEFAULT_MAX_GAIN)),

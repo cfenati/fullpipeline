@@ -17,7 +17,7 @@ import numpy as np
 import yaml
 
 from cameras.blackfly_camera import BlackflyCamera
-from cameras.rgb_camera import RGBCamera
+from cameras.rgb_camera import RGBCamera, controls_for
 from cameras.thermal_camera import ThermalCamera, ThermalFrame
 from gui import CaptureGUI
 from color_correction import RGBColorCorrector, load_rgb_color_corrector
@@ -205,6 +205,7 @@ def open_cameras(
         width=rgb_config["width"],
         height=rgb_config["height"],
         fps=rgb_config["fps"],
+        controls=controls_for(rgb_config, "cam1"),
     )
     cam2 = RGBCamera(
         device=rgb_config["cam2"],
@@ -212,6 +213,7 @@ def open_cameras(
         width=rgb_config["width"],
         height=rgb_config["height"],
         fps=rgb_config["fps"],
+        controls=controls_for(rgb_config, "cam2"),
     )
     thermal = ThermalCamera(config_xml=config["thermal"]["config_xml"])
 
@@ -247,7 +249,10 @@ def save_capture(
     color_corrector: Optional[RGBColorCorrector] = None,
 ) -> Path:
     session_dir = output_dir / timestamp
-    session_dir.mkdir(parents=True, exist_ok=True)
+    # exist_ok=False: a collision here means two captures resolved to the same
+    # timestamp and would silently interleave their rgb_cam1/rgb_cam2 writes,
+    # pairing frames from two different moments under one session label.
+    session_dir.mkdir(parents=True, exist_ok=False)
 
     rgb1_path = session_dir / "rgb_cam1.jpg"
     rgb2_path = session_dir / "rgb_cam2.jpg"
@@ -600,7 +605,7 @@ def run_pipeline(
                         should_quit = True
 
                 if should_capture:
-                    timestamp = time.strftime("%Y%m%d_%H%M%S")
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
                     save_blackfly_frame = blackfly_frame
                     if (
                         blackfly is not None

@@ -27,7 +27,7 @@ import cv2
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from cameras.rgb_camera import RGBCamera
+from cameras.rgb_camera import RGBCamera, controls_for
 from color_correction import (
     DEFAULT_MAX_GAIN,
     DEFAULT_MIN_GAIN,
@@ -279,8 +279,11 @@ def print_correction_tips() -> None:
     print("\nHow to fix color tint (in order of impact):")
     print("  1. Lighting: use diffuse, even illumination across the full FOV.")
     print("  2. Camera AWB: lock white balance after placing a gray/white card in center:")
-    print("       v4l2-ctl -d <device> -c white_balance_auto_preset=0")
-    print("       v4l2-ctl -d <device> -c white_balance_temperature=4500   # tune as needed")
+    print("       v4l2-ctl -d <device> -c white_balance_automatic=0")
+    print("       v4l2-ctl -d <device> -c white_balance_temperature=4500   # 2800-6500")
+    print("     Temperature is the red/blue axis only; a green cast needs software.")
+    print("  2b. Lock exposure too, so reference and real captures match:")
+    print("       v4l2-ctl -d <device> -c auto_exposure=1 -c exposure_time_absolute=157")
     print("  3. Software flat-field: this script's --correct step (saved as *_corrected.jpg).")
     print("     Re-capture a white reference under your real lighting and re-run to build gain maps.")
     print("  4. Pipeline: save the .npz flat-field from --save-flat-field and apply it to future captures.")
@@ -392,7 +395,7 @@ def print_v4l2_controls(device: str) -> None:
             print(f"  {line.strip()}")
 
 
-def capture_live(device: str, name: str, output_dir: Path, config: dict) -> Path:
+def capture_live(device: str, name: str, output_dir: Path, config: dict, key: str) -> Path:
     rgb_config = config["rgb"]
     camera = RGBCamera(
         device=device,
@@ -400,6 +403,7 @@ def capture_live(device: str, name: str, output_dir: Path, config: dict) -> Path
         width=int(rgb_config["width"]),
         height=int(rgb_config["height"]),
         fps=int(rgb_config["fps"]),
+        controls=controls_for(rgb_config, key),
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"{name}_live.jpg"
@@ -436,8 +440,8 @@ def resolve_image_paths(args: argparse.Namespace, config: dict) -> list[Path]:
 
     if args.live:
         live_dir = Path(args.output).expanduser().resolve() / "live_capture"
-        paths.append(capture_live(config["rgb"]["cam1"], "rgb_cam1", live_dir, config))
-        paths.append(capture_live(config["rgb"]["cam2"], "rgb_cam2", live_dir, config))
+        paths.append(capture_live(config["rgb"]["cam1"], "rgb_cam1", live_dir, config, "cam1"))
+        paths.append(capture_live(config["rgb"]["cam2"], "rgb_cam2", live_dir, config, "cam2"))
 
     if paths:
         return paths
@@ -560,6 +564,13 @@ def parse_args() -> argparse.Namespace:
         help="Path to a *_flat_field.npz (overrides config auto-match for cam1/cam2).",
     )
     parser.add_argument(
+        "--no-white-balance",
+        dest="white_balance",
+        action="store_false",
+        default=True,
+        help="Build maps without folding in a fixed white balance (shading only).",
+    )
+    parser.add_argument(
         "--strength",
         type=float,
         default=None,
@@ -576,11 +587,6 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="Lower gain clamp. Default: config or 0.85.",
-    )
-    parser.add_argument(
-        "--neutralize-white",
-        action="store_true",
-        help="Also force center patch to neutral gray after flat-field.",
     )
     return parser.parse_args()
 
@@ -612,9 +618,6 @@ def main() -> int:
         if args.min_gain is not None
         else correction_cfg.get("min_gain", DEFAULT_MIN_GAIN)
     )
-    neutralize_white = bool(
-        args.neutralize_white or correction_cfg.get("neutralize_white", False)
-    )
 
     for image_path in image_paths:
         image = cv2.imread(str(image_path))
@@ -637,7 +640,8 @@ def main() -> int:
             else:
                 flat_field = resolve_flat_field(image_path, args, config)
                 if flat_field is not None:
-                    print(f"Using saved flat-field for {image_path.name}")
+                    balance = "white-balanced" if flat_field.white_balanced else "shading only"
+                    print(f"Using saved flat-field for {image_path.name} ({balance})")
                 else:
                     print(
                         f"No saved flat-field for {image_path.name}; "
@@ -647,17 +651,17 @@ def main() -> int:
             print(
                 f"Tuning: strength={strength:.2f}, "
                 f"gain=[{min_gain:.2f}, {max_gain:.2f}], "
-                f"neutralize_white={neutralize_white}"
+                f"white_balance={args.white_balance}"
             )
             corrected, flat_field = apply_flat_field_correction(
                 image,
                 flat_field=flat_field,
                 blur_sigma_fraction=args.blur_sigma,
                 border_fraction=args.border_fraction,
-                neutralize_white=neutralize_white,
                 strength=strength,
                 max_gain=max_gain,
                 min_gain=min_gain,
+                white_balance=args.white_balance,
             )
             tag = f"s{strength:.2f}"
             corrected_path = output_dir / f"{image_path.stem}_corrected_{tag}.jpg"

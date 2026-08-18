@@ -40,6 +40,7 @@ from calibration.opencv_calibrate import (
     CameraIntrinsics,
     detect_observations,
     outlier_threshold,
+    scaled_px,
 )
 from calibration.target_board import TargetBoard
 
@@ -601,7 +602,12 @@ def calibrate_stereo(
 
         per_view = fit["per_view"]
         if threshold is None:
-            threshold = outlier_threshold(per_view, reject_sigma, max_view_error_px)
+            threshold = outlier_threshold(
+                per_view,
+                reject_sigma,
+                max_view_error_px,
+                image_size=intrinsics_a.image_size,
+            )
         worst = int(np.argmax(per_view))
         if (
             per_view[worst] <= threshold
@@ -871,6 +877,9 @@ class Rectification:
     degenerate: bool = False
     # Share of each rectified frame that real pixels reach.
     valid_fraction: Tuple[float, float] = (float("nan"), float("nan"))
+    # True when camera B's sensor is relabelled by a clean 180-degree in-plane
+    # turn before rectifying, see :func:`_prefer_flipped_b`.
+    b_flipped: bool = False
     @property
     def focal_px(self) -> float:
         return float(self.P1[0, 0])
@@ -895,6 +904,61 @@ class Rectification:
         disparity = np.asarray(disparity_px, dtype=float)
         with np.errstate(divide="ignore", invalid="ignore"):
             return self.Q[2, 3] / (self.Q[3, 2] * disparity + self.Q[3, 3])
+
+
+def _flip_camera_180(
+    camera_matrix: np.ndarray, distortion: np.ndarray, image_size: Tuple[int, int],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Camera model as seen through a 180-degree in-plane relabelling of the sensor.
+
+    Turning a camera's own axes 180 degrees about its optical axis is just a
+    choice of labelling - it does not change what the lens does - so the
+    principal point mirrors to the opposite corner and the tangential
+    distortion terms (the only ones that are not rotationally symmetric) flip
+    sign; radial terms are unchanged.
+    """
+    width, height = image_size
+    camera_matrix = camera_matrix.copy()
+    camera_matrix[0, 2] = width - 1 - camera_matrix[0, 2]
+    camera_matrix[1, 2] = height - 1 - camera_matrix[1, 2]
+    distortion = distortion.copy()
+    flat = distortion.reshape(-1)
+    if flat.size >= 4:
+        flat[2] *= -1.0  # p1
+        flat[3] *= -1.0  # p2
+    return camera_matrix, distortion
+
+
+def _prefer_flipped_b(
+    R: np.ndarray,
+    T: np.ndarray,
+    camera_matrix_b: np.ndarray,
+    distortion_b: np.ndarray,
+    image_size_b: Tuple[int, int],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool]:
+    """Prefer whichever labelling of camera B's axes keeps the pair's rotation small.
+
+    ``cv2.stereoCalibrate`` reports ``R`` for however B's sensor happens to be
+    read out. When B is mounted rolled close to 180 degrees relative to A -
+    common when a module is flipped to route its cable the other way - that
+    roll rides on top of the true toe-in and is large enough to break
+    ``cv2.stereoRectify``'s own scaling (see :func:`rectify`). Relabelling B's
+    axes by a clean 180-degree turn is free (no physical camera changes), so
+    take whichever labelling minimises the total relative rotation; a normal,
+    already-close-to-parallel pair is untouched because flipping it would only
+    make the rotation larger.
+    """
+    flip = np.diag([-1.0, -1.0, 1.0])
+
+    def angle(matrix: np.ndarray) -> float:
+        cos = (float(np.trace(matrix)) - 1.0) / 2.0
+        return float(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))))
+
+    if angle(flip @ R) >= angle(R):
+        return R, T, camera_matrix_b, distortion_b, False
+
+    camera_matrix_b, distortion_b = _flip_camera_180(camera_matrix_b, distortion_b, image_size_b)
+    return flip @ R, flip @ T, camera_matrix_b, distortion_b, True
 
 
 def rectify(
@@ -930,40 +994,61 @@ def rectify(
     subject leaves one of them entirely.
     """
     width, height = extrinsics.image_size_a
-    translation = extrinsics.T.reshape(3)
-    rotated = abs(translation[1]) > abs(translation[0])
+    R_b, T_b, camera_matrix_b, distortion_b, b_flipped = _prefer_flipped_b(
+        extrinsics.R, extrinsics.T.reshape(3),
+        extrinsics.camera_matrix_b, extrinsics.distortion_b, extrinsics.image_size_b,
+    )
+    rotated = abs(T_b[1]) > abs(T_b[0])
     output_size = (height, width) if rotated else (width, height)
 
     R1, R2, P1, P2, Q, roi_a, roi_b = cv2.stereoRectify(
         extrinsics.camera_matrix_a,
         extrinsics.distortion_a,
-        extrinsics.camera_matrix_b,
-        extrinsics.distortion_b,
+        camera_matrix_b,
+        distortion_b,
         (width, height),
-        extrinsics.R,
-        extrinsics.T,
+        R_b,
+        T_b.reshape(3, 1),
         flags=cv2.CALIB_ZERO_DISPARITY,
         alpha=alpha,
         newImageSize=output_size,
     )
-    P1, P2, Q = np.asarray(P1), np.asarray(P2), np.asarray(Q)
+    R1, R2, P1, P2, Q = (np.asarray(x) for x in (R1, R2, P1, P2, Q))
+
+    # R1/R2 keep the pair row-aligned for any R_b/T_b (R1 == R2 @ R_b always
+    # holds), but cv2 is free to pick either rectified axis for the baseline -
+    # it is not always horizontal. compute_stereo_depth's SGBM only ever
+    # searches rows, so a baseline it placed on the vertical axis has to be
+    # turned back onto the horizontal one; any common rotation of R1 and R2
+    # preserves row-alignment, so this costs nothing. cv2's own P1/P2/Q were
+    # built for the unturned R1/R2 and no longer apply, so they get rebuilt
+    # the same way the degenerate fallback below does.
+    baseline_dir = R2 @ T_b
+    turned = abs(baseline_dir[1]) > abs(baseline_dir[0])
+    if turned:
+        turn = np.array([[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+        R1, R2 = turn @ R1, turn @ R2
+        output_size = (output_size[1], output_size[0])
+        rotated = not rotated
+
     out_width, out_height = output_size
-    degenerate = not (
+    degenerate = turned or not (
         P1[0, 0] > 0
         and 0.0 <= P1[0, 2] <= out_width
         and 0.0 <= P1[1, 2] <= out_height
     )
     if degenerate:
         P1, P2, Q = _neutral_projections(
-            extrinsics, np.asarray(R1), np.asarray(R2), output_size, reference_depth
+            extrinsics, R1, R2, output_size, reference_depth,
+            R_b=R_b, T_b=T_b, camera_matrix_b=camera_matrix_b,
         )
         roi_a = roi_b = (0, 0, 0, 0)
 
     rectification = Rectification(
-        R1=np.asarray(R1), R2=np.asarray(R2), P1=P1, P2=P2, Q=Q,
+        R1=R1, R2=R2, P1=P1, P2=P2, Q=Q,
         roi_a=tuple(int(v) for v in roi_a), roi_b=tuple(int(v) for v in roi_b),
         image_size=output_size, alpha=float(alpha), rotated=rotated,
-        degenerate=degenerate,
+        degenerate=degenerate, b_flipped=b_flipped,
     )
     rectification.valid_fraction = _valid_fraction(extrinsics, rectification)
     return rectification
@@ -975,23 +1060,38 @@ def _neutral_projections(
     R2: np.ndarray,
     output_size: Tuple[int, int],
     reference_depth: Optional[float] = None,
+    *,
+    R_b: Optional[np.ndarray] = None,
+    T_b: Optional[np.ndarray] = None,
+    camera_matrix_b: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Rectified projections with a plain focal length, aimed at the working plane.
 
     The rectifying rotations are taken as given: they are what makes the pair
     row-aligned and OpenCV gets them right even when its scaling fails. Only the
     focal length and the two principal points are chosen here.
+
+    ``R_b``/``T_b``/``camera_matrix_b`` are the (possibly 180-degree relabelled,
+    see :func:`_prefer_flipped_b`) values actually used to reach ``R1``/``R2``;
+    they default to the raw extrinsics for callers that never flip B.
     """
+    if R_b is None:
+        R_b = extrinsics.R
+    if T_b is None:
+        T_b = extrinsics.T.reshape(3)
+    if camera_matrix_b is None:
+        camera_matrix_b = extrinsics.camera_matrix_b
+
     width, height = output_size
     focal = 0.25 * float(
         extrinsics.camera_matrix_a[0, 0] + extrinsics.camera_matrix_a[1, 1]
-        + extrinsics.camera_matrix_b[0, 0] + extrinsics.camera_matrix_b[1, 1]
+        + camera_matrix_b[0, 0] + camera_matrix_b[1, 1]
     )
     center_x, center_y = (width - 1.0) / 2.0, (height - 1.0) / 2.0
 
     # After rectification both cameras share one orientation and camera B is
     # displaced from camera A along the rectified x axis by this much.
-    tx = float((R2 @ extrinsics.T.reshape(3))[0])
+    tx = float((R2 @ T_b)[0])
 
     cx_a = cx_b = center_x
     cy = center_y
@@ -1003,7 +1103,7 @@ def _neutral_projections(
         # at least one of the two frames.
         point = np.array([0.0, 0.0, float(reference_depth)])
         in_a = R1 @ point
-        in_b = R2 @ (extrinsics.R @ point + extrinsics.T.reshape(3))
+        in_b = R2 @ (R_b @ point + T_b)
         cx_a = center_x - focal * in_a[0] / in_a[2]
         cx_b = center_x - focal * in_b[0] / in_b[2]
         # in_b is in_a shifted along x, so one shared value aligns both rows.
@@ -1045,14 +1145,30 @@ def rectify_maps(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Remap tables that undistort and row-align one camera of the pair."""
     is_a = which.lower() == "a"
-    return cv2.initUndistortRectifyMap(
-        extrinsics.camera_matrix_a if is_a else extrinsics.camera_matrix_b,
-        extrinsics.distortion_a if is_a else extrinsics.distortion_b,
+    if is_a:
+        camera_matrix, distortion = extrinsics.camera_matrix_a, extrinsics.distortion_a
+    else:
+        camera_matrix, distortion = extrinsics.camera_matrix_b, extrinsics.distortion_b
+        if rectification.b_flipped:
+            camera_matrix, distortion = _flip_camera_180(
+                camera_matrix, distortion, extrinsics.image_size_b,
+            )
+    map_x, map_y = cv2.initUndistortRectifyMap(
+        camera_matrix,
+        distortion,
         rectification.R1 if is_a else rectification.R2,
         rectification.P1 if is_a else rectification.P2,
         rectification.image_size,
         cv2.CV_32FC1,
     )
+    if not is_a and rectification.b_flipped:
+        # The maps above sample a 180-degree-relabelled B; undo that so they
+        # index straight into the raw, unrotated source image instead of
+        # requiring callers to rotate it first.
+        width, height = extrinsics.image_size_b
+        map_x = (width - 1) - map_x
+        map_y = (height - 1) - map_y
+    return map_x, map_y
 
 
 def rectified_residuals(
@@ -1071,15 +1187,29 @@ def rectified_residuals(
     disparity: List[np.ndarray] = []
     depths: List[np.ndarray] = []
 
+    camera_matrix_b, distortion_b = extrinsics.camera_matrix_b, extrinsics.distortion_b
+    if rectification.b_flipped:
+        camera_matrix_b, distortion_b = _flip_camera_180(
+            camera_matrix_b, distortion_b, extrinsics.image_size_b,
+        )
+    width_b, height_b = extrinsics.image_size_b
+
     for observation in observations:
         points_a = cv2.undistortPoints(
             observation.left_points.astype(np.float64),
             extrinsics.camera_matrix_a, extrinsics.distortion_a,
             R=rectification.R1, P=rectification.P1,
         ).reshape(-1, 2)
+        right_points = observation.right_points.astype(np.float64)
+        if rectification.b_flipped:
+            # R2/P2 were built for the 180-degree-relabelled B; raw corner
+            # pixels need the same relabelling before undistorting with them.
+            right_points = right_points.copy()
+            right_points[..., 0] = (width_b - 1) - right_points[..., 0]
+            right_points[..., 1] = (height_b - 1) - right_points[..., 1]
         points_b = cv2.undistortPoints(
-            observation.right_points.astype(np.float64),
-            extrinsics.camera_matrix_b, extrinsics.distortion_b,
+            right_points,
+            camera_matrix_b, distortion_b,
             R=rectification.R2, P=rectification.P2,
         ).reshape(-1, 2)
         vertical.append(points_a[:, 1] - points_b[:, 1])
@@ -1328,6 +1458,7 @@ def suspect_views(
     epipolar: Optional[Dict[str, Any]] = None,
     sigma: float = DEFAULT_REJECT_SIGMA,
     max_epipolar_px: Optional[float] = None,
+    image_size: Optional[Tuple[int, int]] = None,
 ) -> Dict[str, List[str]]:
     """Views that survived the fit but disagree with the rest of the set.
 
@@ -1360,7 +1491,12 @@ def suspect_views(
         if len(per_view) >= MIN_PAIRS:
             labels = list(per_view)
             values = np.array([per_view[label] for label in labels])
-            threshold = outlier_threshold(values, sigma, max_epipolar_px)
+            threshold = outlier_threshold(
+                values,
+                sigma,
+                max_epipolar_px,
+                image_size=image_size,
+            )
             for label, value in zip(labels, values):
                 if value > threshold:
                     flag(label, f"epipolar {value:.3f} px, over the {threshold:.3f} px "
@@ -1538,18 +1674,24 @@ def stereo_quality_warnings(
                 "the frame these views land in - recalibrate each camera over the region the "
                 "stereo captures actually use."
             )
-    elif extrinsics.reprojection_error_px > GOOD_STEREO_RMS_PX:
-        warnings.append(
-            f"Stereo RMS is {extrinsics.reprojection_error_px:.2f} px (expected below "
-            f"{GOOD_STEREO_RMS_PX:.1f} px). Either the corner detections are soft or the "
-            "intrinsics do not fit these images; re-check the per-camera calibration first."
-        )
+    else:
+        stereo_limit = scaled_px(GOOD_STEREO_RMS_PX, extrinsics.image_size_a)
+        if extrinsics.reprojection_error_px > stereo_limit:
+            warnings.append(
+                f"Stereo RMS is {extrinsics.reprojection_error_px:.2f} px (expected below "
+                f"{stereo_limit:.1f} px at {extrinsics.image_size_a[0]}x"
+                f"{extrinsics.image_size_a[1]}). Either the corner detections are soft or the "
+                "intrinsics do not fit these images; re-check the per-camera calibration first."
+            )
 
-    if epipolar and epipolar["rms_px"] > GOOD_EPIPOLAR_RMS_PX:
-        warnings.append(
-            f"Epipolar RMS is {epipolar['rms_px']:.2f} px, so a matcher searching one "
-            "row along the epipolar line will miss correspondences."
-        )
+    if epipolar:
+        epi_limit = scaled_px(GOOD_EPIPOLAR_RMS_PX, extrinsics.image_size_a)
+        if epipolar["rms_px"] > epi_limit:
+            warnings.append(
+                f"Epipolar RMS is {epipolar['rms_px']:.2f} px (expected below "
+                f"{epi_limit:.1f} px at this resolution), so a matcher searching one "
+                "row along the epipolar line will miss correspondences."
+            )
 
     n_input = extrinsics.views_used + len(extrinsics.rejected_views)
     if extrinsics.rejected_views and n_input > 0:

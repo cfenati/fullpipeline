@@ -13,3 +13,16 @@ color_reports/
 
 # Registration outputs (keep registration/*.py source)
 registration/results/
+
+# Subagent-driven-development scratch (ledgers, briefs, review packages)
+.superpowers/
+
+# Nested git worktrees (each is its own checkout; never embed in this repo)
+.claude/worktrees/
+
+# Personal Claude Code settings (permissions etc.) -- local to this machine
+.claude/settings.local.json
+
+# DIYer22/calibrating: cloned third-party reference repo, used only for
+# independent cross-checks (see docs/superpowers/specs/2026-08-18-feature-based-registration-design.md)
+DIYer22/calibrating/
