@@ -35,12 +35,21 @@ Example:
 
 from __future__ import annotations
 
-from typing import Tuple
+import sys
+from pathlib import Path
+from typing import List, Tuple
 
 import cv2
 import kornia.feature as KF
 import numpy as np
 import torch
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from calibration.stereo import StereoExtrinsics  # noqa: E402
+from register_pipeline import PREVIEW_PANEL_WIDTH  # noqa: E402
 
 
 DEFAULT_MAX_KEYPOINTS = 2048
@@ -237,3 +246,128 @@ def fit_depth(
     final_errors = np.where(valid, np.linalg.norm(predicted_b - pts_b, axis=1), np.inf)
     final_inliers = final_errors < ransac_threshold
     return refined_depth, coarse_depth, final_inliers, final_errors
+
+
+# --------------------------------------------------------------------------- #
+# Output
+# --------------------------------------------------------------------------- #
+def render_match_visualization(
+    color_a: np.ndarray, color_b: np.ndarray,
+    pts_a: np.ndarray, pts_b: np.ndarray, inliers: np.ndarray,
+) -> np.ndarray:
+    """Side-by-side correspondence visualization: green lines/dots for inlier
+    matches, red for outliers. A and B keep their native size here (no
+    PREVIEW_PANEL_WIDTH resize) so matches.jpg is legible at full detail;
+    save_preview resizes a copy for the combined strip."""
+    height = max(color_a.shape[0], color_b.shape[0])
+    canvas = np.zeros((height, color_a.shape[1] + color_b.shape[1], 3), dtype=np.uint8)
+    canvas[: color_a.shape[0], : color_a.shape[1]] = color_a
+    canvas[: color_b.shape[0], color_a.shape[1] :] = color_b
+    offset_x = color_a.shape[1]
+
+    for i in range(len(pts_a)):
+        color = (0, 200, 0) if inliers[i] else (0, 0, 200)
+        point_a = (int(round(pts_a[i, 0])), int(round(pts_a[i, 1])))
+        point_b = (int(round(pts_b[i, 0] + offset_x)), int(round(pts_b[i, 1])))
+        cv2.line(canvas, point_a, point_b, color, 1, cv2.LINE_AA)
+        cv2.circle(canvas, point_a, 3, color, -1, cv2.LINE_AA)
+        cv2.circle(canvas, point_b, 3, color, -1, cv2.LINE_AA)
+    return canvas
+
+
+def _labelled(image: np.ndarray, text: str) -> np.ndarray:
+    frame = image.copy()
+    cv2.putText(frame, text, (16, 36), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2, cv2.LINE_AA)
+    return frame
+
+
+def _resize_to_width(image: np.ndarray, width: int) -> np.ndarray:
+    if image.shape[1] <= width:
+        return image
+    scale = width / image.shape[1]
+    return cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+
+
+def save_preview(
+    path: Path, color_a: np.ndarray, warped_color: np.ndarray, match_viz: np.ndarray,
+) -> None:
+    """camera A | warped B | match visualization, side by side.
+
+    Unlike register_pipeline.save_preview's three panels (which all share
+    size_a's aspect ratio), match_viz is roughly twice as wide as the other
+    two, so after independent _resize_to_width scaling the panels can end
+    up different heights -- pad each to the tallest before hstacking, or
+    np.hstack raises on mismatched shapes.
+    """
+    panels = [
+        _resize_to_width(_labelled(color_a, "camera A"), PREVIEW_PANEL_WIDTH),
+        _resize_to_width(_labelled(warped_color, "B warped onto A"), PREVIEW_PANEL_WIDTH),
+        _resize_to_width(_labelled(match_viz, "LightGlue matches"), PREVIEW_PANEL_WIDTH),
+    ]
+    max_height = max(panel.shape[0] for panel in panels)
+    padded = [
+        cv2.copyMakeBorder(panel, 0, max_height - panel.shape[0], 0, 0, cv2.BORDER_CONSTANT, value=(0, 0, 0))
+        for panel in panels
+    ]
+    preview = np.hstack(padded)
+    cv2.imwrite(str(path), preview)
+
+
+def write_report(
+    path: Path,
+    session_dir: Path, camera_a: str, camera_b: str, extrinsics_path: Path,
+    extrinsics: StereoExtrinsics, size_a: Tuple[int, int],
+    n_raw_matches: int, min_confidence: float, n_matches: int,
+    depths: np.ndarray, ransac_threshold: float,
+    fitted_depth: float, inliers: np.ndarray, errors: np.ndarray,
+    default_depth: float, d_critical: float, warnings: List[str],
+) -> None:
+    """n_matches and inliers.sum() are both guaranteed > 0 here -- main()
+    SystemExits before calling this if --min-matches or MIN_INLIERS_TO_TRUST
+    aren't met, so no n/a branches are needed (unlike register_pipeline's
+    write_report, which isn't gated the same way for its DEPTH MAP section)."""
+    n_inliers = int(inliers.sum())
+    inlier_errors = errors[inliers]
+
+    lines = [
+        f"Registration: {camera_b} -> {camera_a} (LightGlue sparse match + single fitted plane depth)",
+        "=" * 66,
+        "",
+        f"  session:            {session_dir}",
+        f"  extrinsics:         {extrinsics_path}",
+        f"  resolution:         {size_a[0]}x{size_a[1]}",
+        f"  baseline:           {extrinsics.baseline_m * 1000:.2f} mm",
+        f"  convergence:        {extrinsics.optical_axis_angle_deg:.2f} deg",
+        "",
+        "MATCHING",
+        "-" * 66,
+        f"  raw LightGlue matches:      {n_raw_matches}",
+        f"  above min-confidence {min_confidence}: {n_matches}",
+        "",
+        "DEPTH FIT",
+        "-" * 66,
+        f"  search range:        {depths[0]:.4f} - {depths[-1]:.4f} m "
+        f"({len(depths)} steps, uniform in 1/depth)",
+        f"  ransac threshold:    {ransac_threshold} px",
+        f"  fitted depth:        {fitted_depth:.4f} m",
+        f"  inliers:             {n_inliers} / {n_matches} ({n_inliers / n_matches * 100:.1f}%)",
+        f"  reprojection error (inliers, px): median {np.median(inlier_errors):.2f}, "
+        f"mean {inlier_errors.mean():.2f}, max {inlier_errors.max():.2f}",
+        f"  calibrated default depth: {default_depth:.4f} m "
+        f"(delta {abs(fitted_depth - default_depth) * 1000:.1f} mm)",
+        f"  homography singular at:  {d_critical * 1000:.2f} mm "
+        f"({'well clear of' if abs(d_critical) < depths[0] / 5 else 'CHECK: close to'} "
+        "the search range)",
+    ]
+    if warnings:
+        lines += ["", "Quality warnings", "-" * 66]
+        lines += [f"  - {warning}" for warning in warnings]
+    lines += [
+        "",
+        "OUTPUT FILES",
+        "-" * 66,
+        "  warped_features.jpg   camera B warped onto camera A via the fitted single-depth homography",
+        "  matches.jpg           inlier (green) / outlier (red) correspondence lines",
+        "  preview_features.jpg  camera A | warped B | match visualization, side by side",
+    ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
