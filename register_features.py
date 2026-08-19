@@ -37,7 +37,69 @@ from __future__ import annotations
 
 from typing import Tuple
 
+import cv2
+import kornia.feature as KF
 import numpy as np
+import torch
+
+
+DEFAULT_MAX_KEYPOINTS = 2048
+
+
+# --------------------------------------------------------------------------- #
+# Feature extraction & matching
+# --------------------------------------------------------------------------- #
+def load_models(device: torch.device) -> Tuple[KF.DISK, KF.LightGlueMatcher]:
+    """Load the pretrained DISK extractor and LightGlue matcher once.
+
+    Weights auto-download from kornia's model hub on first call (needs
+    internet once; cached locally after that).
+    """
+    disk = KF.DISK.from_pretrained("depth").to(device).eval()
+    matcher = KF.LightGlueMatcher("disk").to(device).eval()
+    return disk, matcher
+
+
+def extract_features(
+    disk: KF.DISK, image_bgr: np.ndarray, device: torch.device, max_keypoints: int,
+) -> Tuple["KF.DISKFeatures", Tuple[int, int]]:
+    """DISK keypoints + descriptors for one BGR image.
+
+    Returns (features, (H, W)) -- the (H, W) is the tensor shape fed to
+    DISK, needed unchanged as LightGlueMatcher's hw1/hw2 argument later
+    (pad_if_not_divisible pads internally but keypoints stay in this
+    original, unpadded coordinate frame).
+    """
+    rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    tensor = torch.from_numpy(rgb).to(device).float().permute(2, 0, 1).unsqueeze(0) / 255.0
+    with torch.no_grad():
+        features = disk(tensor, n=max_keypoints, pad_if_not_divisible=True)[0]
+    return features, (tensor.shape[2], tensor.shape[3])
+
+
+def match_features(
+    matcher: KF.LightGlueMatcher,
+    feats_a: "KF.DISKFeatures", feats_b: "KF.DISKFeatures",
+    hw_a: Tuple[int, int], hw_b: Tuple[int, int],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Match two DISK feature sets with LightGlue.
+
+    Returns (pts_a, pts_b, scores) for every match kornia returned --
+    unfiltered by confidence, since --min-confidence is a user-tunable CLI
+    threshold applied by the caller, not baked into this wrapper. `scores`
+    is LightGlue's own matching confidence in [0, 1]; higher is better.
+    """
+    lafs_a = KF.laf_from_center_scale_ori(feats_a.keypoints[None])
+    lafs_b = KF.laf_from_center_scale_ori(feats_b.keypoints[None])
+    with torch.no_grad():
+        scores, matches = matcher(
+            feats_a.descriptors, feats_b.descriptors, lafs_a, lafs_b, hw1=hw_a, hw2=hw_b
+        )
+    matches_np = matches.cpu().numpy()
+    scores_np = scores.reshape(-1).cpu().numpy()
+    pts_a = feats_a.keypoints.cpu().numpy()[matches_np[:, 0]]
+    pts_b = feats_b.keypoints.cpu().numpy()[matches_np[:, 1]]
+    return pts_a, pts_b, scores_np
 
 
 # --------------------------------------------------------------------------- #
