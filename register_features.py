@@ -77,6 +77,18 @@ AMBIGUOUS_DEPTH_GAP_STEPS = 3  # grid points closer than this to the winner aren
                                # competing hypothesis, just its own neighborhood
 AMBIGUOUS_INLIER_RATIO = 0.85  # runner-up inlier count / winner inlier count threshold
                                # to flag a genuinely competitive alternate depth
+MIN_COARSE_STEPS = 250  # floor on fit_depth's internal coarse-search grid, independent
+                        # of --steps. At this rig's default 0.10 m depth range and
+                        # --steps' own default (60), each grid step spans ~2.2 mm near
+                        # the working depth (measured on a real session) -- coarse
+                        # enough that two competing near-planar hypotheses only a few
+                        # mm apart alias into one hump and the coarse winner lands on
+                        # neither true peak. 250 steps over the same range gives ~0.5 mm
+                        # spacing there (a >4x finer sample than the default), safely
+                        # sub-mm and well clear of the ~3 mm real peak separation
+                        # observed on that session -- confirmed empirically to both
+                        # resolve the true global optimum and trigger the ambiguity
+                        # check where the default 60-step grid did neither.
 
 
 # --------------------------------------------------------------------------- #
@@ -276,25 +288,43 @@ def fit_depth(
 ) -> Tuple[float, float, np.ndarray, np.ndarray, Optional[float]]:
     """Fit the single plane depth that best explains matched (pts_a, pts_b).
 
-    Coarse stage: score every depth in `depths` by counting inliers (matches
-    whose reprojection lands within `ransac_threshold` px) -- this is 1-D
-    RANSAC via grid search, robust to however many outlier matches LightGlue
-    lets through. Refine stage: golden-section search over the *full*
-    [depths[0], depths[-1]] range (not just the coarse winner's neighboring
-    grid cells -- an early version bracketed too tightly and consistently
-    undershot the true depth by ~1-2mm in testing) minimizing median
-    reprojection error over the coarse-stage inlier set.
+    Coarse stage: score every depth in an internal coarse grid by counting
+    inliers (matches whose reprojection lands within `ransac_threshold` px)
+    -- this is 1-D RANSAC via grid search, robust to however many outlier
+    matches LightGlue lets through. That internal grid is `depths` itself
+    ONLY if the caller already passed at least MIN_COARSE_STEPS points;
+    otherwise it's resampled to MIN_COARSE_STEPS points spanning the same
+    [depths[0], depths[-1]] range (same uniform-in-inverse-depth sampling as
+    candidate_depths -- reused directly, not reimplemented). This decouples
+    the coarse search's actual resolution from --steps: --steps' default
+    (60, matching register_pipeline.py's own CLI default for consistency)
+    only resolves ~2 mm/step near this rig's working depth, which measurably
+    aliases two competing near-planar hypotheses a few mm apart into a
+    single hump -- the coarse winner then lands on neither true peak, AND
+    the ambiguity check below (which only ever sees the grid it's given)
+    has no way to notice the second peak was ever there. MIN_COARSE_STEPS
+    is the fix for both: it makes the coarse search see the real landscape
+    regardless of what --steps the user left set. `depths` is still used
+    unmodified for the refine stage's search bounds and is still what the
+    caller/report reflects for "how many steps did I ask for" purposes --
+    only the coarse stage's internal resolution is decoupled here.
 
-    Ambiguity check: every candidate depth's coarse inlier count is kept (not
-    just the running best/second, discarded in earlier versions), so after
-    the coarse loop we can look for a "runner-up" -- among grid points whose
-    index is more than AMBIGUOUS_DEPTH_GAP_STEPS away from the winner's index
-    (so a merely-adjacent grid point isn't mistaken for a competing
-    hypothesis), the one with the highest inlier count. If that runner-up's
-    inlier count is at least AMBIGUOUS_INLIER_RATIO times the winner's, the
-    scene has two near-equally-good planar explanations and the single-plane
-    fit is reported as ambiguous rather than silently picking whichever one
-    the grid happened to favor.
+    Refine stage: golden-section search over the *full* [depths[0],
+    depths[-1]] range (not just the coarse winner's neighboring grid cells
+    -- an early version bracketed too tightly and consistently undershot the
+    true depth by ~1-2mm in testing) minimizing median reprojection error
+    over the coarse-stage inlier set.
+
+    Ambiguity check: every candidate coarse-grid depth's inlier count is kept
+    (not just the running best/second, discarded in earlier versions), so
+    after the coarse loop we can look for a "runner-up" -- among coarse-grid
+    points whose index is more than AMBIGUOUS_DEPTH_GAP_STEPS away from the
+    winner's index (so a merely-adjacent grid point isn't mistaken for a
+    competing hypothesis), the one with the highest inlier count. If that
+    runner-up's inlier count is at least AMBIGUOUS_INLIER_RATIO times the
+    winner's, the scene has two near-equally-good planar explanations and
+    the single-plane fit is reported as ambiguous rather than silently
+    picking whichever one the grid happened to favor.
 
     Returns (refined_depth, coarse_depth, inliers, errors, ambiguous_depth):
     inliers/errors are evaluated at refined_depth, over ALL of pts_a/pts_b
@@ -306,12 +336,17 @@ def fit_depth(
     ambiguous_depth is the competitive runner-up depth in metres if the
     ambiguity check above fired, else None.
     """
-    inlier_counts = np.empty(len(depths), dtype=np.int64)
-    best_depth = float(depths[0])
+    coarse_depths = (
+        depths if len(depths) >= MIN_COARSE_STEPS
+        else candidate_depths(float(depths[0]), float(depths[-1]), MIN_COARSE_STEPS)
+    )
+
+    inlier_counts = np.empty(len(coarse_depths), dtype=np.int64)
+    best_depth = float(coarse_depths[0])
     best_inlier_count = -1
     best_index = 0
     best_errors = np.full(len(pts_a), np.inf)
-    for i, depth in enumerate(depths):
+    for i, depth in enumerate(coarse_depths):
         predicted_b, valid = project_points_a_to_b(
             float(depth), pts_a, camera_matrix_a_inv, camera_matrix_b, R, T, size_b
         )
@@ -329,14 +364,16 @@ def fit_depth(
     # highest inlier count among what's left. np.argmax picks the first
     # occurrence of the max, same tie-breaking convention as the running-best
     # loop above (only a strict `>` replaces the incumbent).
-    far_from_winner = np.abs(np.arange(len(depths)) - best_index) > AMBIGUOUS_DEPTH_GAP_STEPS
+    far_from_winner = (
+        np.abs(np.arange(len(coarse_depths)) - best_index) > AMBIGUOUS_DEPTH_GAP_STEPS
+    )
     ambiguous_depth: Optional[float] = None
     if np.any(far_from_winner):
         masked_counts = np.where(far_from_winner, inlier_counts, -1)
         runner_up_index = int(np.argmax(masked_counts))
         runner_up_count = int(masked_counts[runner_up_index])
         if runner_up_count >= AMBIGUOUS_INLIER_RATIO * best_inlier_count:
-            ambiguous_depth = float(depths[runner_up_index])
+            ambiguous_depth = float(coarse_depths[runner_up_index])
 
     coarse_depth = best_depth
     coarse_inliers = best_errors < ransac_threshold
