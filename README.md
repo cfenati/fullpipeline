@@ -16,6 +16,7 @@ flags override them. Run `python <script>.py --help` for full options.
 | Cross-validation    | `cross_validate_stereo.py` | `calibration/results/stereo_<a>_<b>/cross_validation/` |
 | Rig eval / optimize | `design_rig.py`        | coverage studies on measured geometry                         |
 | Registration        | `register_pipeline.py` | depth-aware warp between cameras                              |
+| Registration (sparse)| `register_features.py` | LightGlue-fitted single-plane warp                           |
 
 
 
@@ -243,6 +244,27 @@ Outputs under `registration/results/<session>/`: `warped.jpg`, `depth_m.npy`/`.p
 `confidence.npy`, `filled_mask.npy`/`.png` (True where a low-confidence pixel fell
 back to the reference-plane depth), `preview.jpg`, `report.txt`.
 
+### Sparse alternative: `register_features.py`
+
+For subjects close enough to a single plane, `register_features.py` is an
+alternative to the dense plane-sweep above: it matches sparse features with
+LightGlue and fits the one scalar depth that best explains those matches
+through the same calibrated geometry, instead of scoring every pixel with
+ZNCC. Useful when plane-sweep's dense correlation degenerates (e.g. low
+per-pixel texture) — check `report_features.txt`'s inlier count/ratio and
+`preview_features.jpg` the same way you'd check plane-sweep's confident
+fraction. Needs `torch`/`kornia` (see `requirements.txt`); CPU-only, no GPU
+required.
+
+```bash
+python register_features.py --session captures/hand
+python register_features.py --session captures/hand --downscale 0.25
+```
+
+Outputs under `registration/results/<session>/`: `warped_features.jpg`,
+`matches.jpg` (inlier/outlier correspondence lines), `preview_features.jpg`,
+`report_features.txt`.
+
 ## Config highlights
 
 
@@ -264,6 +286,7 @@ cameras/  capture_pipeline.py  gui.py     drivers + capture
 calibration/  calibrate_*.py  stereo_*.py  prune_*.py
 design/  design_rig.py                     geometry / coverage
 register_pipeline.py                       plane-sweep depth-aware warp
+register_features.py                       LightGlue sparse match + single-depth warp
 color_correction.py  check_color.py        flat-field
 captures/  calibration/results/            data (mostly git-ignored)
 ```

@@ -35,6 +35,7 @@ Example:
 
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 from typing import List, Tuple
@@ -48,11 +49,86 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from calibrate_cameras import load_config, resolve_path  # noqa: E402
 from calibration.stereo import StereoExtrinsics  # noqa: E402
-from register_pipeline import PREVIEW_PANEL_WIDTH  # noqa: E402
+from register_pipeline import (  # noqa: E402
+    DEFAULT_DEPTH_MIN,
+    DEFAULT_DEPTH_MAX,
+    DEFAULT_REGISTRATION_OUTPUT_DIR,
+    DEFAULT_STEPS,
+    PREVIEW_PANEL_WIDTH,
+    candidate_depths,
+    compose_warped_output,
+    default_extrinsics_path,
+    downscale_pair,
+    load_session_images,
+    singular_depth,
+    undistort_pair,
+)
 
 
 DEFAULT_MAX_KEYPOINTS = 2048
+DEFAULT_MIN_MATCHES = 20
+DEFAULT_MIN_CONFIDENCE = 0.5
+DEFAULT_RANSAC_THRESHOLD = 3.0
+MIN_INLIERS_TO_TRUST = 8  # minimum to trust a 1-DOF (single depth) fit
+
+
+# --------------------------------------------------------------------------- #
+# CLI / config
+# --------------------------------------------------------------------------- #
+def parse_args() -> argparse.Namespace:
+    reg_config = load_config().get("registration", {}) or {}
+    depth_range = reg_config.get("depth_range", [DEFAULT_DEPTH_MIN, DEFAULT_DEPTH_MAX])
+
+    parser = argparse.ArgumentParser(
+        description="Register camera B onto camera A via LightGlue sparse matching "
+                    "and a single fitted plane depth.",
+    )
+    parser.add_argument(
+        "--session", required=True,
+        help="Capture session folder holding <camera-a>.jpg and <camera-b>.jpg.",
+    )
+    parser.add_argument("--camera-a", default="rgb_cam1",
+                        help="Target frame; the output is warped into this camera's view "
+                             "(default: %(default)s).")
+    parser.add_argument("--camera-b", default="rgb_cam2",
+                        help="Source camera, warped onto camera A (default: %(default)s).")
+    parser.add_argument(
+        "--extrinsics", default=None,
+        help="Stereo extrinsics JSON (default: geometric_calibration.extrinsics_<a>_<b> "
+             "in config, else calibration/results/stereo_<a>_<b>/extrinsics.json).",
+    )
+    parser.add_argument("--depth-min", type=float, default=depth_range[0],
+                        help="Near edge of the depth-fit search range, metres "
+                             "(default: registration.depth_range[0] in config, "
+                             f"else {DEFAULT_DEPTH_MIN}).")
+    parser.add_argument("--depth-max", type=float, default=depth_range[1],
+                        help="Far edge of the depth-fit search range, metres "
+                             "(default: registration.depth_range[1] in config, "
+                             f"else {DEFAULT_DEPTH_MAX}).")
+    parser.add_argument("--steps", type=int, default=DEFAULT_STEPS,
+                        help="Coarse grid resolution for the depth fit, sampled uniformly "
+                             "in inverse depth (default: %(default)s).")
+    parser.add_argument("--downscale", type=float, default=1.0,
+                        help="Resize factor applied to the undistorted images before "
+                             "feature extraction, e.g. 0.25 for the native ~4656x3496 "
+                             "sensor -- DISK is CPU-heavy at full resolution "
+                             "(default: %(default)s).")
+    parser.add_argument("--min-matches", type=int, default=DEFAULT_MIN_MATCHES,
+                        help="Minimum raw LightGlue matches (post --min-confidence) "
+                             "required to attempt a depth fit (default: %(default)s).")
+    parser.add_argument("--min-confidence", type=float, default=DEFAULT_MIN_CONFIDENCE,
+                        help="Minimum LightGlue match confidence to keep, in [0, 1] "
+                             "(default: %(default)s).")
+    parser.add_argument("--ransac-threshold", type=float, default=DEFAULT_RANSAC_THRESHOLD,
+                        help="Inlier pixel-reprojection threshold for the depth fit, in "
+                             "the working (possibly downscaled) resolution "
+                             "(default: %(default)s).")
+    parser.add_argument("--out", "--output", dest="output", default=None,
+                        help="Output directory (default: registration.output_dir in config, "
+                             f"else {DEFAULT_REGISTRATION_OUTPUT_DIR}) / <session name>.")
+    return parser.parse_args()
 
 
 # --------------------------------------------------------------------------- #
@@ -371,3 +447,118 @@ def write_report(
         "  preview_features.jpg  camera A | warped B | match visualization, side by side",
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+# --------------------------------------------------------------------------- #
+# Entry point
+# --------------------------------------------------------------------------- #
+def main() -> int:
+    args = parse_args()
+    if args.depth_min <= 0 or args.depth_max <= args.depth_min:
+        raise SystemExit(
+            f"--depth-min/--depth-max must satisfy 0 < min < max, got "
+            f"{args.depth_min} / {args.depth_max}"
+        )
+
+    reg_config = load_config().get("registration", {}) or {}
+    default_depth = reg_config.get("default_depth", 0.168)
+
+    extrinsics_path = resolve_path(
+        args.extrinsics or default_extrinsics_path(args.camera_a, args.camera_b)
+    )
+    if not extrinsics_path.exists():
+        raise SystemExit(
+            f"No stereo extrinsics at {extrinsics_path}.\n"
+            f"Run:  python stereo_calibrate.py --camera-a {args.camera_a} "
+            f"--camera-b {args.camera_b}"
+        )
+    extrinsics = StereoExtrinsics.load_json(extrinsics_path)
+
+    session_dir = resolve_path(args.session)
+    output_root = args.output or reg_config.get("output_dir", DEFAULT_REGISTRATION_OUTPUT_DIR)
+    output_dir = resolve_path(output_root) / session_dir.name
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    image_a, image_b = load_session_images(session_dir, args.camera_a, args.camera_b)
+    undistorted_a, undistorted_b = undistort_pair(image_a, image_b, extrinsics)
+    color_a, color_b, camera_matrix_a, camera_matrix_b = downscale_pair(
+        undistorted_a, undistorted_b,
+        extrinsics.camera_matrix_a, extrinsics.camera_matrix_b, args.downscale,
+    )
+    size_a = (color_a.shape[1], color_a.shape[0])
+    size_b = (color_b.shape[1], color_b.shape[0])
+
+    device = torch.device("cpu")
+    print(f"Registering {args.camera_b} -> {args.camera_a}: LightGlue matching at "
+          f"{size_a[0]}x{size_a[1]} (CPU)")
+    disk, matcher = load_models(device)
+    feats_a, hw_a = extract_features(disk, color_a, device, DEFAULT_MAX_KEYPOINTS)
+    feats_b, hw_b = extract_features(disk, color_b, device, DEFAULT_MAX_KEYPOINTS)
+    pts_a_all, pts_b_all, scores_all = match_features(matcher, feats_a, feats_b, hw_a, hw_b)
+
+    keep = scores_all >= args.min_confidence
+    pts_a, pts_b = pts_a_all[keep], pts_b_all[keep]
+    n_raw_matches, n_matches = len(scores_all), int(keep.sum())
+    print(f"LightGlue: {n_raw_matches} raw matches, {n_matches} above confidence "
+          f"{args.min_confidence}")
+    if n_matches < args.min_matches:
+        raise SystemExit(
+            f"Only {n_matches} matches above --min-confidence {args.min_confidence} "
+            f"(need >= {args.min_matches}). Check --camera-a/--camera-b order, exposure "
+            "match between cameras, or lower --min-confidence."
+        )
+
+    camera_matrix_a_inv = np.linalg.inv(camera_matrix_a)
+    depths = candidate_depths(args.depth_min, args.depth_max, args.steps)
+    refined_depth, coarse_depth, inliers, errors = fit_depth(
+        pts_a, pts_b, camera_matrix_a_inv, camera_matrix_b,
+        extrinsics.R, extrinsics.T, size_b, depths, args.ransac_threshold,
+    )
+    n_inliers = int(inliers.sum())
+    if n_inliers > 0:
+        print(f"Fitted depth: {refined_depth:.4f} m ({n_inliers}/{n_matches} inliers, "
+              f"median error {np.median(errors[inliers]):.2f}px)")
+    if n_inliers < MIN_INLIERS_TO_TRUST:
+        raise SystemExit(
+            f"Only {n_inliers} inlier matches at the fitted depth (need >= "
+            f"{MIN_INLIERS_TO_TRUST} to trust a 1-DOF plane fit). Check calibration, "
+            "--ransac-threshold, or capture a more textured scene."
+        )
+
+    warped_color, _remap_valid = compose_warped_output(
+        refined_depth, color_b, camera_matrix_a, camera_matrix_b,
+        extrinsics.R, extrinsics.T, size_a, size_b,
+    )
+    match_viz = render_match_visualization(color_a, color_b, pts_a, pts_b, inliers)
+
+    cv2.imwrite(str(output_dir / "warped_features.jpg"), warped_color)
+    cv2.imwrite(str(output_dir / "matches.jpg"), match_viz)
+    save_preview(output_dir / "preview_features.jpg", color_a, warped_color, match_viz)
+
+    d_critical = singular_depth(extrinsics.R, extrinsics.T)
+    warnings: List[str] = []
+    if np.isclose(coarse_depth, depths[0]) or np.isclose(coarse_depth, depths[-1]):
+        warnings.append(
+            f"Fitted depth landed on the edge of the search range ({depths[0]:.3f} or "
+            f"{depths[-1]:.3f} m). Widen --depth-min/--depth-max."
+        )
+
+    write_report(
+        output_dir / "report_features.txt",
+        session_dir, args.camera_a, args.camera_b, extrinsics_path, extrinsics, size_a,
+        n_raw_matches, args.min_confidence, n_matches,
+        depths, args.ransac_threshold,
+        refined_depth, inliers, errors,
+        default_depth, d_critical, warnings,
+    )
+
+    if warnings:
+        print("\nQuality warnings:")
+        for warning in warnings:
+            print(f"  - {warning}")
+    print(f"\nSaved outputs to {output_dir}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
