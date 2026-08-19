@@ -263,7 +263,8 @@ python register_features.py --session captures/hand --downscale 0.25
 
 Outputs under `registration/results/<session>/`: `warped_features.jpg`,
 `matches.jpg` (inlier/outlier correspondence lines), `preview_features.jpg`,
-`report_features.txt`.
+`report_features.txt`, `fit_result.json` (machine-readable fitted/coarse/ambiguous
+depth, match/inlier counts, outside-FOV pixels).
 
 ## Config highlights
 

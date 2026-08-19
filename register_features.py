@@ -36,9 +36,10 @@ Example:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import cv2
 import kornia.feature as KF
@@ -72,6 +73,10 @@ DEFAULT_MIN_MATCHES = 20
 DEFAULT_MIN_CONFIDENCE = 0.5
 DEFAULT_RANSAC_THRESHOLD = 3.0
 MIN_INLIERS_TO_TRUST = 8  # minimum to trust a 1-DOF (single depth) fit
+AMBIGUOUS_DEPTH_GAP_STEPS = 3  # grid points closer than this to the winner aren't a
+                               # competing hypothesis, just its own neighborhood
+AMBIGUOUS_INLIER_RATIO = 0.85  # runner-up inlier count / winner inlier count threshold
+                               # to flag a genuinely competitive alternate depth
 
 
 # --------------------------------------------------------------------------- #
@@ -116,8 +121,8 @@ def parse_args() -> argparse.Namespace:
                              "sensor -- DISK is CPU-heavy at full resolution "
                              "(default: %(default)s).")
     parser.add_argument("--min-matches", type=int, default=DEFAULT_MIN_MATCHES,
-                        help="Minimum raw LightGlue matches (post --min-confidence) "
-                             "required to attempt a depth fit (default: %(default)s).")
+                        help="Minimum matches above --min-confidence required to attempt "
+                             "a depth fit (default: %(default)s).")
     parser.add_argument("--min-confidence", type=float, default=DEFAULT_MIN_CONFIDENCE,
                         help="Minimum LightGlue match confidence to keep, in [0, 1] "
                              "(default: %(default)s).")
@@ -193,7 +198,9 @@ def match_features(
 GOLDEN_RATIO = (np.sqrt(5.0) - 1.0) / 2.0
 
 
-def golden_section_minimize(f, lo: float, hi: float, tol: float = 1e-5, max_iter: int = 100) -> float:
+def golden_section_minimize(
+    f: Callable[[float], float], lo: float, hi: float, tol: float = 1e-5, max_iter: int = 100,
+) -> float:
     """Bounded 1-D minimization, no scipy dependency.
 
     Standard golden-section search: no derivatives, no assumptions beyond
@@ -266,7 +273,7 @@ def fit_depth(
     camera_matrix_a_inv: np.ndarray, camera_matrix_b: np.ndarray,
     R: np.ndarray, T: np.ndarray, size_b: Tuple[int, int],
     depths: np.ndarray, ransac_threshold: float,
-) -> Tuple[float, float, np.ndarray, np.ndarray]:
+) -> Tuple[float, float, np.ndarray, np.ndarray, Optional[float]]:
     """Fit the single plane depth that best explains matched (pts_a, pts_b).
 
     Coarse stage: score every depth in `depths` by counting inliers (matches
@@ -278,32 +285,65 @@ def fit_depth(
     undershot the true depth by ~1-2mm in testing) minimizing median
     reprojection error over the coarse-stage inlier set.
 
-    Returns (refined_depth, coarse_depth, inliers, errors) -- inliers/errors
-    are evaluated at refined_depth, over ALL of pts_a/pts_b (not just the
-    coarse inlier set), so a match the coarse stage missed can still count
-    once refinement lands closer to the true depth.
+    Ambiguity check: every candidate depth's coarse inlier count is kept (not
+    just the running best/second, discarded in earlier versions), so after
+    the coarse loop we can look for a "runner-up" -- among grid points whose
+    index is more than AMBIGUOUS_DEPTH_GAP_STEPS away from the winner's index
+    (so a merely-adjacent grid point isn't mistaken for a competing
+    hypothesis), the one with the highest inlier count. If that runner-up's
+    inlier count is at least AMBIGUOUS_INLIER_RATIO times the winner's, the
+    scene has two near-equally-good planar explanations and the single-plane
+    fit is reported as ambiguous rather than silently picking whichever one
+    the grid happened to favor.
+
+    Returns (refined_depth, coarse_depth, inliers, errors, ambiguous_depth):
+    inliers/errors are evaluated at refined_depth, over ALL of pts_a/pts_b
+    (not just the coarse inlier set), so a match the coarse stage missed can
+    still count once refinement lands closer to the true depth -- EXCEPT on
+    the early-return branch below (fewer than 2 coarse inliers), which skips
+    refinement entirely and returns the unrefined coarse depth with
+    inliers/errors evaluated at THAT depth, not a golden-section-refined one.
+    ambiguous_depth is the competitive runner-up depth in metres if the
+    ambiguity check above fired, else None.
     """
+    inlier_counts = np.empty(len(depths), dtype=np.int64)
     best_depth = float(depths[0])
     best_inlier_count = -1
+    best_index = 0
     best_errors = np.full(len(pts_a), np.inf)
-    for depth in depths:
+    for i, depth in enumerate(depths):
         predicted_b, valid = project_points_a_to_b(
             float(depth), pts_a, camera_matrix_a_inv, camera_matrix_b, R, T, size_b
         )
         errors = np.linalg.norm(predicted_b - pts_b, axis=1)
         errors = np.where(valid, errors, np.inf)
         inlier_count = int(np.sum(errors < ransac_threshold))
+        inlier_counts[i] = inlier_count
         if inlier_count > best_inlier_count:
             best_inlier_count = inlier_count
             best_depth = float(depth)
+            best_index = i
             best_errors = errors
+
+    # Runner-up search: mask out grid points near the winner, then take the
+    # highest inlier count among what's left. np.argmax picks the first
+    # occurrence of the max, same tie-breaking convention as the running-best
+    # loop above (only a strict `>` replaces the incumbent).
+    far_from_winner = np.abs(np.arange(len(depths)) - best_index) > AMBIGUOUS_DEPTH_GAP_STEPS
+    ambiguous_depth: Optional[float] = None
+    if np.any(far_from_winner):
+        masked_counts = np.where(far_from_winner, inlier_counts, -1)
+        runner_up_index = int(np.argmax(masked_counts))
+        runner_up_count = int(masked_counts[runner_up_index])
+        if runner_up_count >= AMBIGUOUS_INLIER_RATIO * best_inlier_count:
+            ambiguous_depth = float(depths[runner_up_index])
 
     coarse_depth = best_depth
     coarse_inliers = best_errors < ransac_threshold
     if int(coarse_inliers.sum()) < 2:
         # Too few inliers to refine meaningfully; caller (main) gates on
         # MIN_INLIERS_TO_TRUST and will SystemExit before trusting this.
-        return best_depth, coarse_depth, coarse_inliers, best_errors
+        return best_depth, coarse_depth, coarse_inliers, best_errors, ambiguous_depth
 
     lo, hi = float(depths[0]), float(depths[-1])
 
@@ -321,7 +361,7 @@ def fit_depth(
     )
     final_errors = np.where(valid, np.linalg.norm(predicted_b - pts_b, axis=1), np.inf)
     final_inliers = final_errors < ransac_threshold
-    return refined_depth, coarse_depth, final_inliers, final_errors
+    return refined_depth, coarse_depth, final_inliers, final_errors, ambiguous_depth
 
 
 # --------------------------------------------------------------------------- #
@@ -396,7 +436,8 @@ def write_report(
     n_raw_matches: int, min_confidence: float, n_matches: int,
     depths: np.ndarray, ransac_threshold: float,
     fitted_depth: float, inliers: np.ndarray, errors: np.ndarray,
-    default_depth: float, d_critical: float, warnings: List[str],
+    default_depth: float, d_critical: float, n_outside_fov: int,
+    ambiguous_depth: Optional[float], warnings: List[str],
 ) -> None:
     """n_matches and inliers.sum() are both guaranteed > 0 here -- main()
     SystemExits before calling this if --min-matches or MIN_INLIERS_TO_TRUST
@@ -404,6 +445,10 @@ def write_report(
     write_report, which isn't gated the same way for its DEPTH MAP section)."""
     n_inliers = int(inliers.sum())
     inlier_errors = errors[inliers]
+    n_pixels = size_a[0] * size_a[1]
+
+    def pct(count: int, denominator: int) -> str:
+        return f"{count / denominator * 100:.1f}%" if denominator else "n/a"
 
     lines = [
         f"Registration: {camera_b} -> {camera_a} (LightGlue sparse match + single fitted plane depth)",
@@ -435,6 +480,19 @@ def write_report(
         f"({'well clear of' if abs(d_critical) < depths[0] / 5 else 'CHECK: close to'} "
         "the search range)",
     ]
+    if ambiguous_depth is not None:
+        lines.append(
+            f"  ambiguous alternate depth: {ambiguous_depth:.4f} m "
+            "(comparable inlier count to the fitted depth -- see Quality warnings)"
+        )
+    lines += [
+        "",
+        "COVERAGE",
+        "-" * 66,
+        f"  camera A pixels:              {n_pixels}",
+        f"  outside shared field of view (post-fill): {n_outside_fov} "
+        f"({pct(n_outside_fov, n_pixels)})",
+    ]
     if warnings:
         lines += ["", "Quality warnings", "-" * 66]
         lines += [f"  - {warning}" for warning in warnings]
@@ -445,6 +503,8 @@ def write_report(
         "  warped_features.jpg   camera B warped onto camera A via the fitted single-depth homography",
         "  matches.jpg           inlier (green) / outlier (red) correspondence lines",
         "  preview_features.jpg  camera A | warped B | match visualization, side by side",
+        "  fit_result.json       machine-readable summary: fitted/coarse/ambiguous depth, "
+        "match/inlier counts, outside-FOV pixels",
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -510,7 +570,7 @@ def main() -> int:
 
     camera_matrix_a_inv = np.linalg.inv(camera_matrix_a)
     depths = candidate_depths(args.depth_min, args.depth_max, args.steps)
-    refined_depth, coarse_depth, inliers, errors = fit_depth(
+    refined_depth, coarse_depth, inliers, errors, ambiguous_depth = fit_depth(
         pts_a, pts_b, camera_matrix_a_inv, camera_matrix_b,
         extrinsics.R, extrinsics.T, size_b, depths, args.ransac_threshold,
     )
@@ -525,15 +585,31 @@ def main() -> int:
             "--ransac-threshold, or capture a more textured scene."
         )
 
-    warped_color, _remap_valid = compose_warped_output(
+    warped_color, remap_valid = compose_warped_output(
         refined_depth, color_b, camera_matrix_a, camera_matrix_b,
         extrinsics.R, extrinsics.T, size_a, size_b,
     )
     match_viz = render_match_visualization(color_a, color_b, pts_a, pts_b, inliers)
+    n_outside_fov = int((~remap_valid).sum())
 
     cv2.imwrite(str(output_dir / "warped_features.jpg"), warped_color)
     cv2.imwrite(str(output_dir / "matches.jpg"), match_viz)
     save_preview(output_dir / "preview_features.jpg", color_a, warped_color, match_viz)
+
+    fit_result = {
+        "fitted_depth_m": float(refined_depth),
+        "coarse_depth_m": float(coarse_depth),
+        "ambiguous_alternate_depth_m": (
+            float(ambiguous_depth) if ambiguous_depth is not None else None
+        ),
+        "n_matches": n_matches,
+        "n_inliers": n_inliers,
+        "outside_fov_pixels": n_outside_fov,
+        "outside_fov_fraction": n_outside_fov / (size_a[0] * size_a[1]),
+    }
+    with (output_dir / "fit_result.json").open("w", encoding="utf-8") as f:
+        json.dump(fit_result, f, indent=2)
+        f.write("\n")
 
     d_critical = singular_depth(extrinsics.R, extrinsics.T)
     warnings: List[str] = []
@@ -542,6 +618,13 @@ def main() -> int:
             f"Fitted depth landed on the edge of the search range ({depths[0]:.3f} or "
             f"{depths[-1]:.3f} m). Widen --depth-min/--depth-max."
         )
+    if ambiguous_depth is not None:
+        warnings.append(
+            f"A competing plane at {ambiguous_depth:.4f} m had a comparable inlier count "
+            f"to the fitted depth {refined_depth:.4f} m -- the single-plane assumption "
+            "may be ambiguous for this scene. Inspect matches.jpg / preview_features.jpg, "
+            "or narrow --depth-min/--depth-max if you know the true working range."
+        )
 
     write_report(
         output_dir / "report_features.txt",
@@ -549,7 +632,7 @@ def main() -> int:
         n_raw_matches, args.min_confidence, n_matches,
         depths, args.ransac_threshold,
         refined_depth, inliers, errors,
-        default_depth, d_critical, warnings,
+        default_depth, d_critical, n_outside_fov, ambiguous_depth, warnings,
     )
 
     if warnings:
