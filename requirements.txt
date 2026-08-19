@@ -7,3 +7,8 @@ PyYAML>=6.0
 pyvista>=0.44
 matplotlib>=3.7
 PyQt5>=5.15
+
+# LightGlue feature matching (register_features.py)
+torch>=2.0            # CPU-only build recommended on disk-constrained machines:
+                       #   pip install torch --index-url https://download.pytorch.org/whl/cpu
+kornia>=0.8            # provides both the DISK extractor and LightGlueMatcher
