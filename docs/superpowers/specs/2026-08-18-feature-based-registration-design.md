@@ -146,16 +146,27 @@ Mirrors `register_pipeline.py`'s tone:
 
 No hardware needed — this operates on already-saved JPEGs. Validation:
 
-1. Run against the three existing sessions under `registration/results/`
-   (`captures/cross-validation/20260817_164509_218202` and the two
-   `captures/202608171646*` sessions), which already have
-   `rgb_cam1.jpg`/`rgb_cam2.jpg`.
+1. Run against real capture sessions that still have raw
+   `rgb_cam1.jpg`/`rgb_cam2.jpg` on disk. Of the three sessions originally
+   referenced under `registration/results/`, only
+   `captures/cross-validation/20260817_164509_218202` still has its raw
+   captures — the other two were since pruned/deleted, leaving only their
+   old plane-sweep outputs. Use that session plus the two fresh sessions
+   captured during this feature's own design research
+   (`captures/20260818_152110_605174`, `captures/20260818_152114_103039`,
+   both finger closeups) instead.
 2. Compare `preview_features.jpg` against the corresponding plane-sweep
-   `preview.jpg` — the finger edges that were visibly noisy in the plane-sweep
-   warp are the concrete thing to check.
-3. Compare the fitted depth against plane-sweep's confident-pixel depth mean
-   (~0.148-0.153 m across the three existing reports) as a sanity
-   cross-check between the two independent methods.
+   `preview.jpg` where one exists — the finger edges that were visibly
+   noisy in the plane-sweep warp are the concrete thing to check. (Already
+   done informally during design research: LightGlue + single-depth-fit
+   produced a visibly clean, well-aligned warp on both the ChArUco-board
+   cross-validation session and a real finger-closeup session, where
+   plane-sweep's warp was noisy — see the implementation plan's captured
+   numbers.)
+3. Compare the fitted depth against plane-sweep's confident-pixel depth
+   mean where a plane-sweep report exists (~0.153 m on the
+   cross-validation session) as a sanity cross-check between the two
+   independent methods.
 4. `python -c "import register_features"` for a basic import/syntax check
    before the above.
 
