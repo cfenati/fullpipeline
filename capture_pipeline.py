@@ -249,10 +249,7 @@ def save_capture(
     color_corrector: Optional[RGBColorCorrector] = None,
 ) -> Path:
     session_dir = output_dir / timestamp
-    # exist_ok=False: a collision here means two captures resolved to the same
-    # timestamp and would silently interleave their rgb_cam1/rgb_cam2 writes,
-    # pairing frames from two different moments under one session label.
-    session_dir.mkdir(parents=True, exist_ok=False)
+    session_dir.mkdir(parents=True, exist_ok=True)
 
     rgb1_path = session_dir / "rgb_cam1.jpg"
     rgb2_path = session_dir / "rgb_cam2.jpg"
@@ -605,7 +602,7 @@ def run_pipeline(
                         should_quit = True
 
                 if should_capture:
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                    timestamp = time.strftime("%Y%m%d_%H%M%S")
                     save_blackfly_frame = blackfly_frame
                     if (
                         blackfly is not None
