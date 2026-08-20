@@ -16,7 +16,7 @@ flags override them. Run `python <script>.py --help` for full options.
 | Cross-validation    | `cross_validate_stereo.py` | `calibration/results/stereo_<a>_<b>/cross_validation/` |
 | Rig eval / optimize | `design_rig.py`        | coverage studies on measured geometry                         |
 | Registration        | `register_pipeline.py` | depth-aware warp between cameras                              |
-| Registration (sparse)| `register_features.py` | LightGlue-fitted single-plane warp                           |
+| Registration (sparse)| `register_features.py` | LightGlue matches → piecewise-affine warp                    |
 
 
 
@@ -246,25 +246,32 @@ back to the reference-plane depth), `preview.jpg`, `report.txt`.
 
 ### Sparse alternative: `register_features.py`
 
-For subjects close enough to a single plane, `register_features.py` is an
-alternative to the dense plane-sweep above: it matches sparse features with
-LightGlue and fits the one scalar depth that best explains those matches
-through the same calibrated geometry, instead of scoring every pixel with
-ZNCC. Useful when plane-sweep's dense correlation degenerates (e.g. low
-per-pixel texture) — check `report_features.txt`'s inlier count/ratio and
-`preview_features.jpg` the same way you'd check plane-sweep's confident
-fraction. Needs `torch`/`kornia` (see `requirements.txt`); CPU-only, no GPU
-required.
+When plane-sweep's dense correlation degenerates, `register_features.py`
+matches sparse features with LightGlue and warps camera B onto camera A
+with a piecewise-affine field from those matches (Delaunay interpolation,
+exact at every correspondence). A single homography cannot register a
+close-range hand: the matches are real but they span several centimetres
+of depth, so they do not lie on one plane. Check `overlay_checker.jpg` and
+the right panel of `preview_features.jpg` -- skin creases should continue
+across square boundaries inside the bright (matched) region. Needs
+`torch`/`kornia` (see `requirements.txt`); CPU-only, no GPU required.
+
+The mesh is extended with synthetic anchor points at the frame border and
+filtered to drop degenerate (huge-area or thin-sliver) triangles, and the
+match-hull/fallback-plane boundary is feathered rather than a hard switch --
+each of these is independently toggleable (`--no-border-anchors`,
+`--no-reject-degenerate-triangles`, `--no-feather-blend`; see `--help`).
+`check_registration_error.py` scores the resulting warp against held-out
+ChArUco board corners for a quantitative (not eyeballed) accuracy number.
 
 ```bash
 python register_features.py --session captures/hand
-python register_features.py --session captures/hand --downscale 0.25
+python register_features.py --session captures/hand --downscale 0.5
 ```
 
 Outputs under `registration/results/<session>/`: `warped_features.jpg`,
-`matches.jpg` (inlier/outlier correspondence lines), `preview_features.jpg`,
-`report_features.txt`, `fit_result.json` (machine-readable fitted/coarse/ambiguous
-depth, match/inlier counts, outside-FOV pixels).
+`overlay_checker.jpg`, `overlay_blend.jpg`, `matches.jpg`,
+`preview_features.jpg`, `report_features.txt`, `fit_result.json`.
 
 ## Config highlights
 
@@ -287,7 +294,7 @@ cameras/  capture_pipeline.py  gui.py     drivers + capture
 calibration/  calibrate_*.py  stereo_*.py  prune_*.py
 design/  design_rig.py                     geometry / coverage
 register_pipeline.py                       plane-sweep depth-aware warp
-register_features.py                       LightGlue sparse match + single-depth warp
+register_features.py                       LightGlue matches → piecewise-affine warp
 color_correction.py  check_color.py        flat-field
 captures/  calibration/results/            data (mostly git-ignored)
 ```

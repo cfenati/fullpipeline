@@ -1,36 +1,51 @@
 #!/usr/bin/env python3
-"""Register camera B onto camera A via LightGlue sparse matching and a single
-fitted plane depth.
+"""Register camera B onto camera A via LightGlue sparse matching and a
+piecewise-affine warp from those matches.
 
 Sibling to register_pipeline.py, not a replacement: that script's dense
 plane-sweep ZNCC correlation only scored 27-32% of the cameras' overlap
-region confident on real captures (see registration/results/*/report.txt),
-falling back to a default depth almost everywhere and producing visibly
-noisy warps. This script targets that failure case for subjects close
-enough to a single plane (the scoping decision recorded in
-docs/superpowers/specs/2026-08-18-feature-based-registration-design.md):
-find sparse correspondences with LightGlue, then fit the *one* unknown that
-matters -- a scalar plane depth -- through register_pipeline.py's own
-calibration math, rather than a free 8-DOF homography that would discard
-the verified calibration.
+region confident on real captures (see registration/results/*/report.txt).
+This script finds sparse correspondences with LightGlue and warps B onto A
+by interpolating the 2-D correspondence field (Delaunay piecewise affine).
+Matches are also triangulated through the calibrated extrinsics as a
+sanity check (depths should land in the working range).
+
+A single global homography -- 1-DOF plane or free 8-DOF -- cannot register
+this subject. LightGlue matches on a close-range hand are geometrically
+valid but span several centimetres of depth, so they do not lie on one
+plane. One H either rejects most matches or shears the whole frame, and
+the side-by-side preview then looks like the images never overlapped.
+A piecewise affine from the matches is exact at every correspondence and
+continuous across the convex hull, which is what actually overlays the
+fingers. Outside the hull, pixels fall back to a calibrated median-depth
+plane so the rest of the frame is still filled.
 
 Algorithm:
-    1. Undistort + optionally downscale the pair (register_pipeline.py's
-       own load_session_images/undistort_pair/downscale_pair).
+    1. Load + undistort the pair (register_pipeline.py's own
+       load_session_images/undistort_pair/downscale_pair).
     2. LightGlue match (kornia DISK + LightGlueMatcher) -> sparse (pts_a,
-       pts_b) correspondences.
-    3. Fit depth d: coarse grid search over candidate_depths(), scoring
-       each hypothesis by inlier count under a pixel-reprojection
-       threshold (this is exactly RANSAC over one parameter) -- then
-       golden-section refinement over the full search range, minimizing
-       median reprojection error over the coarse inlier set.
-    4. Compose the final dense warp with register_pipeline.compose_warped_output,
-       passing the single fitted depth directly (it accepts a scalar or a
-       dense (H, W) array; register_pipeline.py itself only ever uses the
-       dense form).
+       pts_b) correspondences, filtered to --min-confidence.
+    3. Triangulate with P_a = K_a [I|0], P_b = K_b [R|T]; keep points
+       whose Z_a sits in the configured working range.
+    4. Piecewise-affine warp: mesh the inlier matches plus synthetic anchor
+       points at the frame perimeter (project_via_plane, see
+       border_anchor_points -- pulls the mesh out to the frame edge instead
+       of stopping wherever real matches thin out), Delaunay-interpolate
+       pts_b as a function of pts_a and cv2.remap, after masking out
+       degenerate triangles (huge area or thin slivers -- see
+       degenerate_triangle_mask) so an outlier vertex can't smear a real
+       depth discontinuity into a smooth, wrong blend. Uncovered pixels
+       (outside the mesh, or inside a rejected triangle) blend from this
+       warp into compose_warped_output's median-inlier-depth plane over a
+       feathered transition band (feather_alpha) instead of a hard switch.
+
+Memory: DISK on CPU is hungry per pixel. Native 4656x3496 (--downscale 1.0)
+OOMs; the default --downscale 0.25 (1164x874) is the resolution the existing
+captures were last matched at. Raise it only with enough free RAM.
 
 Example:
     python register_features.py --session captures/hand
+    python register_features.py --session captures/hand --downscale 0.5
 """
 
 from __future__ import annotations
@@ -39,10 +54,11 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Tuple
 
 import cv2
 import kornia.feature as KF
+import matplotlib.tri as mtri
 import numpy as np
 import torch
 
@@ -53,54 +69,53 @@ if str(PROJECT_ROOT) not in sys.path:
 from calibrate_cameras import load_config, resolve_path  # noqa: E402
 from calibration.stereo import StereoExtrinsics  # noqa: E402
 from register_pipeline import (  # noqa: E402
-    DEFAULT_DEPTH_MIN,
     DEFAULT_DEPTH_MAX,
+    DEFAULT_DEPTH_MIN,
     DEFAULT_REGISTRATION_OUTPUT_DIR,
-    DEFAULT_STEPS,
     PREVIEW_PANEL_WIDTH,
-    candidate_depths,
     compose_warped_output,
     default_extrinsics_path,
     downscale_pair,
     load_session_images,
-    singular_depth,
+    plane_homography,
     undistort_pair,
 )
 
 
-DEFAULT_MAX_KEYPOINTS = 2048
+DEFAULT_DOWNSCALE = 0.25  # DISK at native 4656x3496 OOMs on CPU; 0.25 is the
+                          # resolution the existing captures were last matched at
+                          # (1164x874). Raise --downscale only with enough RAM.
+DEFAULT_MAX_KEYPOINTS = 4096
 DEFAULT_MIN_MATCHES = 20
-DEFAULT_MIN_CONFIDENCE = 0.5
-DEFAULT_RANSAC_THRESHOLD = 3.0
-MIN_INLIERS_TO_TRUST = 8  # minimum to trust a 1-DOF (single depth) fit
-AMBIGUOUS_DEPTH_GAP_STEPS = 3  # grid points closer than this to the winner aren't a
-                               # competing hypothesis, just its own neighborhood
-AMBIGUOUS_INLIER_RATIO = 0.85  # runner-up inlier count / winner inlier count threshold
-                               # to flag a genuinely competitive alternate depth
-MIN_COARSE_STEPS = 250  # floor on fit_depth's internal coarse-search grid, independent
-                        # of --steps. At this rig's default 0.10 m depth range and
-                        # --steps' own default (60), each grid step spans ~2.2 mm near
-                        # the working depth (measured on a real session) -- coarse
-                        # enough that two competing near-planar hypotheses only a few
-                        # mm apart alias into one hump and the coarse winner lands on
-                        # neither true peak. 250 steps over the same range gives ~0.5 mm
-                        # spacing there (a >4x finer sample than the default), safely
-                        # sub-mm and well clear of the ~3 mm real peak separation
-                        # observed on that session -- confirmed empirically to both
-                        # resolve the true global optimum and trigger the ambiguity
-                        # check where the default 60-step grid did neither.
+DEFAULT_MIN_CONFIDENCE = 0.3
+MIN_INLIERS_TO_TRUST = 30
+MAX_TRIANGLE_AREA_RATIO = 20.0  # reject Delaunay triangles bigger than N x the median
+                                # triangle area -- a triangle this much larger than its
+                                # neighbors usually means its vertices straddle a real
+                                # depth/object discontinuity (e.g. a fingertip silhouette
+                                # edge, where no match exists ON the edge itself), so
+                                # linear interpolation across it draws a smooth blend
+                                # over what should be a sharp boundary.
+MAX_TRIANGLE_SLENDERNESS = 10.0  # reject triangles whose longest edge^2 / (2 * area)
+                                  # exceeds this -- catches thin sliver triangles from
+                                  # near-collinear vertices, including the zero-area
+                                  # degenerate case (slenderness -> inf there).
+BORDER_ANCHOR_SPACING_PX = 80  # spacing between synthetic anchor points placed around
+                                # camera A's frame perimeter, working-resolution px.
+                                # Dense enough to pull the mesh out to the frame edge
+                                # without adding many extra triangles.
+FEATHER_WIDTH_PX = 25  # match_warp's blend weight ramps from 0 at the covered/uncovered
+                       # boundary to 1 this many px inside the covered region, instead
+                       # of switching to plane_warp in one step.
 
 
 # --------------------------------------------------------------------------- #
 # CLI / config
 # --------------------------------------------------------------------------- #
 def parse_args() -> argparse.Namespace:
-    reg_config = load_config().get("registration", {}) or {}
-    depth_range = reg_config.get("depth_range", [DEFAULT_DEPTH_MIN, DEFAULT_DEPTH_MAX])
-
     parser = argparse.ArgumentParser(
         description="Register camera B onto camera A via LightGlue sparse matching "
-                    "and a single fitted plane depth.",
+                    "and a piecewise-affine warp from those matches.",
     )
     parser.add_argument(
         "--session", required=True,
@@ -113,35 +128,41 @@ def parse_args() -> argparse.Namespace:
                         help="Source camera, warped onto camera A (default: %(default)s).")
     parser.add_argument(
         "--extrinsics", default=None,
-        help="Stereo extrinsics JSON (default: geometric_calibration.extrinsics_<a>_<b> "
-             "in config, else calibration/results/stereo_<a>_<b>/extrinsics.json).",
+        help="Stereo extrinsics JSON (undistortion + triangulation). Default: "
+             "geometric_calibration.extrinsics_<a>_<b> in config, else "
+             "calibration/results/stereo_<a>_<b>/extrinsics.json.",
     )
-    parser.add_argument("--depth-min", type=float, default=depth_range[0],
-                        help="Near edge of the depth-fit search range, metres "
-                             "(default: registration.depth_range[0] in config, "
-                             f"else {DEFAULT_DEPTH_MIN}).")
-    parser.add_argument("--depth-max", type=float, default=depth_range[1],
-                        help="Far edge of the depth-fit search range, metres "
-                             "(default: registration.depth_range[1] in config, "
-                             f"else {DEFAULT_DEPTH_MAX}).")
-    parser.add_argument("--steps", type=int, default=DEFAULT_STEPS,
-                        help="Coarse grid resolution for the depth fit, sampled uniformly "
-                             "in inverse depth (default: %(default)s).")
-    parser.add_argument("--downscale", type=float, default=1.0,
+    parser.add_argument("--downscale", type=float, default=DEFAULT_DOWNSCALE,
                         help="Resize factor applied to the undistorted images before "
-                             "feature extraction, e.g. 0.25 for the native ~4656x3496 "
-                             "sensor -- DISK is CPU-heavy at full resolution "
+                             "feature extraction. Native ~4656x3496 OOMs DISK on CPU; "
+                             "0.25 (1164x874) is the measured-safe default "
                              "(default: %(default)s).")
     parser.add_argument("--min-matches", type=int, default=DEFAULT_MIN_MATCHES,
                         help="Minimum matches above --min-confidence required to attempt "
-                             "a depth fit (default: %(default)s).")
+                             "triangulation (default: %(default)s).")
     parser.add_argument("--min-confidence", type=float, default=DEFAULT_MIN_CONFIDENCE,
                         help="Minimum LightGlue match confidence to keep, in [0, 1] "
                              "(default: %(default)s).")
-    parser.add_argument("--ransac-threshold", type=float, default=DEFAULT_RANSAC_THRESHOLD,
-                        help="Inlier pixel-reprojection threshold for the depth fit, in "
-                             "the working (possibly downscaled) resolution "
-                             "(default: %(default)s).")
+    parser.add_argument(
+        "--no-reject-degenerate-triangles", action="store_true",
+        help="Keep huge-area/thin-sliver Delaunay triangles in the piecewise-affine warp "
+             "instead of masking them out to the fallback plane (default: rejected). "
+             f"Thresholds: area > {MAX_TRIANGLE_AREA_RATIO}x median, or "
+             f"longest_edge^2/(2*area) > {MAX_TRIANGLE_SLENDERNESS}.",
+    )
+    parser.add_argument(
+        "--no-border-anchors", action="store_true",
+        help="Don't add synthetic frame-perimeter anchor points (projected through the "
+             "calibrated fallback plane) to the piecewise-affine mesh. Default: added, "
+             "so the mesh reaches the frame edge instead of stopping wherever real "
+             f"matches happen to thin out (spacing: {BORDER_ANCHOR_SPACING_PX} px).",
+    )
+    parser.add_argument(
+        "--no-feather-blend", action="store_true",
+        help="Hard-switch between the piecewise-affine warp and the fallback plane at "
+             "the covered/uncovered boundary instead of ramping smoothly across it "
+             f"(default: feathered over {FEATHER_WIDTH_PX} px).",
+    )
     parser.add_argument("--out", "--output", dest="output", default=None,
                         help="Output directory (default: registration.output_dir in config, "
                              f"else {DEFAULT_REGISTRATION_OUTPUT_DIR}) / <session name>.")
@@ -205,200 +226,196 @@ def match_features(
 
 
 # --------------------------------------------------------------------------- #
-# Depth fit
+# Geometry
 # --------------------------------------------------------------------------- #
-GOLDEN_RATIO = (np.sqrt(5.0) - 1.0) / 2.0
-
-
-def golden_section_minimize(
-    f: Callable[[float], float], lo: float, hi: float, tol: float = 1e-5, max_iter: int = 100,
-) -> float:
-    """Bounded 1-D minimization, no scipy dependency.
-
-    Standard golden-section search: no derivatives, no assumptions beyond
-    (approximate) unimodality on [lo, hi], which holds here since
-    reprojection error is smooth and has a single minimum near the true
-    depth once obvious outliers are excluded (fit_depth's coarse stage).
-    """
-    c = hi - GOLDEN_RATIO * (hi - lo)
-    d = lo + GOLDEN_RATIO * (hi - lo)
-    fc, fd = f(c), f(d)
-    for _ in range(max_iter):
-        if abs(hi - lo) < tol:
-            break
-        if fc < fd:
-            hi, d, fd = d, c, fc
-            c = hi - GOLDEN_RATIO * (hi - lo)
-            fc = f(c)
-        else:
-            lo, c, fc = c, d, fd
-            d = lo + GOLDEN_RATIO * (hi - lo)
-            fd = f(d)
-    return (lo + hi) / 2.0
-
-
-def project_points_a_to_b(
-    depth: float, points_a: np.ndarray,
-    camera_matrix_a_inv: np.ndarray, camera_matrix_b: np.ndarray,
-    R: np.ndarray, T: np.ndarray, size_b: Tuple[int, int],
+def triangulate_matches(
+    pts_a: np.ndarray, pts_b: np.ndarray,
+    camera_matrix_a: np.ndarray, camera_matrix_b: np.ndarray,
+    R: np.ndarray, T: np.ndarray,
+    depth_min: float, depth_max: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Project camera-A pixel points at a hypothesized plane depth into camera B.
+    """Triangulate LightGlue matches into camera-A depth.
 
-    Mirrors register_pipeline.reproject_a_to_b's per-point formula exactly
-    (back-project to the plane at `depth`, transform by R/T, project into
-    B, chirality + bounds check), but for a sparse (N, 2) point array
-    instead of a dense per-pixel raster -- reproject_a_to_b hardcodes a
-    reshape to (height_a, width_a), so it cannot be reused directly for an
-    arbitrary sparse point count. Any future change to the projection
-    model must be mirrored in both places.
-
-    Returns (predicted_b (N, 2), valid (N,) bool) -- valid is False wherever
-    the projected point falls outside B's frame OR behind camera B, same
-    chirality-via-w check reproject_a_to_b uses (a point behind the camera
-    can otherwise divide by a negative w and land back inside frame bounds
-    by coincidence).
+    P_a = K_a [I | 0], P_b = K_b [R | T] using this repo's X_b = R X_a + T
+    convention. Returns (depths (N,), inliers (N,) bool) -- inliers are
+    matches whose triangulated Z_a sits in (depth_min, depth_max).
     """
-    width_b, height_b = size_b
-    ones = np.ones((points_a.shape[0], 1))
-    homogeneous_a = np.concatenate([points_a, ones], axis=1).T  # (3, N)
+    projection_a = camera_matrix_a @ np.hstack([np.eye(3), np.zeros((3, 1))])
+    projection_b = camera_matrix_b @ np.hstack([R, T.reshape(3, 1)])
+    homogeneous = cv2.triangulatePoints(
+        projection_a, projection_b,
+        pts_a.T.astype(np.float64), pts_b.T.astype(np.float64),
+    )
+    homogeneous /= homogeneous[3]
+    depths = homogeneous[2]
+    inliers = (depths > depth_min) & (depths < depth_max)
+    return depths, inliers
 
-    rays_a = camera_matrix_a_inv @ homogeneous_a  # (3, N), normalized ray directions
-    points_3d = rays_a * depth  # (3, N), points at the hypothesized depth
-    points_b = R @ points_3d + T.reshape(3, 1)  # (3, N), camera B frame
-    projected = camera_matrix_b @ points_b  # (3, N), unnormalized B-image coords
 
+def degenerate_triangle_mask(
+    points: np.ndarray, triangles: np.ndarray,
+    max_area_ratio: float, max_slenderness: float,
+) -> np.ndarray:
+    """Flag Delaunay triangles too large or too thin to trust for interpolation.
+
+    area = 0.5 |cross(v1-v0, v2-v0)|. slenderness uses the fact that the
+    altitude to a triangle's longest edge is always its shortest altitude
+    (area is fixed, altitude ~ 1/base), so longest_edge / shortest_altitude
+    reduces to longest_edge^2 / (2 * area) -- no need to compute all three
+    altitudes. Equilateral triangles score ~1.15 (the minimum); it grows
+    without bound as a triangle thins toward collinear, so the zero-area
+    limit is naturally caught by the same threshold via the division guard.
+
+    Returns a boolean mask aligned with `triangles`' rows, True = reject.
+    """
+    vertices = points[triangles]  # (M, 3, 2)
+    edge_lengths = np.linalg.norm(
+        vertices[:, [1, 2, 0], :] - vertices, axis=2
+    )  # (M, 3): |v1-v0|, |v2-v1|, |v0-v2|
+    longest_edge = edge_lengths.max(axis=1)
+    e1 = vertices[:, 1] - vertices[:, 0]
+    e2 = vertices[:, 2] - vertices[:, 0]
+    cross_z = e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0]  # 2-D cross product (scalar)
+    area = 0.5 * np.abs(cross_z)
+
+    too_big = area > max_area_ratio * np.median(area)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        slenderness = longest_edge**2 / (2.0 * area)
+    too_thin = ~np.isfinite(slenderness) | (slenderness > max_slenderness)
+    return too_big | too_thin
+
+
+def build_mesh_interpolators(
+    pts_a: np.ndarray, pts_b: np.ndarray, reject_degenerate: bool = True,
+) -> Tuple["mtri.LinearTriInterpolator", "mtri.LinearTriInterpolator", int, int]:
+    """Delaunay-triangulate pts_a and build linear interpolators for pts_b as a
+    function of it (exact at every vertex), after masking out degenerate
+    triangles (see degenerate_triangle_mask) unless reject_degenerate is
+    False, so a single stretched-out triangle can't smear a real depth
+    discontinuity into a smooth (wrong) blend.
+
+    Split out of warp_with_match_field so other callers (e.g. a registration
+    accuracy check evaluating the same mesh at specific query points, not a
+    full pixel grid) can reuse the exact mesh main() builds instead of
+    re-deriving it. Returns (interpolate_x, interpolate_y, n_rejected,
+    n_triangles); n_rejected is 0 when reject_degenerate is False. Querying
+    either interpolator outside a valid triangle returns a masked value.
+    """
+    triangulation = mtri.Triangulation(pts_a[:, 0], pts_a[:, 1])
+    n_rejected = 0
+    if reject_degenerate:
+        bad_triangles = degenerate_triangle_mask(
+            pts_a, triangulation.triangles, MAX_TRIANGLE_AREA_RATIO, MAX_TRIANGLE_SLENDERNESS,
+        )
+        triangulation.set_mask(bad_triangles)
+        n_rejected = int(bad_triangles.sum())
+    interpolate_x = mtri.LinearTriInterpolator(triangulation, pts_b[:, 0].astype(np.float64))
+    interpolate_y = mtri.LinearTriInterpolator(triangulation, pts_b[:, 1].astype(np.float64))
+    return interpolate_x, interpolate_y, n_rejected, len(triangulation.triangles)
+
+
+def warp_with_match_field(
+    pts_a: np.ndarray, pts_b: np.ndarray, color_b: np.ndarray, size_a: Tuple[int, int],
+    reject_degenerate: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, int, int]:
+    """Piecewise-affine warp of camera B onto camera A from sparse matches,
+    via build_mesh_interpolators, sampled over the full pixel grid and
+    remapped. Returns (warped, covered, n_rejected, n_triangles): covered is
+    False outside the convex hull of the matches OR inside a rejected
+    triangle -- those pixels have no trustworthy source location and the
+    caller fills them with a calibrated plane warp.
+    """
+    width, height = size_a
+    interpolate_x, interpolate_y, n_rejected, n_triangles = build_mesh_interpolators(
+        pts_a, pts_b, reject_degenerate,
+    )
+    rows, cols = np.mgrid[0:height, 0:width]
+    source_x = interpolate_x(cols, rows)
+    source_y = interpolate_y(cols, rows)
+    covered = ~np.ma.getmaskarray(source_x)
+    map_x = np.ma.filled(source_x, -1.0).astype(np.float32)
+    map_y = np.ma.filled(source_y, -1.0).astype(np.float32)
+    warped = cv2.remap(
+        color_b, map_x, map_y, interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0),
+    )
+    return warped, covered, n_rejected, n_triangles
+
+
+def border_anchor_points(size_a: Tuple[int, int], spacing_px: float) -> np.ndarray:
+    """Points spaced around camera A's frame perimeter, corners included."""
+    width, height = size_a
+    n_x = max(2, int(round(width / spacing_px)) + 1)
+    n_y = max(2, int(round(height / spacing_px)) + 1)
+    top = np.stack([np.linspace(0, width - 1, n_x), np.zeros(n_x)], axis=1)
+    bottom = np.stack([np.linspace(0, width - 1, n_x), np.full(n_x, height - 1)], axis=1)
+    left = np.stack([np.zeros(n_y), np.linspace(0, height - 1, n_y)], axis=1)
+    right = np.stack([np.full(n_y, width - 1), np.linspace(0, height - 1, n_y)], axis=1)
+    return np.unique(np.concatenate([top, bottom, left, right]), axis=0)
+
+
+def project_via_plane(
+    points_a: np.ndarray, camera_matrix_a: np.ndarray, camera_matrix_b: np.ndarray,
+    R: np.ndarray, T: np.ndarray, depth_m: float, size_b: Tuple[int, int],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Project camera-A points into camera B via the calibrated single-depth plane
+    homography (register_pipeline.plane_homography). Used for synthetic border
+    anchors, not real matches: gives the mesh a physically-grounded vertex to
+    interpolate toward near the frame edge, instead of stopping wherever real
+    matches happen to thin out. Same chirality-via-w + bounds check as
+    register_pipeline.reproject_a_to_b. Returns (points_b, valid); valid is
+    False where the projection lands outside B's frame or behind camera B --
+    genuinely outside this rig's shared field of view, not a bug.
+    """
+    homography = plane_homography(np.linalg.inv(camera_matrix_a), camera_matrix_b, R, T, depth_m)
+    homogeneous_a = np.concatenate([points_a, np.ones((len(points_a), 1))], axis=1).T  # (3, N)
+    projected = homography @ homogeneous_a
     w = projected[2]
     with np.errstate(invalid="ignore", divide="ignore"):
-        predicted = (projected[:2] / w).T  # (N, 2)
-
+        points_b = (projected[:2] / w).T
+    width_b, height_b = size_b
     valid = (
         (w > 1e-9)
-        & (predicted[:, 0] >= 0) & (predicted[:, 0] <= width_b - 1)
-        & (predicted[:, 1] >= 0) & (predicted[:, 1] <= height_b - 1)
+        & (points_b[:, 0] >= 0) & (points_b[:, 0] <= width_b - 1)
+        & (points_b[:, 1] >= 0) & (points_b[:, 1] <= height_b - 1)
     )
-    predicted = np.nan_to_num(predicted, nan=-1.0, posinf=-1.0, neginf=-1.0)
-    return predicted, valid
+    points_b = np.nan_to_num(points_b, nan=-1.0, posinf=-1.0, neginf=-1.0)
+    return points_b, valid
 
 
-def fit_depth(
-    pts_a: np.ndarray, pts_b: np.ndarray,
-    camera_matrix_a_inv: np.ndarray, camera_matrix_b: np.ndarray,
-    R: np.ndarray, T: np.ndarray, size_b: Tuple[int, int],
-    depths: np.ndarray, ransac_threshold: float,
-) -> Tuple[float, float, np.ndarray, np.ndarray, Optional[float]]:
-    """Fit the single plane depth that best explains matched (pts_a, pts_b).
+def feather_alpha(covered: np.ndarray, width_px: int) -> np.ndarray:
+    """Blend weight for match_warp vs. plane_warp: 0 right at the covered/uncovered
+    boundary, ramping to 1 a full width_px inside the covered region.
 
-    Coarse stage: score every depth in an internal coarse grid by counting
-    inliers (matches whose reprojection lands within `ransac_threshold` px)
-    -- this is 1-D RANSAC via grid search, robust to however many outlier
-    matches LightGlue lets through. That internal grid is `depths` itself
-    ONLY if the caller already passed at least MIN_COARSE_STEPS points;
-    otherwise it's resampled to MIN_COARSE_STEPS points spanning the same
-    [depths[0], depths[-1]] range (same uniform-in-inverse-depth sampling as
-    candidate_depths -- reused directly, not reimplemented). This decouples
-    the coarse search's actual resolution from --steps: --steps' default
-    (60, matching register_pipeline.py's own CLI default for consistency)
-    only resolves ~2 mm/step near this rig's working depth, which measurably
-    aliases two competing near-planar hypotheses a few mm apart into a
-    single hump -- the coarse winner then lands on neither true peak, AND
-    the ambiguity check below (which only ever sees the grid it's given)
-    has no way to notice the second peak was ever there. MIN_COARSE_STEPS
-    is the fix for both: it makes the coarse search see the real landscape
-    regardless of what --steps the user left set. `depths` is still used
-    unmodified for the refine stage's search bounds and is still what the
-    caller/report reflects for "how many steps did I ask for" purposes --
-    only the coarse stage's internal resolution is decoupled here.
-
-    Refine stage: golden-section search over the *full* [depths[0],
-    depths[-1]] range (not just the coarse winner's neighboring grid cells
-    -- an early version bracketed too tightly and consistently undershot the
-    true depth by ~1-2mm in testing) minimizing median reprojection error
-    over the coarse-stage inlier set.
-
-    Ambiguity check: every candidate coarse-grid depth's inlier count is kept
-    (not just the running best/second, discarded in earlier versions), so
-    after the coarse loop we can look for a "runner-up" -- among coarse-grid
-    points whose index is more than AMBIGUOUS_DEPTH_GAP_STEPS away from the
-    winner's index (so a merely-adjacent grid point isn't mistaken for a
-    competing hypothesis), the one with the highest inlier count. If that
-    runner-up's inlier count is at least AMBIGUOUS_INLIER_RATIO times the
-    winner's, the scene has two near-equally-good planar explanations and
-    the single-plane fit is reported as ambiguous rather than silently
-    picking whichever one the grid happened to favor.
-
-    Returns (refined_depth, coarse_depth, inliers, errors, ambiguous_depth):
-    inliers/errors are evaluated at refined_depth, over ALL of pts_a/pts_b
-    (not just the coarse inlier set), so a match the coarse stage missed can
-    still count once refinement lands closer to the true depth -- EXCEPT on
-    the early-return branch below (fewer than 2 coarse inliers), which skips
-    refinement entirely and returns the unrefined coarse depth with
-    inliers/errors evaluated at THAT depth, not a golden-section-refined one.
-    ambiguous_depth is the competitive runner-up depth in metres if the
-    ambiguity check above fired, else None.
+    One-sided by design (always 0 outside `covered`, never partially blended
+    in): match_warp's pixels outside the hull are meaningless remap fill
+    (black, from cv2.remap's borderValue), not a smooth extrapolation of real
+    content, so blending any nonzero weight of them in would draw a dark
+    fringe just outside the boundary instead of removing the seam.
     """
-    coarse_depths = (
-        depths if len(depths) >= MIN_COARSE_STEPS
-        else candidate_depths(float(depths[0]), float(depths[-1]), MIN_COARSE_STEPS)
-    )
+    covered_u8 = covered.astype(np.uint8) * 255
+    dist_inside = cv2.distanceTransform(covered_u8, cv2.DIST_L2, 5)
+    return np.clip(dist_inside / width_px, 0.0, 1.0).astype(np.float32)
 
-    inlier_counts = np.empty(len(coarse_depths), dtype=np.int64)
-    best_depth = float(coarse_depths[0])
-    best_inlier_count = -1
-    best_index = 0
-    best_errors = np.full(len(pts_a), np.inf)
-    for i, depth in enumerate(coarse_depths):
-        predicted_b, valid = project_points_a_to_b(
-            float(depth), pts_a, camera_matrix_a_inv, camera_matrix_b, R, T, size_b
+
+def match_histogram(source: np.ndarray, reference: np.ndarray) -> np.ndarray:
+    """Per-channel histogram match so overlay panels are not dominated by the
+    exposure/gain offset between the two cameras (cam2 collects less light)."""
+    matched = source.copy()
+    for channel in range(source.shape[2]):
+        source_values, bin_index, source_counts = np.unique(
+            source[:, :, channel].ravel(), return_inverse=True, return_counts=True
         )
-        errors = np.linalg.norm(predicted_b - pts_b, axis=1)
-        errors = np.where(valid, errors, np.inf)
-        inlier_count = int(np.sum(errors < ransac_threshold))
-        inlier_counts[i] = inlier_count
-        if inlier_count > best_inlier_count:
-            best_inlier_count = inlier_count
-            best_depth = float(depth)
-            best_index = i
-            best_errors = errors
-
-    # Runner-up search: mask out grid points near the winner, then take the
-    # highest inlier count among what's left. np.argmax picks the first
-    # occurrence of the max, same tie-breaking convention as the running-best
-    # loop above (only a strict `>` replaces the incumbent).
-    far_from_winner = (
-        np.abs(np.arange(len(coarse_depths)) - best_index) > AMBIGUOUS_DEPTH_GAP_STEPS
-    )
-    ambiguous_depth: Optional[float] = None
-    if np.any(far_from_winner):
-        masked_counts = np.where(far_from_winner, inlier_counts, -1)
-        runner_up_index = int(np.argmax(masked_counts))
-        runner_up_count = int(masked_counts[runner_up_index])
-        if runner_up_count >= AMBIGUOUS_INLIER_RATIO * best_inlier_count:
-            ambiguous_depth = float(coarse_depths[runner_up_index])
-
-    coarse_depth = best_depth
-    coarse_inliers = best_errors < ransac_threshold
-    if int(coarse_inliers.sum()) < 2:
-        # Too few inliers to refine meaningfully; caller (main) gates on
-        # MIN_INLIERS_TO_TRUST and will SystemExit before trusting this.
-        return best_depth, coarse_depth, coarse_inliers, best_errors, ambiguous_depth
-
-    lo, hi = float(depths[0]), float(depths[-1])
-
-    def objective(depth: float) -> float:
-        predicted_b, valid = project_points_a_to_b(
-            depth, pts_a[coarse_inliers], camera_matrix_a_inv, camera_matrix_b, R, T, size_b
+        reference_values, reference_counts = np.unique(
+            reference[:, :, channel].ravel(), return_counts=True
         )
-        errors = np.linalg.norm(predicted_b - pts_b[coarse_inliers], axis=1)
-        errors = np.where(valid, errors, ransac_threshold * 10.0)
-        return float(np.median(errors))
-
-    refined_depth = golden_section_minimize(objective, lo, hi)
-    predicted_b, valid = project_points_a_to_b(
-        refined_depth, pts_a, camera_matrix_a_inv, camera_matrix_b, R, T, size_b
-    )
-    final_errors = np.where(valid, np.linalg.norm(predicted_b - pts_b, axis=1), np.inf)
-    final_inliers = final_errors < ransac_threshold
-    return refined_depth, coarse_depth, final_inliers, final_errors, ambiguous_depth
+        source_quantiles = np.cumsum(source_counts).astype(np.float64)
+        source_quantiles /= source_quantiles[-1]
+        reference_quantiles = np.cumsum(reference_counts).astype(np.float64)
+        reference_quantiles /= reference_quantiles[-1]
+        mapped = np.interp(source_quantiles, reference_quantiles, reference_values)
+        matched[:, :, channel] = mapped[bin_index].reshape(source[:, :, channel].shape).astype(np.uint8)
+    return matched
 
 
 # --------------------------------------------------------------------------- #
@@ -428,6 +445,25 @@ def render_match_visualization(
     return canvas
 
 
+def render_checker(
+    color_a: np.ndarray, warped: np.ndarray, covered: np.ndarray, n_cells: int = 12,
+) -> np.ndarray:
+    """Checkerboard of camera A and warped B, only inside the match hull.
+
+    Outside the hull the warp is a fallback plane, not a correspondence, so
+    including it in the checker makes the fingers look broken even when the
+    matched surface overlapped. Uncovered pixels stay as camera A, dimmed.
+    """
+    height, width = color_a.shape[:2]
+    cell = max(32, min(height, width) // n_cells)
+    rows, cols = np.ogrid[:height, :width]
+    board = ((cols // cell) + (rows // cell)) % 2 == 0
+    checker = color_a.copy()
+    checker[covered & board] = warped[covered & board]
+    checker[~covered] = (color_a[~covered] // 2)
+    return checker
+
+
 def _labelled(image: np.ndarray, text: str) -> np.ndarray:
     frame = image.copy()
     cv2.putText(frame, text, (16, 36), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2, cv2.LINE_AA)
@@ -442,20 +478,19 @@ def _resize_to_width(image: np.ndarray, width: int) -> np.ndarray:
 
 
 def save_preview(
-    path: Path, color_a: np.ndarray, warped_color: np.ndarray, match_viz: np.ndarray,
+    path: Path, color_a: np.ndarray, warped_color: np.ndarray, checker: np.ndarray,
 ) -> None:
-    """camera A | warped B | match visualization, side by side.
+    """camera A | warped B | checker overlay, side by side.
 
-    Unlike register_pipeline.save_preview's three panels (which all share
-    size_a's aspect ratio), match_viz is roughly twice as wide as the other
-    two, so after independent _resize_to_width scaling the panels can end
-    up different heights -- pad each to the tallest before hstacking, or
-    np.hstack raises on mismatched shapes.
+    The checker is the overlap diagnostic: if registration worked, finger
+    edges and skin creases continue across square boundaries. A and warped
+    B share size_a's aspect; pad anyway so a future layout change cannot
+    make np.hstack raise.
     """
     panels = [
         _resize_to_width(_labelled(color_a, "camera A"), PREVIEW_PANEL_WIDTH),
         _resize_to_width(_labelled(warped_color, "B warped onto A"), PREVIEW_PANEL_WIDTH),
-        _resize_to_width(_labelled(match_viz, "LightGlue matches"), PREVIEW_PANEL_WIDTH),
+        _resize_to_width(_labelled(checker, "overlap (checker)"), PREVIEW_PANEL_WIDTH),
     ]
     max_height = max(panel.shape[0] for panel in panels)
     padded = [
@@ -469,79 +504,77 @@ def save_preview(
 def write_report(
     path: Path,
     session_dir: Path, camera_a: str, camera_b: str, extrinsics_path: Path,
-    extrinsics: StereoExtrinsics, size_a: Tuple[int, int],
+    size_a: Tuple[int, int],
     n_raw_matches: int, min_confidence: float, n_matches: int,
-    depths: np.ndarray, ransac_threshold: float,
-    fitted_depth: float, inliers: np.ndarray, errors: np.ndarray,
-    default_depth: float, d_critical: float, n_outside_fov: int,
-    ambiguous_depth: Optional[float], warnings: List[str],
+    n_inliers: int, depths: np.ndarray, inliers: np.ndarray,
+    covered: np.ndarray, n_outside_fov: int,
+    reject_degenerate: bool, n_rejected_triangles: int, n_triangles: int,
+    use_border_anchors: bool, n_anchors: int, use_feather_blend: bool,
 ) -> None:
-    """n_matches and inliers.sum() are both guaranteed > 0 here -- main()
-    SystemExits before calling this if --min-matches or MIN_INLIERS_TO_TRUST
-    aren't met, so no n/a branches are needed (unlike register_pipeline's
-    write_report, which isn't gated the same way for its DEPTH MAP section)."""
-    n_inliers = int(inliers.sum())
-    inlier_errors = errors[inliers]
+    inlier_depths = depths[inliers]
     n_pixels = size_a[0] * size_a[1]
+    n_covered = int(covered.sum())
 
     def pct(count: int, denominator: int) -> str:
         return f"{count / denominator * 100:.1f}%" if denominator else "n/a"
 
     lines = [
-        f"Registration: {camera_b} -> {camera_a} (LightGlue sparse match + single fitted plane depth)",
+        f"Registration: {camera_b} -> {camera_a} (LightGlue sparse match + piecewise-affine warp)",
         "=" * 66,
         "",
         f"  session:            {session_dir}",
         f"  extrinsics:         {extrinsics_path}",
         f"  resolution:         {size_a[0]}x{size_a[1]}",
-        f"  baseline:           {extrinsics.baseline_m * 1000:.2f} mm",
-        f"  convergence:        {extrinsics.optical_axis_angle_deg:.2f} deg",
         "",
         "MATCHING",
         "-" * 66,
         f"  raw LightGlue matches:      {n_raw_matches}",
         f"  above min-confidence {min_confidence}: {n_matches}",
         "",
-        "DEPTH FIT",
+        "TRIANGULATION",
         "-" * 66,
-        f"  search range:        {depths[0]:.4f} - {depths[-1]:.4f} m "
-        f"({len(depths)} steps, uniform in 1/depth)",
-        f"  ransac threshold:    {ransac_threshold} px",
-        f"  fitted depth:        {fitted_depth:.4f} m",
-        f"  inliers:             {n_inliers} / {n_matches} ({n_inliers / n_matches * 100:.1f}%)",
-        f"  reprojection error (inliers, px): median {np.median(inlier_errors):.2f}, "
-        f"mean {inlier_errors.mean():.2f}, max {inlier_errors.max():.2f}",
-        f"  calibrated default depth: {default_depth:.4f} m "
-        f"(delta {abs(fitted_depth - default_depth) * 1000:.1f} mm)",
-        f"  homography singular at:  {d_critical * 1000:.2f} mm "
-        f"({'well clear of' if abs(d_critical) < depths[0] / 5 else 'CHECK: close to'} "
-        "the search range)",
-    ]
-    if ambiguous_depth is not None:
-        lines.append(
-            f"  ambiguous alternate depth: {ambiguous_depth:.4f} m "
-            "(comparable inlier count to the fitted depth -- see Quality warnings)"
-        )
-    lines += [
+        f"  inliers (Z in working range): {n_inliers} / {n_matches} "
+        f"({n_inliers / n_matches * 100:.1f}%)",
+        f"  triangulated Z (inliers, m): min {inlier_depths.min():.4f}, "
+        f"median {np.median(inlier_depths):.4f}, max {inlier_depths.max():.4f}",
+        f"  match-hull coverage: {n_covered} ({pct(n_covered, n_pixels)}) "
+        "-- uncovered pixels use a calibrated median-depth plane",
+        (
+            f"  degenerate triangles rejected: {n_rejected_triangles} / {n_triangles} "
+            f"({pct(n_rejected_triangles, n_triangles)}) -- huge-area or thin-sliver, "
+            "excluded from the piecewise warp"
+        ) if reject_degenerate else (
+            "  degenerate triangle rejection: disabled "
+            "(--no-reject-degenerate-triangles)"
+        ),
+        (
+            f"  border anchors: {n_anchors} synthetic points added at the frame "
+            "perimeter (projected via the calibrated plane) so the mesh reaches "
+            "the edge instead of stopping wherever real matches thin out"
+        ) if use_border_anchors else (
+            "  border anchors: disabled (--no-border-anchors)"
+        ),
+        (
+            f"  covered/uncovered blend: feathered over {FEATHER_WIDTH_PX} px "
+            "(match_warp -> plane_warp ramp, no hard seam)"
+        ) if use_feather_blend else (
+            "  covered/uncovered blend: hard switch (--no-feather-blend)"
+        ),
         "",
         "COVERAGE",
         "-" * 66,
         f"  camera A pixels:              {n_pixels}",
         f"  outside shared field of view (post-fill): {n_outside_fov} "
         f"({pct(n_outside_fov, n_pixels)})",
-    ]
-    if warnings:
-        lines += ["", "Quality warnings", "-" * 66]
-        lines += [f"  - {warning}" for warning in warnings]
-    lines += [
         "",
         "OUTPUT FILES",
         "-" * 66,
-        "  warped_features.jpg   camera B warped onto camera A via the fitted single-depth homography",
+        "  warped_features.jpg   camera B warped onto camera A (piecewise affine from matches)",
+        "  overlay_checker.jpg   checkerboard of camera A vs warped B (overlap diagnostic)",
+        "  overlay_blend.jpg     50/50 blend of camera A and warped B",
         "  matches.jpg           inlier (green) / outlier (red) correspondence lines",
-        "  preview_features.jpg  camera A | warped B | match visualization, side by side",
-        "  fit_result.json       machine-readable summary: fitted/coarse/ambiguous depth, "
-        "match/inlier counts, outside-FOV pixels",
+        "  preview_features.jpg  camera A | warped B | checker overlay, side by side",
+        "  fit_result.json       match/inlier counts, depth stats, outside-FOV pixels",
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -551,14 +584,6 @@ def write_report(
 # --------------------------------------------------------------------------- #
 def main() -> int:
     args = parse_args()
-    if args.depth_min <= 0 or args.depth_max <= args.depth_min:
-        raise SystemExit(
-            f"--depth-min/--depth-max must satisfy 0 < min < max, got "
-            f"{args.depth_min} / {args.depth_max}"
-        )
-
-    reg_config = load_config().get("registration", {}) or {}
-    default_depth = reg_config.get("default_depth", 0.168)
 
     extrinsics_path = resolve_path(
         args.extrinsics or default_extrinsics_path(args.camera_a, args.camera_b)
@@ -572,9 +597,13 @@ def main() -> int:
     extrinsics = StereoExtrinsics.load_json(extrinsics_path)
 
     session_dir = resolve_path(args.session)
+    reg_config = load_config().get("registration", {}) or {}
     output_root = args.output or reg_config.get("output_dir", DEFAULT_REGISTRATION_OUTPUT_DIR)
     output_dir = resolve_path(output_root) / session_dir.name
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    depth_range = reg_config.get("depth_range", [DEFAULT_DEPTH_MIN, DEFAULT_DEPTH_MAX])
+    depth_min, depth_max = float(depth_range[0]), float(depth_range[1])
 
     image_a, image_b = load_session_images(session_dir, args.camera_a, args.camera_b)
     undistorted_a, undistorted_b = undistort_pair(image_a, image_b, extrinsics)
@@ -605,42 +634,99 @@ def main() -> int:
             "match between cameras, or lower --min-confidence."
         )
 
-    camera_matrix_a_inv = np.linalg.inv(camera_matrix_a)
-    depths = candidate_depths(args.depth_min, args.depth_max, args.steps)
-    refined_depth, coarse_depth, inliers, errors, ambiguous_depth = fit_depth(
-        pts_a, pts_b, camera_matrix_a_inv, camera_matrix_b,
-        extrinsics.R, extrinsics.T, size_b, depths, args.ransac_threshold,
+    depths, inliers = triangulate_matches(
+        pts_a, pts_b, camera_matrix_a, camera_matrix_b,
+        extrinsics.R, extrinsics.T, depth_min, depth_max,
     )
     n_inliers = int(inliers.sum())
     if n_inliers > 0:
-        print(f"Fitted depth: {refined_depth:.4f} m ({n_inliers}/{n_matches} inliers, "
-              f"median error {np.median(errors[inliers]):.2f}px)")
+        inlier_depths = depths[inliers]
+        print(
+            f"Triangulated {n_inliers}/{n_matches} matches, "
+            f"Z median {np.median(inlier_depths):.4f} m "
+            f"[{inlier_depths.min():.4f}, {inlier_depths.max():.4f}]"
+        )
     if n_inliers < MIN_INLIERS_TO_TRUST:
         raise SystemExit(
-            f"Only {n_inliers} inlier matches at the fitted depth (need >= "
-            f"{MIN_INLIERS_TO_TRUST} to trust a 1-DOF plane fit). Check calibration, "
-            "--ransac-threshold, or capture a more textured scene."
+            f"Only {n_inliers} matches triangulated inside {depth_min:.3f}-{depth_max:.3f} m "
+            f"(need >= {MIN_INLIERS_TO_TRUST}). Check calibration, camera order, or capture "
+            "a more textured scene."
         )
 
-    warped_color, remap_valid = compose_warped_output(
-        refined_depth, color_b, camera_matrix_a, camera_matrix_b,
+    reject_degenerate = not args.no_reject_degenerate_triangles
+    use_border_anchors = not args.no_border_anchors
+    use_feather_blend = not args.no_feather_blend
+    fill_depth = float(np.median(depths[inliers]))
+
+    mesh_pts_a, mesh_pts_b = pts_a[inliers], pts_b[inliers]
+    n_anchors = 0
+    if use_border_anchors:
+        candidate_anchors_a = border_anchor_points(size_a, BORDER_ANCHOR_SPACING_PX)
+        anchors_b, anchors_valid = project_via_plane(
+            candidate_anchors_a, camera_matrix_a, camera_matrix_b,
+            extrinsics.R, extrinsics.T, fill_depth, size_b,
+        )
+        anchors_a = candidate_anchors_a[anchors_valid]
+        anchors_b = anchors_b[anchors_valid]
+        n_anchors = len(anchors_a)
+        mesh_pts_a = np.concatenate([mesh_pts_a, anchors_a])
+        mesh_pts_b = np.concatenate([mesh_pts_b, anchors_b])
+
+    match_warp, covered, n_rejected_triangles, n_triangles = warp_with_match_field(
+        mesh_pts_a, mesh_pts_b, color_b, size_a, reject_degenerate,
+    )
+    plane_depth = np.full((size_a[1], size_a[0]), fill_depth, dtype=np.float64)
+    plane_warp, remap_valid = compose_warped_output(
+        plane_depth, color_b, camera_matrix_a, camera_matrix_b,
         extrinsics.R, extrinsics.T, size_a, size_b,
     )
+    if use_feather_blend:
+        alpha = feather_alpha(covered, FEATHER_WIDTH_PX)[:, :, None]
+        warped_color = (
+            alpha * match_warp.astype(np.float32) + (1 - alpha) * plane_warp.astype(np.float32)
+        ).astype(np.uint8)
+    else:
+        warped_color = np.where(covered[:, :, None], match_warp, plane_warp)
+    n_outside_fov = int((~remap_valid & ~covered).sum())
+    rejection_note = (
+        f"{n_rejected_triangles}/{n_triangles} degenerate triangles rejected"
+        if reject_degenerate else "degenerate triangle rejection disabled"
+    )
+    anchor_note = f"{n_anchors} border anchors" if use_border_anchors else "border anchors disabled"
+    feather_note = f"feathered {FEATHER_WIDTH_PX}px" if use_feather_blend else "hard switch"
+    print(
+        f"Piecewise-affine warp over {covered.mean() * 100:.1f}% of the frame "
+        f"({rejection_note}; {anchor_note}; {feather_note}; "
+        f"uncovered pixels use a {fill_depth:.4f} m plane)"
+    )
+
     match_viz = render_match_visualization(color_a, color_b, pts_a, pts_b, inliers)
-    n_outside_fov = int((~remap_valid).sum())
+    overlay_source = match_histogram(warped_color, color_a)
+    checker = render_checker(color_a, overlay_source, covered)
+    blend = color_a.copy()
+    blend[covered] = (
+        0.5 * color_a[covered].astype(np.float32) + 0.5 * overlay_source[covered].astype(np.float32)
+    ).astype(np.uint8)
 
     cv2.imwrite(str(output_dir / "warped_features.jpg"), warped_color)
+    cv2.imwrite(str(output_dir / "overlay_checker.jpg"), checker)
+    cv2.imwrite(str(output_dir / "overlay_blend.jpg"), blend)
     cv2.imwrite(str(output_dir / "matches.jpg"), match_viz)
-    save_preview(output_dir / "preview_features.jpg", color_a, warped_color, match_viz)
+    save_preview(output_dir / "preview_features.jpg", color_a, warped_color, checker)
 
     fit_result = {
-        "fitted_depth_m": float(refined_depth),
-        "coarse_depth_m": float(coarse_depth),
-        "ambiguous_alternate_depth_m": (
-            float(ambiguous_depth) if ambiguous_depth is not None else None
-        ),
         "n_matches": n_matches,
         "n_inliers": n_inliers,
+        "depth_min_m": float(depths[inliers].min()),
+        "depth_median_m": fill_depth,
+        "depth_max_m": float(depths[inliers].max()),
+        "interpolated_coverage": float(covered.mean()),
+        "reject_degenerate_triangles": reject_degenerate,
+        "triangles_total": n_triangles,
+        "triangles_rejected": n_rejected_triangles,
+        "border_anchors_used": use_border_anchors,
+        "n_border_anchors": n_anchors,
+        "feather_blend_used": use_feather_blend,
         "outside_fov_pixels": n_outside_fov,
         "outside_fov_fraction": n_outside_fov / (size_a[0] * size_a[1]),
     }
@@ -648,34 +734,15 @@ def main() -> int:
         json.dump(fit_result, f, indent=2)
         f.write("\n")
 
-    d_critical = singular_depth(extrinsics.R, extrinsics.T)
-    warnings: List[str] = []
-    if np.isclose(coarse_depth, depths[0]) or np.isclose(coarse_depth, depths[-1]):
-        warnings.append(
-            f"Fitted depth landed on the edge of the search range ({depths[0]:.3f} or "
-            f"{depths[-1]:.3f} m). Widen --depth-min/--depth-max."
-        )
-    if ambiguous_depth is not None:
-        warnings.append(
-            f"A competing plane at {ambiguous_depth:.4f} m had a comparable inlier count "
-            f"to the fitted depth {refined_depth:.4f} m -- the single-plane assumption "
-            "may be ambiguous for this scene. Inspect matches.jpg / preview_features.jpg, "
-            "or narrow --depth-min/--depth-max if you know the true working range."
-        )
-
     write_report(
         output_dir / "report_features.txt",
-        session_dir, args.camera_a, args.camera_b, extrinsics_path, extrinsics, size_a,
+        session_dir, args.camera_a, args.camera_b, extrinsics_path, size_a,
         n_raw_matches, args.min_confidence, n_matches,
-        depths, args.ransac_threshold,
-        refined_depth, inliers, errors,
-        default_depth, d_critical, n_outside_fov, ambiguous_depth, warnings,
+        n_inliers, depths, inliers, covered, n_outside_fov,
+        reject_degenerate, n_rejected_triangles, n_triangles,
+        use_border_anchors, n_anchors, use_feather_blend,
     )
 
-    if warnings:
-        print("\nQuality warnings:")
-        for warning in warnings:
-            print(f"  - {warning}")
     print(f"\nSaved outputs to {output_dir}")
     return 0
 
