@@ -81,6 +81,9 @@ from register_features import (  # noqa: E402
     BORDER_ANCHOR_SPACING_PX,
     extract_features,
     extract_features_tiled,
+    geometric_consistency_mask,
+    GEOMETRIC_CONSISTENCY_NEIGHBORS,
+    GEOMETRIC_CONSISTENCY_THRESHOLD_PX,
     KEYPOINT_TILE_SIZE_PX,
     load_models,
     match_features,
@@ -129,6 +132,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-confidence", type=float, default=DEFAULT_MIN_CONFIDENCE)
     parser.add_argument("--no-border-anchors", action="store_true")
     parser.add_argument("--no-reject-degenerate-triangles", action="store_true")
+    parser.add_argument("--no-geometric-consistency-filter", action="store_true")
     parser.add_argument("--tiled-keypoints", action="store_true",
                         help="Opt-in: measured as an accuracy regression, see "
                              "register_features.py --help for details.")
@@ -158,6 +162,7 @@ def evaluate_observation(
     downscale: float, min_confidence: float,
     depth_min: float, depth_max: float,
     use_border_anchors: bool, reject_degenerate: bool, use_tiled_keypoints: bool,
+    use_geometric_filter: bool,
 ) -> dict:
     """Build register_features.py's mesh for this session and evaluate it at
     this session's independently-detected board corners. Returns a dict with
@@ -179,6 +184,11 @@ def evaluate_observation(
     pts_a_all, pts_b_all, scores_all = match_features(matcher, feats_a, feats_b, hw_a, hw_b)
     keep = scores_all >= min_confidence
     pts_a, pts_b = pts_a_all[keep], pts_b_all[keep]
+    if use_geometric_filter:
+        consistent = geometric_consistency_mask(
+            pts_a, pts_b, GEOMETRIC_CONSISTENCY_NEIGHBORS, GEOMETRIC_CONSISTENCY_THRESHOLD_PX,
+        )
+        pts_a, pts_b = pts_a[consistent], pts_b[consistent]
 
     depths, inliers = triangulate_matches(
         pts_a, pts_b, camera_matrix_a, camera_matrix_b,
@@ -273,6 +283,7 @@ def main() -> int:
     reject_degenerate = not args.no_reject_degenerate_triangles
     use_border_anchors = not args.no_border_anchors
     use_tiled_keypoints = args.tiled_keypoints
+    use_geometric_filter = not args.no_geometric_consistency_filter
     device = torch.device("cpu")
     disk, matcher = load_models(device)
 
@@ -284,6 +295,7 @@ def main() -> int:
             observation, session_dir, args.camera_a, args.camera_b, extrinsics,
             disk, matcher, device, args.downscale, args.min_confidence,
             depth_min, depth_max, use_border_anchors, reject_degenerate, use_tiled_keypoints,
+            use_geometric_filter,
         )
         if "skipped" in result:
             print(f"  skipped: {result['skipped']}")
@@ -314,6 +326,7 @@ def main() -> int:
         f"  border anchors:   {'on' if use_border_anchors else 'off (--no-border-anchors)'}",
         f"  degenerate reject: {'on' if reject_degenerate else 'off (--no-reject-degenerate-triangles)'}",
         f"  tiled keypoints:  {'on (--tiled-keypoints)' if use_tiled_keypoints else 'off'}",
+        f"  geometric filter: {'on' if use_geometric_filter else 'off (--no-geometric-consistency-filter)'}",
         f"  sessions scored:  {len(scored)}/{len(results)}",
         f"  corners scored:   {len(all_errors)} ({n_mesh_total} via mesh, "
         f"{len(all_errors) - n_mesh_total} via fallback plane)",
@@ -347,6 +360,7 @@ def main() -> int:
         "use_border_anchors": use_border_anchors,
         "reject_degenerate_triangles": reject_degenerate,
         "use_tiled_keypoints": use_tiled_keypoints,
+        "use_geometric_filter": use_geometric_filter,
         "n_sessions_scored": len(scored),
         "n_corners_scored": len(all_errors),
         "n_corners_via_mesh": n_mesh_total,

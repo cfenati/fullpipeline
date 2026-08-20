@@ -42,10 +42,21 @@ needed to score that.
    rather than removed, in case a genuinely texture-sparse subject reverses
    the trade-off, but don't default to it without new evidence.
 
-2. **Geometric-consistency pre-filtering.** Reject matches whose local
-   displacement is an outlier vs. its neighbors *before* triangulating --
-   catches bad matches before they can form a bad triangle, complementing
-   the post-hoc degenerate-triangle rejection already in place.
+2. **Geometric-consistency pre-filtering, status: tried, neutral.**
+   Implemented as `geometric_consistency_mask` / `--no-geometric-consistency-filter`
+   (default: on). Rejects a match whose displacement (pts_b - pts_a) deviates
+   from its 8 nearest neighbors' median by more than 15px, before
+   triangulation -- catches a bad match before it can form a bad triangle,
+   complementing degenerate-triangle rejection (which only catches one after
+   the fact). Measured effect: only 7/2782 matches rejected on a hand
+   capture (`captures/20260818_152114_103039`), and on the held-out ChArUco
+   set `check_registration_error.py` reports byte-identical numbers with the
+   filter on or off (357 corners, median 0.66px, max 3.51px either way) --
+   this rig's LightGlue matches are apparently already too clean on both
+   available test scenes for this filter to have much to catch. Kept
+   default-on (sound rationale, no measured downside, negligible cost), but
+   it hasn't been proven to help either -- would need a messier/higher-
+   outlier-rate test scene to actually discriminate its value.
 
 3. **Ensemble/second matcher.** Pool LightGlue+DISK matches with a second
    independent matcher (ORB/SIFT, or a dense matcher like LoFTR) to extend

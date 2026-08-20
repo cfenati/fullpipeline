@@ -118,6 +118,15 @@ KEYPOINT_TILE_SIZE_PX = 300  # target tile size for extract_features_tiled, work
                               # 1164x874 resolution, small enough to force keypoints into
                               # low-texture tiles without shrinking each tile's own budget
                               # to noise.
+GEOMETRIC_CONSISTENCY_NEIGHBORS = 8  # how many spatially-nearest matches (in camera-A
+                                     # pixel space) each match's displacement is compared
+                                     # against in geometric_consistency_mask.
+GEOMETRIC_CONSISTENCY_THRESHOLD_PX = 15.0  # reject a match whose displacement deviates
+                                            # from its neighbors' median by more than this
+                                            # many px, working resolution. Calibrated
+                                            # empirically against this rig's observed
+                                            # depth-driven displacement variation -- see
+                                            # geometric_consistency_mask.
 
 
 # --------------------------------------------------------------------------- #
@@ -173,6 +182,14 @@ def parse_args() -> argparse.Namespace:
         help="Hard-switch between the piecewise-affine warp and the fallback plane at "
              "the covered/uncovered boundary instead of ramping smoothly across it "
              f"(default: feathered over {FEATHER_WIDTH_PX} px).",
+    )
+    parser.add_argument(
+        "--no-geometric-consistency-filter", action="store_true",
+        help="Keep matches whose displacement disagrees with their spatial neighbors' "
+             "(see geometric_consistency_mask) instead of dropping them before "
+             "triangulation. Default: filtered, "
+             f"threshold {GEOMETRIC_CONSISTENCY_THRESHOLD_PX} px vs. the median of the "
+             f"nearest {GEOMETRIC_CONSISTENCY_NEIGHBORS} neighbors.",
     )
     parser.add_argument(
         "--tiled-keypoints", action="store_true",
@@ -302,6 +319,41 @@ def match_features(
 # --------------------------------------------------------------------------- #
 # Geometry
 # --------------------------------------------------------------------------- #
+def geometric_consistency_mask(
+    pts_a: np.ndarray, pts_b: np.ndarray, k_neighbors: int, threshold_px: float,
+) -> np.ndarray:
+    """Flag matches whose displacement (pts_b - pts_a) disagrees with its
+    spatial neighbors' displacement in camera A, before triangulation ever
+    sees them.
+
+    A correct match on a locally smooth surface moves similarly to its
+    nearby matches (parallax varies smoothly with depth, except right at a
+    real depth discontinuity); a mismatched point's displacement is
+    essentially arbitrary relative to its neighbors. Complements
+    degenerate_triangle_mask, which only catches a bad match once it's
+    already stretched a Delaunay triangle -- this catches it earlier, before
+    it can pull a neighboring good match's triangle out of shape too.
+
+    O(N^2) pairwise distance matrix -- fine at LightGlue's match counts here
+    (thousands, not millions); would need a KD-tree at a larger scale.
+
+    Returns a boolean mask aligned with pts_a's rows, True = keep.
+    """
+    n = len(pts_a)
+    k = min(k_neighbors, n - 1)
+    if k < 1:
+        return np.ones(n, dtype=bool)
+
+    displacement = pts_b - pts_a
+    diff = pts_a[:, None, :] - pts_a[None, :, :]
+    dist_sq = np.sum(diff**2, axis=2)
+    np.fill_diagonal(dist_sq, np.inf)
+    neighbor_idx = np.argpartition(dist_sq, k - 1, axis=1)[:, :k]
+    local_median = np.median(displacement[neighbor_idx], axis=1)
+    deviation = np.linalg.norm(displacement - local_median, axis=1)
+    return deviation <= threshold_px
+
+
 def triangulate_matches(
     pts_a: np.ndarray, pts_b: np.ndarray,
     camera_matrix_a: np.ndarray, camera_matrix_b: np.ndarray,
@@ -585,6 +637,7 @@ def write_report(
     reject_degenerate: bool, n_rejected_triangles: int, n_triangles: int,
     use_border_anchors: bool, n_anchors: int, use_feather_blend: bool,
     use_tiled_keypoints: bool,
+    use_geometric_filter: bool, n_before_geometric_filter: int,
 ) -> None:
     inlier_depths = depths[inliers]
     n_pixels = size_a[0] * size_a[1]
@@ -605,7 +658,14 @@ def write_report(
         "-" * 66,
         f"  keypoint extraction: {'tiled ~' + str(KEYPOINT_TILE_SIZE_PX) + 'px' if use_tiled_keypoints else 'global top-K'}",
         f"  raw LightGlue matches:      {n_raw_matches}",
-        f"  above min-confidence {min_confidence}: {n_matches}",
+        f"  above min-confidence {min_confidence}: {n_before_geometric_filter}",
+        (
+            f"  geometric-consistency filter: kept {n_matches}/{n_before_geometric_filter} "
+            f"(threshold {GEOMETRIC_CONSISTENCY_THRESHOLD_PX}px vs. "
+            f"{GEOMETRIC_CONSISTENCY_NEIGHBORS}-neighbor median displacement)"
+        ) if use_geometric_filter else (
+            "  geometric-consistency filter: disabled (--no-geometric-consistency-filter)"
+        ),
         "",
         "TRIANGULATION",
         "-" * 66,
@@ -720,6 +780,16 @@ def main() -> int:
             "match between cameras, or lower --min-confidence."
         )
 
+    use_geometric_filter = not args.no_geometric_consistency_filter
+    n_before_geometric_filter = n_matches
+    if use_geometric_filter:
+        consistent = geometric_consistency_mask(
+            pts_a, pts_b, GEOMETRIC_CONSISTENCY_NEIGHBORS, GEOMETRIC_CONSISTENCY_THRESHOLD_PX,
+        )
+        pts_a, pts_b = pts_a[consistent], pts_b[consistent]
+        n_matches = int(consistent.sum())
+        print(f"Geometric-consistency filter: kept {n_matches}/{n_before_geometric_filter} matches")
+
     depths, inliers = triangulate_matches(
         pts_a, pts_b, camera_matrix_a, camera_matrix_b,
         extrinsics.R, extrinsics.T, depth_min, depth_max,
@@ -814,6 +884,8 @@ def main() -> int:
         "n_border_anchors": n_anchors,
         "feather_blend_used": use_feather_blend,
         "tiled_keypoints_used": use_tiled_keypoints,
+        "geometric_consistency_filter_used": use_geometric_filter,
+        "n_before_geometric_filter": n_before_geometric_filter,
         "outside_fov_pixels": n_outside_fov,
         "outside_fov_fraction": n_outside_fov / (size_a[0] * size_a[1]),
     }
@@ -829,6 +901,7 @@ def main() -> int:
         reject_degenerate, n_rejected_triangles, n_triangles,
         use_border_anchors, n_anchors, use_feather_blend,
         use_tiled_keypoints,
+        use_geometric_filter, n_before_geometric_filter,
     )
 
     print(f"\nSaved outputs to {output_dir}")
