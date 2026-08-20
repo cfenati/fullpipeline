@@ -8,7 +8,8 @@ pyvista>=0.44
 matplotlib>=3.7
 PyQt5>=5.15
 
-# LightGlue feature matching (register_features.py)
+# Sparse/dense feature matching (register_features.py)
 torch>=2.0            # CPU-only build recommended on disk-constrained machines:
                        #   pip install torch --index-url https://download.pytorch.org/whl/cpu
-kornia>=0.8            # provides both the DISK extractor and LightGlueMatcher
+kornia>=0.8            # provides the DISK extractor, LightGlueMatcher, and LoFTR
+torchvision>=0.15      # provides the RAFT optical flow model (--matcher raft)

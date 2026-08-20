@@ -70,6 +70,7 @@ import kornia.feature as KF
 import matplotlib.tri as mtri
 import numpy as np
 import torch
+from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -130,6 +131,17 @@ GEOMETRIC_CONSISTENCY_THRESHOLD_PX = 15.0  # reject a match whose displacement d
                                             # empirically against this rig's observed
                                             # depth-driven displacement variation -- see
                                             # geometric_consistency_mask.
+RAFT_GRID_STEP_PX = 12  # match_raft samples dense flow on a grid this many px apart,
+                        # working resolution -- dense enough for a useful mesh without
+                        # an unreasonable number of triangulate_matches calls.
+RAFT_FB_CONSISTENCY_THRESHOLD_PX = 1.5  # match_raft's forward-backward consistency
+                                         # error is bimodal, not gradual: correctly-
+                                         # tracked points measured ~0.2-0.9px round-trip
+                                         # error on this rig, points RAFT lost track of
+                                         # (aperture problem on repetitive/low-texture
+                                         # regions) jump to 20-200+px with no gray zone
+                                         # in between -- this threshold just needs to sit
+                                         # in that gap, not be finely tuned.
 
 
 # --------------------------------------------------------------------------- #
@@ -206,19 +218,29 @@ def parse_args() -> argparse.Namespace:
              f"regions -- default tile size if enabled: {KEYPOINT_TILE_SIZE_PX} px.",
     )
     parser.add_argument(
-        "--matcher", choices=("disk", "loftr", "both"), default="disk",
+        "--matcher", nargs="+", choices=("disk", "loftr", "raft"), default=["disk"],
         help="Which matcher(s) produce the sparse correspondences the mesh is built "
-             "from (default: %(default)s). 'loftr' and 'both' are opt-in, not "
-             "recommended: kornia LoFTR (outdoor-pretrained) covers ~84%% of the "
-             "frame vs. DISK+LightGlue's ~45%% and every match triangulates to a "
-             "plausible depth, but measured on held-out ChArUco corners "
-             "(check_registration_error.py) its point localization is far worse -- "
-             "median error 0.66px (disk) vs. 2.97px (loftr) vs. 1.03px (both, "
-             "pooling doesn't fully recover disk's precision), with p90/max blowing "
-             "out to 52.66/104.78px for loftr alone. LoFTR's broad coverage doesn't "
-             "translate into trustworthy point positions on this rig -- kept "
-             "available in case a future scene has too little DISK-matchable "
-             "texture to have a better option, not because it's currently better.",
+             "from -- one or more, pooled if more than one (default: %(default)s). "
+             "'loftr' is opt-in, not recommended: kornia LoFTR (outdoor-pretrained) "
+             "covers ~84%% of the frame vs. DISK+LightGlue's ~45%% and every match "
+             "triangulates to a plausible depth, but measured on held-out ChArUco "
+             "corners (check_registration_error.py) its point localization is far "
+             "worse -- median error 0.66px (disk) vs. 2.97px (loftr) vs. 1.03px "
+             "(disk+loftr pooled, which doesn't fully recover disk's precision), "
+             "p90/max blowing out to 52.66/104.78px for loftr alone. 'raft' "
+             "(torchvision RAFT-large, dense optical flow + forward-backward "
+             "consistency filtering, see match_raft) alone is a mixed bag: median "
+             "0.62px (competitive with disk) but p90/max 10.46/23.47px -- some "
+             "sessions' flow gets fooled into a periodic-but-wrong lock (plausible "
+             "on a repetitive ChArUco pattern specifically). 'disk raft' pooled is "
+             "the one combination measured better than disk alone on every "
+             "aggregate: median 0.56px, p90 1.18px (both improved), max 6.76px "
+             "(worse than disk's 3.51px but far better than raft alone) -- disk's "
+             "precision anchors exactly the sessions raft's periodic-lock hurt. Not "
+             "the default: real extra cost (a second model, ~8s/image-pair on CPU, "
+             "the torchvision dependency) for a currently sub-pixel-already metric "
+             "to improve further, and 'disk raft' is only validated on this rig's "
+             "ChArUco set, not yet on the actual hand-capture use case.",
     )
     parser.add_argument("--out", "--output", dest="output", default=None,
                         help="Output directory (default: registration.output_dir in config, "
@@ -372,6 +394,66 @@ def match_loftr(
     pts_a = result["keypoints0"].cpu().numpy()
     pts_b = result["keypoints1"].cpu().numpy()
     scores = result["confidence"].cpu().numpy()
+    return pts_a, pts_b, scores
+
+
+def load_raft_model(device: torch.device) -> torch.nn.Module:
+    """Load the pretrained RAFT-large optical flow model once.
+
+    Weights auto-download from torchvision's model hub on first call (needs
+    internet once; cached locally after that).
+    """
+    return raft_large(weights=Raft_Large_Weights.DEFAULT).to(device).eval()
+
+
+def match_raft(
+    model: torch.nn.Module, color_a: np.ndarray, color_b: np.ndarray, device: torch.device,
+    grid_step: float, fb_threshold_px: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Dense optical flow (RAFT) sampled on a grid, filtered by forward-backward
+    consistency, as a third matching source alongside DISK+LightGlue/LoFTR.
+
+    Unlike either of those, RAFT gives no sparse "confidence" at all -- it's
+    a dense per-pixel flow field. This runs flow in both directions (A->B and
+    B->A) and, for each grid point, warps forward then back through the
+    reverse flow: a correct estimate returns you to (near) where you started,
+    a wrong one (RAFT lost track -- the aperture problem, typically on
+    repetitive/low-texture regions like this rig's mottled backdrop) does
+    not, and does not by a lot (empirically bimodal on this rig: correct
+    points round-trip within ~1px, incorrect ones are off by tens to
+    hundreds of px -- see RAFT_FB_CONSISTENCY_THRESHOLD_PX). Returns
+    (pts_a, pts_b, scores) matching the other matchers' convention: scores
+    is 1 - fb_error/fb_threshold_px clipped to [0, 1], so the caller's
+    existing --min-confidence gate filters consistently with DISK/LoFTR
+    scores instead of needing special-cased handling.
+    """
+    height, width = color_a.shape[:2]
+    pad_h, pad_w = (-height) % 8, (-width) % 8
+
+    def to_tensor(image_bgr: np.ndarray) -> torch.Tensor:
+        rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        tensor = torch.from_numpy(rgb).to(device).permute(2, 0, 1).unsqueeze(0)
+        return torch.nn.functional.pad(tensor, (0, pad_w, 0, pad_h))
+
+    weights = Raft_Large_Weights.DEFAULT
+    img_a, img_b = weights.transforms()(to_tensor(color_a), to_tensor(color_b))
+    with torch.no_grad():
+        flow_fwd = model(img_a, img_b)[-1][0, :, :height, :width].permute(1, 2, 0).cpu().numpy()
+        flow_bwd = model(img_b, img_a)[-1][0, :, :height, :width].permute(1, 2, 0).cpu().numpy()
+
+    rows, cols = np.mgrid[0:height:grid_step, 0:width:grid_step]
+    pts_a = np.stack([cols.ravel(), rows.ravel()], axis=1).astype(np.float32)
+    forward = flow_fwd[rows, cols].reshape(-1, 2)
+    pts_b = pts_a + forward
+
+    map_x = pts_b[:, 0].reshape(1, -1)
+    map_y = pts_b[:, 1].reshape(1, -1)
+    backward_x = cv2.remap(flow_bwd[:, :, 0], map_x, map_y, interpolation=cv2.INTER_LINEAR).ravel()
+    backward_y = cv2.remap(flow_bwd[:, :, 1], map_x, map_y, interpolation=cv2.INTER_LINEAR).ravel()
+    recovered_a = pts_b + np.stack([backward_x, backward_y], axis=1)
+    fb_error = np.linalg.norm(recovered_a - pts_a, axis=1)
+
+    scores = np.clip(1.0 - fb_error / fb_threshold_px, 0.0, 1.0)
     return pts_a, pts_b, scores
 
 
@@ -811,11 +893,12 @@ def main() -> int:
     size_b = (color_b.shape[1], color_b.shape[0])
 
     use_tiled_keypoints = args.tiled_keypoints
-    use_disk = args.matcher in ("disk", "both")
-    use_loftr = args.matcher in ("loftr", "both")
+    use_disk = "disk" in args.matcher
+    use_loftr = "loftr" in args.matcher
+    use_raft = "raft" in args.matcher
     device = torch.device("cpu")
     print(f"Registering {args.camera_b} -> {args.camera_a}: matching at "
-          f"{size_a[0]}x{size_a[1]} (CPU, --matcher {args.matcher}"
+          f"{size_a[0]}x{size_a[1]} (CPU, --matcher {' '.join(args.matcher)}"
           f"{', tiled keypoints' if use_tiled_keypoints and use_disk else ''})")
 
     pts_a_parts, pts_b_parts, scores_parts = [], [], []
@@ -843,6 +926,16 @@ def main() -> int:
         pts_a_parts.append(loftr_pts_a)
         pts_b_parts.append(loftr_pts_b)
         scores_parts.append(loftr_scores)
+    if use_raft:
+        raft_model = load_raft_model(device)
+        raft_pts_a, raft_pts_b, raft_scores = match_raft(
+            raft_model, color_a, color_b, device, RAFT_GRID_STEP_PX, RAFT_FB_CONSISTENCY_THRESHOLD_PX,
+        )
+        print(f"RAFT: {len(raft_scores)} grid samples, "
+              f"{int((raft_scores >= args.min_confidence).sum())} forward-backward consistent")
+        pts_a_parts.append(raft_pts_a)
+        pts_b_parts.append(raft_pts_b)
+        scores_parts.append(raft_scores)
 
     pts_a_all = np.concatenate(pts_a_parts)
     pts_b_all = np.concatenate(pts_b_parts)
@@ -981,7 +1074,7 @@ def main() -> int:
         n_inliers, depths, inliers, covered, n_outside_fov,
         reject_degenerate, n_rejected_triangles, n_triangles,
         use_border_anchors, n_anchors, use_feather_blend,
-        use_tiled_keypoints, args.matcher,
+        use_tiled_keypoints, " ".join(args.matcher),
         use_geometric_filter, n_before_geometric_filter,
     )
 

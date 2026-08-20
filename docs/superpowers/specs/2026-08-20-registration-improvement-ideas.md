@@ -58,9 +58,10 @@ needed to score that.
    it hasn't been proven to help either -- would need a messier/higher-
    outlier-rate test scene to actually discriminate its value.
 
-3. **Ensemble/second matcher, status: tried, negative.** Implemented as
-   `load_loftr_model`/`match_loftr` + `--matcher {disk,loftr,both}` (default:
-   `disk`). A cheap probe first (not the full pipeline) confirmed LoFTR
+3. **Ensemble/second matcher (LoFTR), status: tried, negative alone.**
+   Implemented as `load_loftr_model`/`match_loftr` + `--matcher disk|loftr|raft`
+   (space-separated to pool multiple, default: `disk`). A cheap probe first
+   (not the full pipeline) confirmed LoFTR
    (kornia, outdoor-pretrained) genuinely covers new ground: 2.8x the raw
    matches of DISK+LightGlue, ~84% of the frame's convex hull vs. ~45%, and
    100% of matches triangulated to a physically plausible depth on a hand
@@ -91,14 +92,39 @@ needed to score that.
    LoFTR only to seed matches in regions with no nearby DISK match instead of
    naively pooling everywhere.
 
-4. **RAFT-style dense optical flow (flagged as a specific future option).**
-   Two-view flow gives a genuinely dense correspondence field directly -- no
-   rectification needed (unlike FoundationStereo, which loses ~65% of the
-   frame to this rig's 18 deg toe-in per `register_foundationstereo.py`'s
-   docstring), no sparse-keypoints-then-mesh step (unlike LightGlue). Forward-
-   backward consistency + the existing triangulation-based depth-range filter
-   could reject bad flow. Sits structurally between `register_features.py`
-   and `register_foundationstereo.py`; GPU is available on this machine.
+4. **RAFT-style dense optical flow, status: tried, positive when pooled with
+   disk.** Implemented as `load_raft_model`/`match_raft` + `--matcher raft`
+   (torchvision RAFT-large, no new heavy dependency beyond `torchvision`
+   itself). A probe first caught its own bug (naive preprocessing skipped
+   torchvision's expected uint8->float normalization, producing near-random
+   flow) -- worth remembering: verify a probe's *inputs* look sane before
+   trusting a discouraging result. Once fixed, forward-backward consistency
+   error on this rig turned out cleanly bimodal, not gradual: correctly-
+   tracked points round-trip within ~0.2-0.9px, lost-tracking points (the
+   aperture problem, on repetitive/low-texture regions) jump to 20-200+px
+   with no gray zone -- so a single threshold (1.5px) separates them well.
+
+   `raft` alone: median 0.62px (competitive with disk's 0.66px) but p90
+   10.46px / max 23.47px -- a handful of sessions get fooled into a
+   periodic-but-self-consistent wrong lock, plausibly specific to the
+   ChArUco board's repetitive pattern (a textbook adversarial case for
+   forward-backward consistency checks) rather than a hand's aperiodic
+   texture. **`disk raft` pooled is the one combination measured better
+   than disk alone on every aggregate this session**: median 0.56px, p90
+   1.18px (both improved over disk alone), max 6.76px (worse than disk's
+   3.51px but far better than raft alone, and every session's median lands
+   under 1px -- disk's precision specifically rescues the sessions raft's
+   periodic-lock hurt). Verified on the hand capture too (not just ChArUco):
+   62.8% hull coverage, 16.2s runtime, visually clean.
+
+   Not made default: real added cost (a second model, ~8s extra per image
+   pair on CPU, a new `torchvision` dependency -- added to requirements.txt
+   regardless) to improve an already-sub-pixel metric further, and only
+   validated by the point-accuracy numbers on ChArUco corners, not yet
+   confirmed as a win on the actual hand-capture use case by any measure
+   beyond visual inspection. Worth deliberately turning on
+   (`--matcher disk raft`) if squeezing out that last fraction of a pixel
+   matters, or revisiting as the default if it holds up on more scenes.
 
 5. **Classical dense stereo (SGBM), status: tried, inconclusive-to-negative.**
    `DIYer22/check_dense_stereo.py`'s `TunedSGBM` fixed the disparity search
