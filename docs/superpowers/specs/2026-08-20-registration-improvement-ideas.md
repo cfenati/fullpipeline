@@ -58,9 +58,38 @@ needed to score that.
    it hasn't been proven to help either -- would need a messier/higher-
    outlier-rate test scene to actually discriminate its value.
 
-3. **Ensemble/second matcher.** Pool LightGlue+DISK matches with a second
-   independent matcher (ORB/SIFT, or a dense matcher like LoFTR) to extend
-   coverage into regions DISK undersamples.
+3. **Ensemble/second matcher, status: tried, negative.** Implemented as
+   `load_loftr_model`/`match_loftr` + `--matcher {disk,loftr,both}` (default:
+   `disk`). A cheap probe first (not the full pipeline) confirmed LoFTR
+   (kornia, outdoor-pretrained) genuinely covers new ground: 2.8x the raw
+   matches of DISK+LightGlue, ~84% of the frame's convex hull vs. ~45%, and
+   100% of matches triangulated to a physically plausible depth on a hand
+   capture -- strong enough evidence to justify building the full
+   integration, unlike the weaker case for tiled keypoints.
+
+   But `check_registration_error.py` tells a different story: median point
+   error 0.66px (disk) vs. **2.97px (loftr)** vs. 1.03px (both pooled), p90
+   1.32 vs. 52.66 vs. 3.58px, max 3.51 vs. 104.78 vs. 104.73px. LoFTR's
+   coverage is real but its sub-pixel localization is far worse than
+   DISK+LightGlue's -- plausible in hindsight, since the outdoor-pretrained
+   checkpoint is a coarse-to-fine dense matcher tuned for broad scene
+   correspondence under wide baseline/viewpoint change, not precise
+   checkerboard-corner-grade localization. Pooling ("both") only partially
+   recovers disk's precision and its max error stays almost as bad as
+   loftr-alone, meaning even one imprecise pooled vertex can still corrupt a
+   nearby mesh triangle. Third confirmed case this session (after tiled
+   keypoints) where visually-plausible extra coverage did not survive
+   contact with ground truth -- **don't trust coverage % as a proxy for
+   accuracy; always check `check_registration_error.py`.**
+
+   Kept available (`--matcher loftr`/`both`) rather than removed, in case a
+   future scene has so little DISK-matchable texture that LoFTR's worse
+   precision is still better than no coverage at all -- not because either
+   option is currently recommended. Untried refinement if this is revisited:
+   the "indoor" LoFTR checkpoint instead of "outdoor" (close-range hand/
+   object shots may be a better match for that pretraining domain), or using
+   LoFTR only to seed matches in regions with no nearby DISK match instead of
+   naively pooling everywhere.
 
 4. **RAFT-style dense optical flow (flagged as a specific future option).**
    Two-view flow gives a genuinely dense correspondence field directly -- no

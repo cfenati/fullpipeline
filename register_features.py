@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Register camera B onto camera A via LightGlue sparse matching and a
+"""Register camera B onto camera A via sparse feature matching and a
 piecewise-affine warp from those matches.
 
 Sibling to register_pipeline.py, not a replacement: that script's dense
 plane-sweep ZNCC correlation only scored 27-32% of the cameras' overlap
 region confident on real captures (see registration/results/*/report.txt).
-This script finds sparse correspondences with LightGlue and warps B onto A
-by interpolating the 2-D correspondence field (Delaunay piecewise affine).
-Matches are also triangulated through the calibrated extrinsics as a
-sanity check (depths should land in the working range).
+This script finds sparse correspondences (DISK+LightGlue by default, or
+LoFTR, or both pooled -- see --matcher) and warps B onto A by interpolating
+the 2-D correspondence field (Delaunay piecewise affine). Matches are also
+triangulated through the calibrated extrinsics as a sanity check (depths
+should land in the working range).
 
 A single global homography -- 1-DOF plane or free 8-DOF -- cannot register
 this subject. LightGlue matches on a close-range hand are geometrically
@@ -23,11 +24,13 @@ plane so the rest of the frame is still filled.
 Algorithm:
     1. Load + undistort the pair (register_pipeline.py's own
        load_session_images/undistort_pair/downscale_pair).
-    2. LightGlue match (kornia DISK + LightGlueMatcher) -> sparse (pts_a,
-       pts_b) correspondences, filtered to --min-confidence. --tiled-keypoints
-       extracts DISK per-tile instead of one global top-K (see
-       extract_features_tiled), spreading keypoints into low-texture regions
-       -- opt-in, not default: measured as an accuracy regression on
+    2. Match (--matcher disk: kornia DISK + LightGlueMatcher, sparse
+       keypoint-based; loftr: kornia LoFTR, dense/semi-dense and
+       detector-free -- see load_loftr_model; both: pooled) -> sparse
+       (pts_a, pts_b) correspondences, filtered to --min-confidence.
+       --tiled-keypoints extracts DISK per-tile instead of one global top-K
+       (see extract_features_tiled), spreading keypoints into low-texture
+       regions -- opt-in, not default: measured as an accuracy regression on
        held-out ChArUco corners (see --tiled-keypoints --help), it thins
        keypoint density on already-textured regions more than it helps
        low-texture ones.
@@ -134,7 +137,7 @@ GEOMETRIC_CONSISTENCY_THRESHOLD_PX = 15.0  # reject a match whose displacement d
 # --------------------------------------------------------------------------- #
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Register camera B onto camera A via LightGlue sparse matching "
+        description="Register camera B onto camera A via sparse feature matching "
                     "and a piecewise-affine warp from those matches.",
     )
     parser.add_argument(
@@ -201,6 +204,21 @@ def parse_args() -> argparse.Namespace:
              "regressed accuracy (median 0.66->0.77px, p90 1.32->2.22px, "
              "max 3.51->14.20px) by thinning keypoint density on already-textured "
              f"regions -- default tile size if enabled: {KEYPOINT_TILE_SIZE_PX} px.",
+    )
+    parser.add_argument(
+        "--matcher", choices=("disk", "loftr", "both"), default="disk",
+        help="Which matcher(s) produce the sparse correspondences the mesh is built "
+             "from (default: %(default)s). 'loftr' and 'both' are opt-in, not "
+             "recommended: kornia LoFTR (outdoor-pretrained) covers ~84%% of the "
+             "frame vs. DISK+LightGlue's ~45%% and every match triangulates to a "
+             "plausible depth, but measured on held-out ChArUco corners "
+             "(check_registration_error.py) its point localization is far worse -- "
+             "median error 0.66px (disk) vs. 2.97px (loftr) vs. 1.03px (both, "
+             "pooling doesn't fully recover disk's precision), with p90/max blowing "
+             "out to 52.66/104.78px for loftr alone. LoFTR's broad coverage doesn't "
+             "translate into trustworthy point positions on this rig -- kept "
+             "available in case a future scene has too little DISK-matchable "
+             "texture to have a better option, not because it's currently better.",
     )
     parser.add_argument("--out", "--output", dest="output", default=None,
                         help="Output directory (default: registration.output_dir in config, "
@@ -314,6 +332,47 @@ def match_features(
     pts_a = feats_a.keypoints.cpu().numpy()[matches_np[:, 0]]
     pts_b = feats_b.keypoints.cpu().numpy()[matches_np[:, 1]]
     return pts_a, pts_b, scores_np
+
+
+def load_loftr_model(device: torch.device) -> KF.LoFTR:
+    """Load the pretrained LoFTR matcher once.
+
+    Detector-free, unlike DISK+LightGlue: LoFTR matches an image pair
+    directly with no separate keypoint-extraction step, which lets it find
+    correspondence in low-texture regions a keypoint detector never fires on
+    at all (a mottled background, smooth skin) -- see this file's git history
+    for the probe that motivated adding it: on a hand capture, LoFTR found
+    2.8x the matches of DISK+LightGlue, covering ~84% of the frame's convex
+    hull area vs ~45%, with 100% of matches triangulating to a physically
+    plausible depth. Weights auto-download from kornia's model hub on first
+    call (needs internet once; cached locally after that).
+    """
+    return KF.LoFTR(pretrained="outdoor").to(device).eval()
+
+
+def match_loftr(
+    loftr: KF.LoFTR, color_a: np.ndarray, color_b: np.ndarray, device: torch.device,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """LoFTR-match two BGR images directly (dense/semi-dense, grayscale input).
+
+    Returns (pts_a, pts_b, scores) for every match kornia returned --
+    unfiltered by confidence, matching match_features' convention (the
+    caller applies --min-confidence uniformly, whether matches came from
+    LoFTR or DISK+LightGlue -- the two scores aren't independently
+    calibrated to mean exactly the same thing, but both are nominally
+    dual-softmax-style confidence in [0, 1] with higher better, close enough
+    for one shared threshold). `scores` is LoFTR's own confidence.
+    """
+    def to_gray_tensor(image_bgr: np.ndarray) -> torch.Tensor:
+        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+        return torch.from_numpy(gray).to(device).float()[None, None] / 255.0
+
+    with torch.no_grad():
+        result = loftr({"image0": to_gray_tensor(color_a), "image1": to_gray_tensor(color_b)})
+    pts_a = result["keypoints0"].cpu().numpy()
+    pts_b = result["keypoints1"].cpu().numpy()
+    scores = result["confidence"].cpu().numpy()
+    return pts_a, pts_b, scores
 
 
 # --------------------------------------------------------------------------- #
@@ -636,7 +695,7 @@ def write_report(
     covered: np.ndarray, n_outside_fov: int,
     reject_degenerate: bool, n_rejected_triangles: int, n_triangles: int,
     use_border_anchors: bool, n_anchors: int, use_feather_blend: bool,
-    use_tiled_keypoints: bool,
+    use_tiled_keypoints: bool, matcher: str,
     use_geometric_filter: bool, n_before_geometric_filter: int,
 ) -> None:
     inlier_depths = depths[inliers]
@@ -647,7 +706,7 @@ def write_report(
         return f"{count / denominator * 100:.1f}%" if denominator else "n/a"
 
     lines = [
-        f"Registration: {camera_b} -> {camera_a} (LightGlue sparse match + piecewise-affine warp)",
+        f"Registration: {camera_b} -> {camera_a} (sparse match + piecewise-affine warp)",
         "=" * 66,
         "",
         f"  session:            {session_dir}",
@@ -656,8 +715,9 @@ def write_report(
         "",
         "MATCHING",
         "-" * 66,
-        f"  keypoint extraction: {'tiled ~' + str(KEYPOINT_TILE_SIZE_PX) + 'px' if use_tiled_keypoints else 'global top-K'}",
-        f"  raw LightGlue matches:      {n_raw_matches}",
+        f"  matcher:              {matcher}",
+        f"  keypoint extraction: {('tiled ~' + str(KEYPOINT_TILE_SIZE_PX) + 'px' if use_tiled_keypoints else 'global top-K') if matcher != 'loftr' else 'n/a (loftr is detector-free)'}",
+        f"  raw matches:      {n_raw_matches}",
         f"  above min-confidence {min_confidence}: {n_before_geometric_filter}",
         (
             f"  geometric-consistency filter: kept {n_matches}/{n_before_geometric_filter} "
@@ -751,27 +811,47 @@ def main() -> int:
     size_b = (color_b.shape[1], color_b.shape[0])
 
     use_tiled_keypoints = args.tiled_keypoints
+    use_disk = args.matcher in ("disk", "both")
+    use_loftr = args.matcher in ("loftr", "both")
     device = torch.device("cpu")
-    print(f"Registering {args.camera_b} -> {args.camera_a}: LightGlue matching at "
-          f"{size_a[0]}x{size_a[1]} (CPU, "
-          f"{'tiled' if use_tiled_keypoints else 'global'} keypoint extraction)")
-    disk, matcher = load_models(device)
-    if use_tiled_keypoints:
-        feats_a, hw_a = extract_features_tiled(
-            disk, color_a, device, DEFAULT_MAX_KEYPOINTS, KEYPOINT_TILE_SIZE_PX,
-        )
-        feats_b, hw_b = extract_features_tiled(
-            disk, color_b, device, DEFAULT_MAX_KEYPOINTS, KEYPOINT_TILE_SIZE_PX,
-        )
-    else:
-        feats_a, hw_a = extract_features(disk, color_a, device, DEFAULT_MAX_KEYPOINTS)
-        feats_b, hw_b = extract_features(disk, color_b, device, DEFAULT_MAX_KEYPOINTS)
-    pts_a_all, pts_b_all, scores_all = match_features(matcher, feats_a, feats_b, hw_a, hw_b)
+    print(f"Registering {args.camera_b} -> {args.camera_a}: matching at "
+          f"{size_a[0]}x{size_a[1]} (CPU, --matcher {args.matcher}"
+          f"{', tiled keypoints' if use_tiled_keypoints and use_disk else ''})")
+
+    pts_a_parts, pts_b_parts, scores_parts = [], [], []
+    if use_disk:
+        disk, matcher = load_models(device)
+        if use_tiled_keypoints:
+            feats_a, hw_a = extract_features_tiled(
+                disk, color_a, device, DEFAULT_MAX_KEYPOINTS, KEYPOINT_TILE_SIZE_PX,
+            )
+            feats_b, hw_b = extract_features_tiled(
+                disk, color_b, device, DEFAULT_MAX_KEYPOINTS, KEYPOINT_TILE_SIZE_PX,
+            )
+        else:
+            feats_a, hw_a = extract_features(disk, color_a, device, DEFAULT_MAX_KEYPOINTS)
+            feats_b, hw_b = extract_features(disk, color_b, device, DEFAULT_MAX_KEYPOINTS)
+        disk_pts_a, disk_pts_b, disk_scores = match_features(matcher, feats_a, feats_b, hw_a, hw_b)
+        print(f"DISK+LightGlue: {len(disk_scores)} raw matches")
+        pts_a_parts.append(disk_pts_a)
+        pts_b_parts.append(disk_pts_b)
+        scores_parts.append(disk_scores)
+    if use_loftr:
+        loftr = load_loftr_model(device)
+        loftr_pts_a, loftr_pts_b, loftr_scores = match_loftr(loftr, color_a, color_b, device)
+        print(f"LoFTR: {len(loftr_scores)} raw matches")
+        pts_a_parts.append(loftr_pts_a)
+        pts_b_parts.append(loftr_pts_b)
+        scores_parts.append(loftr_scores)
+
+    pts_a_all = np.concatenate(pts_a_parts)
+    pts_b_all = np.concatenate(pts_b_parts)
+    scores_all = np.concatenate(scores_parts)
 
     keep = scores_all >= args.min_confidence
     pts_a, pts_b = pts_a_all[keep], pts_b_all[keep]
     n_raw_matches, n_matches = len(scores_all), int(keep.sum())
-    print(f"LightGlue: {n_raw_matches} raw matches, {n_matches} above confidence "
+    print(f"Pooled: {n_raw_matches} raw matches, {n_matches} above confidence "
           f"{args.min_confidence}")
     if n_matches < args.min_matches:
         raise SystemExit(
@@ -884,6 +964,7 @@ def main() -> int:
         "n_border_anchors": n_anchors,
         "feather_blend_used": use_feather_blend,
         "tiled_keypoints_used": use_tiled_keypoints,
+        "matcher": args.matcher,
         "geometric_consistency_filter_used": use_geometric_filter,
         "n_before_geometric_filter": n_before_geometric_filter,
         "outside_fov_pixels": n_outside_fov,
@@ -900,7 +981,7 @@ def main() -> int:
         n_inliers, depths, inliers, covered, n_outside_fov,
         reject_degenerate, n_rejected_triangles, n_triangles,
         use_border_anchors, n_anchors, use_feather_blend,
-        use_tiled_keypoints,
+        use_tiled_keypoints, args.matcher,
         use_geometric_filter, n_before_geometric_filter,
     )
 

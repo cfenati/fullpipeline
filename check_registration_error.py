@@ -85,8 +85,10 @@ from register_features import (  # noqa: E402
     GEOMETRIC_CONSISTENCY_NEIGHBORS,
     GEOMETRIC_CONSISTENCY_THRESHOLD_PX,
     KEYPOINT_TILE_SIZE_PX,
+    load_loftr_model,
     load_models,
     match_features,
+    match_loftr,
     project_via_plane,
     triangulate_matches,
 )
@@ -136,6 +138,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tiled-keypoints", action="store_true",
                         help="Opt-in: measured as an accuracy regression, see "
                              "register_features.py --help for details.")
+    parser.add_argument("--matcher", choices=("disk", "loftr", "both"), default="disk",
+                        help="Must match the register_features.py configuration being "
+                             "scored (default: %(default)s).")
     parser.add_argument("--out", "--output", dest="output", default=None,
                         help="Output directory (default: registration.output_dir in "
                              f"config, else {DEFAULT_REGISTRATION_OUTPUT_DIR}) "
@@ -158,7 +163,7 @@ def evaluate_observation(
     session_dir: Path,
     camera_a: str, camera_b: str,
     extrinsics: StereoExtrinsics,
-    disk, matcher, device: torch.device,
+    disk, lg_matcher, loftr, matcher_choice: str, device: torch.device,
     downscale: float, min_confidence: float,
     depth_min: float, depth_max: float,
     use_border_anchors: bool, reject_degenerate: bool, use_tiled_keypoints: bool,
@@ -175,13 +180,27 @@ def evaluate_observation(
     size_a = (color_a.shape[1], color_a.shape[0])
     size_b = (color_b.shape[1], color_b.shape[0])
 
-    if use_tiled_keypoints:
-        feats_a, hw_a = extract_features_tiled(disk, color_a, device, DEFAULT_MAX_KEYPOINTS, KEYPOINT_TILE_SIZE_PX)
-        feats_b, hw_b = extract_features_tiled(disk, color_b, device, DEFAULT_MAX_KEYPOINTS, KEYPOINT_TILE_SIZE_PX)
-    else:
-        feats_a, hw_a = extract_features(disk, color_a, device, DEFAULT_MAX_KEYPOINTS)
-        feats_b, hw_b = extract_features(disk, color_b, device, DEFAULT_MAX_KEYPOINTS)
-    pts_a_all, pts_b_all, scores_all = match_features(matcher, feats_a, feats_b, hw_a, hw_b)
+    pts_a_parts, pts_b_parts, scores_parts = [], [], []
+    if matcher_choice in ("disk", "both"):
+        if use_tiled_keypoints:
+            feats_a, hw_a = extract_features_tiled(disk, color_a, device, DEFAULT_MAX_KEYPOINTS, KEYPOINT_TILE_SIZE_PX)
+            feats_b, hw_b = extract_features_tiled(disk, color_b, device, DEFAULT_MAX_KEYPOINTS, KEYPOINT_TILE_SIZE_PX)
+        else:
+            feats_a, hw_a = extract_features(disk, color_a, device, DEFAULT_MAX_KEYPOINTS)
+            feats_b, hw_b = extract_features(disk, color_b, device, DEFAULT_MAX_KEYPOINTS)
+        disk_pts_a, disk_pts_b, disk_scores = match_features(lg_matcher, feats_a, feats_b, hw_a, hw_b)
+        pts_a_parts.append(disk_pts_a)
+        pts_b_parts.append(disk_pts_b)
+        scores_parts.append(disk_scores)
+    if matcher_choice in ("loftr", "both"):
+        loftr_pts_a, loftr_pts_b, loftr_scores = match_loftr(loftr, color_a, color_b, device)
+        pts_a_parts.append(loftr_pts_a)
+        pts_b_parts.append(loftr_pts_b)
+        scores_parts.append(loftr_scores)
+
+    pts_a_all = np.concatenate(pts_a_parts)
+    pts_b_all = np.concatenate(pts_b_parts)
+    scores_all = np.concatenate(scores_parts)
     keep = scores_all >= min_confidence
     pts_a, pts_b = pts_a_all[keep], pts_b_all[keep]
     if use_geometric_filter:
@@ -285,7 +304,11 @@ def main() -> int:
     use_tiled_keypoints = args.tiled_keypoints
     use_geometric_filter = not args.no_geometric_consistency_filter
     device = torch.device("cpu")
-    disk, matcher = load_models(device)
+    disk, lg_matcher, loftr = None, None, None
+    if args.matcher in ("disk", "both"):
+        disk, lg_matcher = load_models(device)
+    if args.matcher in ("loftr", "both"):
+        loftr = load_loftr_model(device)
 
     results = []
     for observation in observations:
@@ -293,7 +316,7 @@ def main() -> int:
         print(f"Evaluating {observation.label} ({len(observation.corner_ids)} shared corners)...")
         result = evaluate_observation(
             observation, session_dir, args.camera_a, args.camera_b, extrinsics,
-            disk, matcher, device, args.downscale, args.min_confidence,
+            disk, lg_matcher, loftr, args.matcher, device, args.downscale, args.min_confidence,
             depth_min, depth_max, use_border_anchors, reject_degenerate, use_tiled_keypoints,
             use_geometric_filter,
         )
@@ -323,6 +346,7 @@ def main() -> int:
         "",
         f"  extrinsics:       {extrinsics_path}",
         f"  downscale:        {args.downscale}",
+        f"  matcher:          {args.matcher}",
         f"  border anchors:   {'on' if use_border_anchors else 'off (--no-border-anchors)'}",
         f"  degenerate reject: {'on' if reject_degenerate else 'off (--no-reject-degenerate-triangles)'}",
         f"  tiled keypoints:  {'on (--tiled-keypoints)' if use_tiled_keypoints else 'off'}",
@@ -361,6 +385,7 @@ def main() -> int:
         "reject_degenerate_triangles": reject_degenerate,
         "use_tiled_keypoints": use_tiled_keypoints,
         "use_geometric_filter": use_geometric_filter,
+        "matcher": args.matcher,
         "n_sessions_scored": len(scored),
         "n_corners_scored": len(all_errors),
         "n_corners_via_mesh": n_mesh_total,
