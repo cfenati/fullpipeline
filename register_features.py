@@ -24,7 +24,13 @@ Algorithm:
     1. Load + undistort the pair (register_pipeline.py's own
        load_session_images/undistort_pair/downscale_pair).
     2. LightGlue match (kornia DISK + LightGlueMatcher) -> sparse (pts_a,
-       pts_b) correspondences, filtered to --min-confidence.
+       pts_b) correspondences, filtered to --min-confidence. --tiled-keypoints
+       extracts DISK per-tile instead of one global top-K (see
+       extract_features_tiled), spreading keypoints into low-texture regions
+       -- opt-in, not default: measured as an accuracy regression on
+       held-out ChArUco corners (see --tiled-keypoints --help), it thins
+       keypoint density on already-textured regions more than it helps
+       low-texture ones.
     3. Triangulate with P_a = K_a [I|0], P_b = K_b [R|T]; keep points
        whose Z_a sits in the configured working range.
     4. Piecewise-affine warp: mesh the inlier matches plus synthetic anchor
@@ -107,6 +113,11 @@ BORDER_ANCHOR_SPACING_PX = 80  # spacing between synthetic anchor points placed 
 FEATHER_WIDTH_PX = 25  # match_warp's blend weight ramps from 0 at the covered/uncovered
                        # boundary to 1 this many px inside the covered region, instead
                        # of switching to plane_warp in one step.
+KEYPOINT_TILE_SIZE_PX = 300  # target tile size for extract_features_tiled, working-
+                              # resolution px -- ~300px gives a 4x3 grid at the default
+                              # 1164x874 resolution, small enough to force keypoints into
+                              # low-texture tiles without shrinking each tile's own budget
+                              # to noise.
 
 
 # --------------------------------------------------------------------------- #
@@ -163,6 +174,17 @@ def parse_args() -> argparse.Namespace:
              "the covered/uncovered boundary instead of ramping smoothly across it "
              f"(default: feathered over {FEATHER_WIDTH_PX} px).",
     )
+    parser.add_argument(
+        "--tiled-keypoints", action="store_true",
+        help="Extract DISK keypoints per-tile (grid cells, each with its own budget) "
+             "instead of one global top-K, so low-texture regions "
+             "(palm, background) aren't starved of keypoints by high-texture ones. "
+             "Opt-in, not default: measured on held-out ChArUco corners "
+             "(check_registration_error.py), tiling raised match-hull coverage but "
+             "regressed accuracy (median 0.66->0.77px, p90 1.32->2.22px, "
+             "max 3.51->14.20px) by thinning keypoint density on already-textured "
+             f"regions -- default tile size if enabled: {KEYPOINT_TILE_SIZE_PX} px.",
+    )
     parser.add_argument("--out", "--output", dest="output", default=None,
                         help="Output directory (default: registration.output_dir in config, "
                              f"else {DEFAULT_REGISTRATION_OUTPUT_DIR}) / <session name>.")
@@ -198,6 +220,58 @@ def extract_features(
     with torch.no_grad():
         features = disk(tensor, n=max_keypoints, pad_if_not_divisible=True)[0]
     return features, (tensor.shape[2], tensor.shape[3])
+
+
+def extract_features_tiled(
+    disk: KF.DISK, image_bgr: np.ndarray, device: torch.device,
+    max_keypoints: int, tile_size_px: float,
+) -> Tuple["KF.DISKFeatures", Tuple[int, int]]:
+    """DISK keypoints + descriptors extracted per-tile and merged, instead of
+    one global top-max_keypoints budget over the whole image.
+
+    DISK's own top-K selection concentrates on the strongest local response
+    (knuckles, nail edges on a hand) and can starve flat regions (palm,
+    background) of any keypoints at all even when max_keypoints is generous
+    -- that caps how far warp_with_match_field's mesh can ever reach,
+    regardless of how border anchoring or degenerate-triangle rejection are
+    tuned, since there's simply nothing to triangulate there. Splitting the
+    image into a grid of ~tile_size_px tiles and giving each an equal
+    keypoint budget forces spatial spread instead.
+
+    Non-overlapping tiles: a real feature straddling a tile boundary can be
+    missed by both tiles, but LightGlue matching doesn't need every feature,
+    just enough spread -- not worth the complexity of overlapping tiles with
+    duplicate-keypoint suppression for this file's purposes.
+
+    Returns (features, (H, W)) like extract_features -- (H, W) is the full
+    image's shape (not any one tile's); keypoints are offset back into
+    full-image coordinates before returning, so this is a drop-in return
+    value for match_features' hw1/hw2.
+    """
+    height, width = image_bgr.shape[:2]
+    cols = max(1, round(width / tile_size_px))
+    rows = max(1, round(height / tile_size_px))
+    budget_per_tile = max(1, max_keypoints // (cols * rows))
+
+    keypoints, descriptors, scores = [], [], []
+    for row in range(rows):
+        y0, y1 = int(round(row * height / rows)), int(round((row + 1) * height / rows))
+        for col in range(cols):
+            x0, x1 = int(round(col * width / cols)), int(round((col + 1) * width / cols))
+            tile_features, _ = extract_features(disk, image_bgr[y0:y1, x0:x1], device, budget_per_tile)
+            if tile_features.n == 0:
+                continue
+            offset = torch.tensor(
+                [x0, y0], device=tile_features.keypoints.device, dtype=tile_features.keypoints.dtype,
+            )
+            keypoints.append(tile_features.keypoints + offset)
+            descriptors.append(tile_features.descriptors)
+            scores.append(tile_features.detection_scores)
+
+    merged = KF.DISKFeatures(
+        torch.cat(keypoints, dim=0), torch.cat(descriptors, dim=0), torch.cat(scores, dim=0),
+    )
+    return merged, (height, width)
 
 
 def match_features(
@@ -510,6 +584,7 @@ def write_report(
     covered: np.ndarray, n_outside_fov: int,
     reject_degenerate: bool, n_rejected_triangles: int, n_triangles: int,
     use_border_anchors: bool, n_anchors: int, use_feather_blend: bool,
+    use_tiled_keypoints: bool,
 ) -> None:
     inlier_depths = depths[inliers]
     n_pixels = size_a[0] * size_a[1]
@@ -528,6 +603,7 @@ def write_report(
         "",
         "MATCHING",
         "-" * 66,
+        f"  keypoint extraction: {'tiled ~' + str(KEYPOINT_TILE_SIZE_PX) + 'px' if use_tiled_keypoints else 'global top-K'}",
         f"  raw LightGlue matches:      {n_raw_matches}",
         f"  above min-confidence {min_confidence}: {n_matches}",
         "",
@@ -614,12 +690,22 @@ def main() -> int:
     size_a = (color_a.shape[1], color_a.shape[0])
     size_b = (color_b.shape[1], color_b.shape[0])
 
+    use_tiled_keypoints = args.tiled_keypoints
     device = torch.device("cpu")
     print(f"Registering {args.camera_b} -> {args.camera_a}: LightGlue matching at "
-          f"{size_a[0]}x{size_a[1]} (CPU)")
+          f"{size_a[0]}x{size_a[1]} (CPU, "
+          f"{'tiled' if use_tiled_keypoints else 'global'} keypoint extraction)")
     disk, matcher = load_models(device)
-    feats_a, hw_a = extract_features(disk, color_a, device, DEFAULT_MAX_KEYPOINTS)
-    feats_b, hw_b = extract_features(disk, color_b, device, DEFAULT_MAX_KEYPOINTS)
+    if use_tiled_keypoints:
+        feats_a, hw_a = extract_features_tiled(
+            disk, color_a, device, DEFAULT_MAX_KEYPOINTS, KEYPOINT_TILE_SIZE_PX,
+        )
+        feats_b, hw_b = extract_features_tiled(
+            disk, color_b, device, DEFAULT_MAX_KEYPOINTS, KEYPOINT_TILE_SIZE_PX,
+        )
+    else:
+        feats_a, hw_a = extract_features(disk, color_a, device, DEFAULT_MAX_KEYPOINTS)
+        feats_b, hw_b = extract_features(disk, color_b, device, DEFAULT_MAX_KEYPOINTS)
     pts_a_all, pts_b_all, scores_all = match_features(matcher, feats_a, feats_b, hw_a, hw_b)
 
     keep = scores_all >= args.min_confidence
@@ -727,6 +813,7 @@ def main() -> int:
         "border_anchors_used": use_border_anchors,
         "n_border_anchors": n_anchors,
         "feather_blend_used": use_feather_blend,
+        "tiled_keypoints_used": use_tiled_keypoints,
         "outside_fov_pixels": n_outside_fov,
         "outside_fov_fraction": n_outside_fov / (size_a[0] * size_a[1]),
     }
@@ -741,6 +828,7 @@ def main() -> int:
         n_inliers, depths, inliers, covered, n_outside_fov,
         reject_degenerate, n_rejected_triangles, n_triangles,
         use_border_anchors, n_anchors, use_feather_blend,
+        use_tiled_keypoints,
     )
 
     print(f"\nSaved outputs to {output_dir}")

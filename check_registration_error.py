@@ -80,6 +80,8 @@ from register_features import (  # noqa: E402
     build_mesh_interpolators,
     BORDER_ANCHOR_SPACING_PX,
     extract_features,
+    extract_features_tiled,
+    KEYPOINT_TILE_SIZE_PX,
     load_models,
     match_features,
     project_via_plane,
@@ -127,6 +129,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-confidence", type=float, default=DEFAULT_MIN_CONFIDENCE)
     parser.add_argument("--no-border-anchors", action="store_true")
     parser.add_argument("--no-reject-degenerate-triangles", action="store_true")
+    parser.add_argument("--tiled-keypoints", action="store_true",
+                        help="Opt-in: measured as an accuracy regression, see "
+                             "register_features.py --help for details.")
     parser.add_argument("--out", "--output", dest="output", default=None,
                         help="Output directory (default: registration.output_dir in "
                              f"config, else {DEFAULT_REGISTRATION_OUTPUT_DIR}) "
@@ -152,7 +157,7 @@ def evaluate_observation(
     disk, matcher, device: torch.device,
     downscale: float, min_confidence: float,
     depth_min: float, depth_max: float,
-    use_border_anchors: bool, reject_degenerate: bool,
+    use_border_anchors: bool, reject_degenerate: bool, use_tiled_keypoints: bool,
 ) -> dict:
     """Build register_features.py's mesh for this session and evaluate it at
     this session's independently-detected board corners. Returns a dict with
@@ -165,8 +170,12 @@ def evaluate_observation(
     size_a = (color_a.shape[1], color_a.shape[0])
     size_b = (color_b.shape[1], color_b.shape[0])
 
-    feats_a, hw_a = extract_features(disk, color_a, device, DEFAULT_MAX_KEYPOINTS)
-    feats_b, hw_b = extract_features(disk, color_b, device, DEFAULT_MAX_KEYPOINTS)
+    if use_tiled_keypoints:
+        feats_a, hw_a = extract_features_tiled(disk, color_a, device, DEFAULT_MAX_KEYPOINTS, KEYPOINT_TILE_SIZE_PX)
+        feats_b, hw_b = extract_features_tiled(disk, color_b, device, DEFAULT_MAX_KEYPOINTS, KEYPOINT_TILE_SIZE_PX)
+    else:
+        feats_a, hw_a = extract_features(disk, color_a, device, DEFAULT_MAX_KEYPOINTS)
+        feats_b, hw_b = extract_features(disk, color_b, device, DEFAULT_MAX_KEYPOINTS)
     pts_a_all, pts_b_all, scores_all = match_features(matcher, feats_a, feats_b, hw_a, hw_b)
     keep = scores_all >= min_confidence
     pts_a, pts_b = pts_a_all[keep], pts_b_all[keep]
@@ -263,6 +272,7 @@ def main() -> int:
 
     reject_degenerate = not args.no_reject_degenerate_triangles
     use_border_anchors = not args.no_border_anchors
+    use_tiled_keypoints = args.tiled_keypoints
     device = torch.device("cpu")
     disk, matcher = load_models(device)
 
@@ -273,7 +283,7 @@ def main() -> int:
         result = evaluate_observation(
             observation, session_dir, args.camera_a, args.camera_b, extrinsics,
             disk, matcher, device, args.downscale, args.min_confidence,
-            depth_min, depth_max, use_border_anchors, reject_degenerate,
+            depth_min, depth_max, use_border_anchors, reject_degenerate, use_tiled_keypoints,
         )
         if "skipped" in result:
             print(f"  skipped: {result['skipped']}")
@@ -303,6 +313,7 @@ def main() -> int:
         f"  downscale:        {args.downscale}",
         f"  border anchors:   {'on' if use_border_anchors else 'off (--no-border-anchors)'}",
         f"  degenerate reject: {'on' if reject_degenerate else 'off (--no-reject-degenerate-triangles)'}",
+        f"  tiled keypoints:  {'on (--tiled-keypoints)' if use_tiled_keypoints else 'off'}",
         f"  sessions scored:  {len(scored)}/{len(results)}",
         f"  corners scored:   {len(all_errors)} ({n_mesh_total} via mesh, "
         f"{len(all_errors) - n_mesh_total} via fallback plane)",
@@ -335,6 +346,7 @@ def main() -> int:
         "downscale": args.downscale,
         "use_border_anchors": use_border_anchors,
         "reject_degenerate_triangles": reject_degenerate,
+        "use_tiled_keypoints": use_tiled_keypoints,
         "n_sessions_scored": len(scored),
         "n_corners_scored": len(all_errors),
         "n_corners_via_mesh": n_mesh_total,

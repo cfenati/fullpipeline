@@ -28,10 +28,19 @@ needed to score that.
 
 ## Ideas, roughly cheapest/highest-leverage first
 
-1. **Tiled/grid-quota keypoint extraction.** DISK currently clusters
-   keypoints on texture (knuckles, creases); a grid-quota scheme would force
-   keypoints into low-texture regions (palm, background), directly growing
-   match density and hull coverage.
+1. **Tiled/grid-quota keypoint extraction, status: tried, negative.**
+   Implemented as `extract_features_tiled` / `--tiled-keypoints` (opt-in, not
+   default). Coverage on a hand capture did increase (35.5% -> 38.5% hull
+   coverage on `captures/20260818_152114_103039`), matching the hypothesis
+   visually -- but `check_registration_error.py` on the held-out ChArUco set
+   caught what eyeballing missed: accuracy regressed (median 0.66 -> 0.77px,
+   p90 1.32 -> 2.22px, **max 3.51 -> 14.20px**, some corners lost mesh
+   coverage entirely). Splitting a fixed keypoint budget across tiles thins
+   density on already-textured regions (the board itself, or a hand's
+   knuckles/creases) more than it helps low-texture ones -- net negative on
+   a scene that's mostly texture-rich to begin with. Kept as an opt-in flag
+   rather than removed, in case a genuinely texture-sparse subject reverses
+   the trade-off, but don't default to it without new evidence.
 
 2. **Geometric-consistency pre-filtering.** Reject matches whose local
    displacement is an outlier vs. its neighbors *before* triangulating --
