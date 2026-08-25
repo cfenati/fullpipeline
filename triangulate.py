@@ -158,11 +158,22 @@ def epipolar_lines(points_a: np.ndarray, fundamental: np.ndarray) -> np.ndarray:
     return lines / np.maximum(norm, 1e-12)[:, None]
 
 
+def distance_to_line(points: np.ndarray, lines: np.ndarray) -> np.ndarray:
+    """Signed perpendicular distance from each point to its line, in pixels.
+
+    Lines are normalised (a^2 + b^2 = 1, as epipolar_lines returns), so this
+    homogeneous residual is a true distance, not just a scaled one.
+    """
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    lines = np.asarray(lines, dtype=np.float64).reshape(-1, 3)
+    return np.einsum("ij,ij->i", np.column_stack([points, np.ones(len(points))]), lines)
+
+
 def snap_to_line(points: np.ndarray, lines: np.ndarray) -> np.ndarray:
     """Closest point on each line: drops the click error perpendicular to it."""
     points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
     lines = np.asarray(lines, dtype=np.float64).reshape(-1, 3)
-    offset = np.einsum("ij,ij->i", np.column_stack([points, np.ones(len(points))]), lines)
+    offset = distance_to_line(points, lines)
     return points - offset[:, None] * lines[:, :2]
 
 

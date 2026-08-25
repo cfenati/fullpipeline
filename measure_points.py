@@ -38,7 +38,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -51,6 +51,7 @@ from calibrate_cameras import load_config, resolve_path  # noqa: E402
 from calibration.stereo import StereoExtrinsics  # noqa: E402
 from registration_io import default_extrinsics_path, undistort_pair  # noqa: E402
 from triangulate import (  # noqa: E402
+    distance_to_line,
     epipolar_lines,
     fundamental_for_undistorted,
     snap_to_line,
@@ -195,9 +196,7 @@ def measure_points(
     snapped = snap_to_line(clicks_b, lines)
     # How far each click had to move to reach its epipolar line. This is the one
     # number that says whether the two clicks were the same physical feature.
-    offsets = np.abs(np.einsum(
-        "ij,ij->i", np.column_stack([clicks_b, np.ones(len(clicks_b))]), lines,
-    ))
+    offsets = np.abs(distance_to_line(clicks_b, lines))
 
     points_3d = triangulate_points(
         clicks_a, snapped,
@@ -417,7 +416,9 @@ def render(state: Dict[str, Any]) -> np.ndarray:
 def run_interactive(image_a: np.ndarray, image_b: np.ndarray,
                     extrinsics: StereoExtrinsics, depth_range: Tuple[float, float],
                     zoom: int, max_window: Tuple[int, int], blob_radius: int,
-                    depth_m: float) -> Dict[str, Any]:
+                    depth_m: float,
+                    on_point: Optional[Callable[[int, Dict[str, Any]], None]] = None,
+                    on_undo: Optional[Callable[[int], None]] = None) -> Dict[str, Any]:
     fundamental = fundamental_for_undistorted(
         extrinsics.camera_matrix_a, extrinsics.camera_matrix_b, extrinsics.essential,
     )
@@ -429,6 +430,7 @@ def run_interactive(image_a: np.ndarray, image_b: np.ndarray,
         "panel_a": Panel(image_a, panel_size), "panel_b": Panel(image_b, panel_size),
         "zoom": zoom, "clicks_a": [], "clicks_b": [], "pending_a": None,
         "pending_line": None, "cursor": None, "status": [], "consecutive": [],
+        "click_offsets_px": [],
         "drag": None, "linked": True,
         # Best guess at how far away the subject is, used ONLY to aim camera B's
         # view. Starts at the configured nominal and is replaced by the depth of
@@ -450,6 +452,7 @@ def run_interactive(image_a: np.ndarray, image_b: np.ndarray,
             result = measure_points(
                 np.array(state["clicks_a"]), np.array(state["clicks_b"]), extrinsics,
             )
+            result["epipolar_offset_px"] = list(state["click_offsets_px"])
             points = np.array(result["points_mm"])
             state["consecutive"] = [
                 float(np.linalg.norm(points[i] - points[i - 1]))
@@ -499,11 +502,16 @@ def run_interactive(image_a: np.ndarray, image_b: np.ndarray,
                                   extrinsics, state["depth_hint"])
         elif on_b:
             # Centroid first (the dot's true centre), then the epipolar line
-            # (which discards whatever click error is left across the line).
+            # (which discards whatever click error is left across the line) --
+            # capture the distance to that line HERE, before it's discarded.
             blob = snap_to_blob(gray_b, full, blob_radius)
+            raw_offset = float(np.abs(
+                distance_to_line(blob[None, :], state["pending_line"][None, :])[0]
+            ))
             snapped = snap_to_line(blob[None, :], state["pending_line"][None, :])[0]
             state["clicks_a"].append(state["pending_a"])
             state["clicks_b"].append(snapped.tolist())
+            state["click_offsets_px"].append(raw_offset)
             state["pending_a"] = None
             recompute()
             state["depth_hint"] = float(state["result"]["depth_mm"][-1]) / 1000.0
@@ -512,8 +520,10 @@ def run_interactive(image_a: np.ndarray, image_b: np.ndarray,
                 print(f"  point {index - 1} -> {index} : "
                       f"{state['consecutive'][-1]:.3f} mm    "
                       f"depth {state['result']['depth_mm'][-1]:.1f} mm, "
-                      f"click offset {state['result']['epipolar_offset_px'][-1]:.1f} px",
+                      f"click offset {raw_offset:.1f} px",
                       flush=True)
+            if on_point is not None:
+                on_point(len(state["clicks_a"]) - 1, state["result"])
 
     window = "measure_points"
     # AUTOSIZE, with the canvas built to fit the requested window size. A resizable
@@ -552,10 +562,17 @@ def run_interactive(image_a: np.ndarray, image_b: np.ndarray,
             if state["pending_a"] is not None:
                 state["pending_a"] = None
             elif state["clicks_b"]:
-                state["clicks_a"].pop(); state["clicks_b"].pop(); recompute()
+                state["clicks_a"].pop(); state["clicks_b"].pop()
+                state["click_offsets_px"].pop()
+                recompute()
+                if on_undo is not None:
+                    on_undo(len(state["clicks_a"]))
         elif key == ord("r"):
             state["clicks_a"].clear(); state["clicks_b"].clear()
+            state["click_offsets_px"].clear()
             state["pending_a"] = None; recompute()
+            if on_undo is not None:
+                on_undo(0)
         elif key == ord("0"):
             state["panel_a"].fit(); state["panel_b"].fit()
         elif key == ord("l"):
@@ -572,9 +589,11 @@ def run_interactive(image_a: np.ndarray, image_b: np.ndarray,
     cv2.waitKey(1)
     if len(state["clicks_b"]) < 2:
         return {}
-    return measure_points(
+    result = measure_points(
         np.array(state["clicks_a"]), np.array(state["clicks_b"]), extrinsics,
     )
+    result["epipolar_offset_px"] = list(state["click_offsets_px"])
+    return result
 
 
 # --------------------------------------------------------------------------- #
