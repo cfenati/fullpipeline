@@ -50,7 +50,8 @@ Usage:
     python check_depth_accuracy.py --session captures/depth_target/<timestamp> \\
         --ref 100,200,90,205 --ref 900,200,890,205 \\
         --ref 100,900,90,905 --ref 900,900,890,905 \\
-        --cell 0,0,300,400,290,405 --cell 4,4,700,600,690,605   # non-interactive
+        --cell 0.6,300,400,290,405 --cell 30.0,700,600,690,605   # non-interactive;
+        # HEIGHT,AX,AY,BX,BY -- identify a block by the number engraved on it
 """
 
 from __future__ import annotations
@@ -435,18 +436,17 @@ def write_report(
 # CLI
 # --------------------------------------------------------------------------- #
 
-def parse_cell(text: str) -> Tuple[int, int, float, float, float, float]:
+def parse_cell(text: str) -> Tuple[float, float, float, float, float]:
     parts = text.replace(" ", "").split(",")
-    if len(parts) != 6:
+    if len(parts) != 5:
         raise argparse.ArgumentTypeError(
-            f"--cell wants ROW,COL,AX,AY,BX,BY, got '{text}'"
+            f"--cell wants HEIGHT,AX,AY,BX,BY, got '{text}'"
         )
     try:
-        row, col = int(parts[0]), int(parts[1])
-        ax, ay, bx, by = (float(value) for value in parts[2:])
+        height, ax, ay, bx, by = (float(value) for value in parts)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"--cell could not parse '{text}': {exc}") from exc
-    return row, col, ax, ay, bx, by
+    return height, ax, ay, bx, by
 
 
 class LabelingSession:
@@ -549,11 +549,12 @@ def parse_args() -> argparse.Namespace:
                              "undistorted full-res pixels. Repeat exactly "
                              "reference_corner_count times, any order among themselves.")
     parser.add_argument("--cell", type=parse_cell, action="append", default=None,
-                        metavar="ROW,COL,AX,AY,BX,BY",
-                        help="Non-interactive: one grid-cell click pair, labeled by its "
-                             "(row, col) in the target's heights_mm grid. Repeat for every "
-                             "cell visible this session -- occluded cells are simply "
-                             "omitted, not required.")
+                        metavar="HEIGHT,AX,AY,BX,BY",
+                        help="Non-interactive: one block click pair, labeled by the height "
+                             "(mm) engraved on it -- must match one of the target's "
+                             "heights_mm values. Repeat for every block visible this "
+                             "session (a block may repeat for a repeatability sample); "
+                             "occluded blocks are simply omitted, not required.")
     parser.add_argument("--zoom", type=int, default=DEFAULT_LOUPE_ZOOM,
                         help="Initial loupe magnification (default: %(default)s).")
     parser.add_argument("--window", type=int, nargs=2, default=list(DEFAULT_MAX_WINDOW),
@@ -609,14 +610,8 @@ def main() -> int:
                 f"{target_path.name} needs exactly {target.reference_corner_count} --ref "
                 f"clicks, got {len(args.ref) if args.ref else 0}."
             )
-        if not args.cell or len(args.cell) < 2:
-            raise SystemExit("Need at least 2 --cell clicks to measure a depth difference.")
-        for row, col, *_ in args.cell:
-            if not (0 <= row < target.row_count and 0 <= col < target.col_count):
-                raise SystemExit(
-                    f"--cell {row},{col} is out of range for a {target.row_count}x"
-                    f"{target.col_count} grid."
-                )
+        if not args.cell:
+            raise SystemExit("Need at least 1 --cell click to measure a block's depth.")
 
     if args.session:
         session_dir = resolve_path(args.session)
@@ -654,35 +649,40 @@ def main() -> int:
         if args.ref:
             ref_clicks_a = np.array([[point[0], point[1]] for point in args.ref])
             ref_clicks_b = np.array([[point[2], point[3]] for point in args.ref])
-            cell_labels = [(cell[0], cell[1]) for cell in args.cell]
-            cell_clicks_a = np.array([[cell[2], cell[3]] for cell in args.cell])
-            cell_clicks_b = np.array([[cell[4], cell[5]] for cell in args.cell])
+            try:
+                cell_labels = [target.cell_at_height(cell[0]) for cell in args.cell]
+            except ValueError as exc:
+                raise SystemExit(str(exc))
+            cell_clicks_a = np.array([[cell[1], cell[2]] for cell in args.cell])
+            cell_clicks_b = np.array([[cell[3], cell[4]] for cell in args.cell])
         else:
             print(f"{label}: click the {target.reference_corner_count} reference corners "
-                  "first (any order among themselves), then click every grid cell you can "
-                  "see -- skip ones you can't. Press q/Esc to finish.")
+                  "first (any order among themselves) -- the plane fits itself in as soon "
+                  "as the last one lands. After that, click a block and type the height "
+                  "engraved on it when prompted; click the same block again anytime for a "
+                  "repeatability sample. Press q/Esc to finish.")
+            session = LabelingSession(target)
             raw_result = run_interactive(
                 image_a, image_b, extrinsics, depth_range,
                 max(2, args.zoom), (int(args.window[0]), int(args.window[1])),
                 max(3, args.blob_radius) if args.blob_snap else 0,
                 float(reg_config.get("default_depth", 0.168)),
+                on_point=session.on_point, on_undo=session.on_undo,
             )
             n_ref = target.reference_corner_count
             total_clicks = len(raw_result.get("clicks_a", [])) if raw_result else 0
-            if total_clicks < n_ref + 2:
+            if total_clicks < n_ref + 1:
                 results.append({
                     "label": label,
-                    "skipped": f"fewer than {n_ref} reference + 2 cell clicks",
+                    "skipped": f"fewer than {n_ref} reference + 1 labeled block click",
                 })
                 print(f"{label}: skipped: not enough points clicked")
                 continue
             ref_clicks_a = np.array(raw_result["clicks_a"][:n_ref])
             ref_clicks_b = np.array(raw_result["clicks_b_snapped"][:n_ref])
-            remaining_a = raw_result["clicks_a"][n_ref:]
-            remaining_b = raw_result["clicks_b_snapped"][n_ref:]
-            cell_labels = _prompt_cell_labels(len(remaining_a), target)
-            cell_clicks_a = np.array(remaining_a)
-            cell_clicks_b = np.array(remaining_b)
+            cell_labels = session.labels
+            cell_clicks_a = np.array(raw_result["clicks_a"][n_ref:])
+            cell_clicks_b = np.array(raw_result["clicks_b_snapped"][n_ref:])
 
         try:
             measured = measure_depth_session(
@@ -710,9 +710,12 @@ def main() -> int:
                             (int(args.window[0]), int(args.window[1]))),
         )
 
-        session_scale = fit_scale(measured["pair_truth_mm"], measured["pair_measured_mm"])
-        print(f"{label}: scale {session_scale['scale_error_pct']:+.3f} %, "
-              f"cells {len(measured['cell_labels'])}, "
+        if len(measured["pair_truth_mm"]):
+            session_scale = fit_scale(measured["pair_truth_mm"], measured["pair_measured_mm"])
+            scale_text = f"scale {session_scale['scale_error_pct']:+.3f} %"
+        else:
+            scale_text = "scale n/a (1 block)"
+        print(f"{label}: {scale_text}, blocks {len(measured['block_labels'])}, "
               f"plane rms {measured['plane_rms_mm']:.4f} mm, "
               f"depth {measured['depth_mean_m'] * 1000:.0f} mm")
 
@@ -739,9 +742,11 @@ def main() -> int:
             if "skipped" in result else
             {
                 "label": result["label"],
-                "cell_labels": result["cell_labels"],
-                "cell_truth_mm": result["cell_truth_mm"].tolist(),
-                "cell_measured_mm": result["cell_measured_mm"].tolist(),
+                "block_labels": result["block_labels"],
+                "block_truth_mm": result["block_truth_mm"].tolist(),
+                "block_measured_mm": result["block_measured_mm"].tolist(),
+                "block_samples": result["block_samples"].tolist(),
+                "block_repeatability_rms_mm": result["block_repeatability_rms_mm"],
                 "pairs": result["pairs"].tolist(),
                 "pair_truth_mm": result["pair_truth_mm"].tolist(),
                 "pair_measured_mm": result["pair_measured_mm"].tolist(),
@@ -761,10 +766,14 @@ def main() -> int:
 
     fit = summary["scale_fit"]
     print()
-    print(f"scale error   {fit['scale_error_pct']:+.3f} %  "
-          f"(a = {fit['scale']:.5f}, residual {fit['residual_rms_mm']:.4f} mm rms)")
-    print(f"mean abs err  {summary['mean_abs_relative_pct']:.3f} %  "
-          f"({summary['rms_error_mm']:.4f} mm rms, max {summary['max_abs_error_mm']:.4f} mm)")
+    if fit is not None:
+        print(f"scale error   {fit['scale_error_pct']:+.3f} %  "
+              f"(a = {fit['scale']:.5f}, residual {fit['residual_rms_mm']:.4f} mm rms)")
+    else:
+        print("scale error   n/a (no pairwise data -- every session measured only one block)")
+    print(f"rms error     {summary['rms_error_mm']:.4f} mm  (max {summary['max_abs_error_mm']:.4f} mm)")
+    if summary["repeatability_rms_mm"] is not None:
+        print(f"repeatability {summary['repeatability_rms_mm']:.4f} mm rms")
     print(f"Saved report.txt / result.json / *_correspondences.jpg to {output_dir}")
     return 0
 
