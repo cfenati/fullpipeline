@@ -1580,9 +1580,15 @@ with tempfile.TemporaryDirectory() as tmp:
         a, b = project_pair(p)
         ref_args += ["--ref", f"{a[0]},{a[1]},{b[0]},{b[1]}"]
 
+    # The second (0,0) click gets a deliberate 0.4px jitter (mirroring Task 3's
+    # verification) so its within-session repeatability is genuinely nonzero,
+    # not trivially 0.0 from two bit-identical clicks.
     cell_args = []
-    for point_m, height_mm in ((block36_m, 3.6), (block36_m, 3.6), (block70_m, 7.0)):
+    for point_m, height_mm, jitter_px in (
+        (block36_m, 3.6, 0.0), (block36_m, 3.6, 0.4), (block70_m, 7.0, 0.0),
+    ):
         a, b = project_pair(point_m)
+        a = a + np.array([jitter_px, 0.0])
         cell_args += ["--cell", f"{height_mm},{a[0]},{a[1]},{b[0]},{b[1]}"]
 
     out_dir = tmp / "out"
@@ -1605,10 +1611,22 @@ with tempfile.TemporaryDirectory() as tmp:
     summary = result["summary"]
     assert summary["scale_fit"] is not None
     assert abs(summary["scale_fit"]["scale_error_pct"]) < 1.0
-    assert summary["repeatability_rms_mm"] is not None
+    # aggregate_depth_results pools repeatability ACROSS SESSIONS (by design --
+    # see its docstring): with only one session in this test, every per_block
+    # entry necessarily has exactly one session-level sample, so the aggregate
+    # summary["repeatability_rms_mm"] is correctly None here, not a bug. The
+    # WITHIN-session repeatability (from this session's two (0,0) clicks) is
+    # what the session-level block_repeatability_rms_mm list captures instead.
+    assert summary["repeatability_rms_mm"] is None
     per_block = {(entry["row"], entry["col"]): entry for entry in summary["per_block"]}
     assert abs(per_block[(0, 0)]["error_mm"]) < 0.05
     assert abs(per_block[(0, 1)]["error_mm"]) < 0.05
+
+    session_entry = next(s for s in result["sessions"] if s["label"] == "20990101_000000")
+    session_labels = [tuple(label) for label in session_entry["block_labels"]]
+    session_repeatability = dict(zip(session_labels, session_entry["block_repeatability_rms_mm"]))
+    assert session_repeatability[(0, 0)] is not None and session_repeatability[(0, 0)] > 0.0
+    assert session_repeatability[(0, 1)] is None
 
     assert (out_dir / "depth_accuracy" / "20990101_000000_correspondences.jpg").exists()
 
