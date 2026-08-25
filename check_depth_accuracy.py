@@ -449,32 +449,73 @@ def parse_cell(text: str) -> Tuple[int, int, float, float, float, float]:
     return row, col, ax, ay, bx, by
 
 
-def _prompt_cell_labels(count: int, target: DepthGridTarget) -> List[Tuple[int, int]]:
-    """Ask, in click order, which grid cell each non-reference click was.
+class LabelingSession:
+    """Drives live labeling via run_interactive's on_point/on_undo hooks.
 
-    run_interactive (measure_points.py) collects clicks anonymously with no
-    hook for per-click metadata, and it is reused here unmodified -- so
-    labeling happens once, right after the session ends, in the same order
-    the points were clicked. The user just clicked them and knows that order.
+    Counts off the reference corners as they land, fits the datum plane the
+    instant the last one completes, then prompts for each subsequent
+    block's engraved height and grades it immediately against that plane --
+    replacing the old blind, post-hoc, click-order-matched labeling prompt.
     """
-    print(f"\n{count} cell click(s) recorded. Label each one, in the order you clicked "
-          f"it (grid is {target.row_count} rows x {target.col_count} cols, 0-indexed).")
-    labels: List[Tuple[int, int]] = []
-    for index in range(count):
+
+    def __init__(self, target: DepthGridTarget) -> None:
+        self.target = target
+        self.n_ref = target.reference_corner_count
+        self.labels: List[Tuple[int, int]] = []
+        self.samples: Dict[Tuple[int, int], List[float]] = {}
+        self.plane: Optional[Tuple[np.ndarray, np.ndarray]] = None
+
+    def on_point(self, index: int, result: Dict[str, Any]) -> None:
+        if index < self.n_ref - 1:
+            print(f"  reference corner {index + 1}/{self.n_ref} recorded")
+            return
+        if index == self.n_ref - 1:
+            points_mm = np.asarray(result["points_mm"][:self.n_ref], dtype=np.float64)
+            centroid, normal, rms_m = fit_plane_3d(points_mm / 1000.0)
+            if normal @ (-centroid) < 0.0:
+                normal = -normal
+            self.plane = (centroid, normal)
+            print(f"  reference corner {self.n_ref}/{self.n_ref} recorded -- "
+                  f"plane fit rms {rms_m * 1000.0:.4f} mm")
+            return
+
+        centroid, normal = self.plane
+        point_mm = np.asarray(result["points_mm"][index], dtype=np.float64)
+        measured_mm = perpendicular_distance_to_plane(
+            point_mm / 1000.0, centroid, normal,
+        ) * 1000.0
+
         while True:
-            raw = input(f"  click {index}: row,col > ").strip()
+            raw = input("  engraved height (mm) on this block > ").strip()
             try:
-                row_text, col_text = raw.split(",")
-                row, col = int(row_text), int(col_text)
-                if not (0 <= row < target.row_count and 0 <= col < target.col_count):
-                    raise ValueError
-            except ValueError:
-                print(f"    enter as ROW,COL within 0-{target.row_count - 1},"
-                      f"0-{target.col_count - 1}")
+                height = float(raw)
+                label = self.target.cell_at_height(height)
+            except ValueError as exc:
+                print(f"    {exc}")
                 continue
-            labels.append((row, col))
             break
-    return labels
+
+        self.labels.append(label)
+        history = self.samples.setdefault(label, [])
+        history.append(measured_mm)
+        if len(history) == 1:
+            print(f"  {height}mm: measured {measured_mm:.3f}mm "
+                  f"(delta {measured_mm - height:+.3f}mm)")
+        else:
+            values = np.asarray(history)
+            spread = float(np.sqrt(np.mean((values - values.mean()) ** 2)))
+            print(f"  {height}mm, sample {len(history)}: measured {measured_mm:.3f}mm "
+                  f"(spread so far: {spread:.4f}mm rms)")
+
+    def on_undo(self, new_count: int) -> None:
+        n_labels = max(0, new_count - self.n_ref)
+        removed = self.labels[n_labels:]
+        self.labels = self.labels[:n_labels]
+        for label in removed:
+            if self.samples.get(label):
+                self.samples[label].pop()
+        if new_count < self.n_ref:
+            self.plane = None
 
 
 def parse_args() -> argparse.Namespace:
