@@ -242,13 +242,14 @@ def measure_depth_session(
 def aggregate_depth_results(
     results: Sequence[Dict[str, Any]], target: DepthGridTarget,
 ) -> Dict[str, Any]:
-    """Pool per-session pairwise and per-cell measurements, then fit scale.
+    """Pool per-session pairwise and per-block measurements, then fit scale.
 
-    Structured like check_line_accuracy.aggregate_results (bucket-by-truth
-    pairwise table, pooled scale fit, per-session quality table), adapted:
-    plane_rms_mm/epipolar-offset diagnostics instead of straightness/
-    intersection-angle, plus a per-cell table for the direct plane-to-cell
-    check that isolates plane-fit bias (see module docstring).
+    Each session already deduplicates repeat clicks on the same block into
+    one mean (measure_depth_session) -- this pools those per-session means
+    across sessions, so the reported repeatability_rms_mm answers "if I
+    measure this block on separate occasions, how much does the answer
+    vary," on top of (not instead of) each session's own within-session
+    block_repeatability_rms_mm.
     """
     scored = [result for result in results if "skipped" not in result]
 
@@ -266,58 +267,63 @@ def aggregate_depth_results(
             "samples": int(values.size),
             "measured_mean_mm": mean,
             "error_mm": mean - truth,
-            "error_pct": (mean - truth) / truth * 100.0 if truth else float("nan"),
         })
 
-    cell_buckets: Dict[Tuple[int, int], List[float]] = {}
+    block_buckets: Dict[Tuple[int, int], List[float]] = {}
     for result in scored:
-        for label, measured in zip(result["cell_labels"], result["cell_measured_mm"]):
-            cell_buckets.setdefault(tuple(label), []).append(float(measured))
+        for label, measured in zip(result["block_labels"], result["block_measured_mm"]):
+            block_buckets.setdefault(tuple(label), []).append(float(measured))
 
-    per_cell: List[Dict[str, Any]] = []
-    for label in sorted(cell_buckets):
+    per_block: List[Dict[str, Any]] = []
+    for label in sorted(block_buckets):
         truth = target.height_at(*label)
-        values = np.asarray(cell_buckets[label], dtype=np.float64)
+        values = np.asarray(block_buckets[label], dtype=np.float64)
         mean = float(values.mean())
-        per_cell.append({
+        per_block.append({
             "row": label[0], "col": label[1],
             "truth_mm": truth,
             "samples": int(values.size),
             "measured_mean_mm": mean,
+            "repeatability_rms_mm": (
+                float(np.sqrt(np.mean((values - mean) ** 2))) if values.size > 1 else None
+            ),
             "error_mm": mean - truth,
         })
 
-    errors = np.array([entry["error_mm"] for entry in per_pair])
-    relative = np.array([entry["error_pct"] for entry in per_pair])
+    block_errors = np.array([entry["error_mm"] for entry in per_block])
+    repeatability_values = np.array([
+        entry["repeatability_rms_mm"] for entry in per_block
+        if entry["repeatability_rms_mm"] is not None
+    ])
 
-    flat_truth = np.concatenate([result["pair_truth_mm"] for result in scored])
-    flat_measured = np.concatenate([result["pair_measured_mm"] for result in scored])
+    has_pairs = any(len(result["pair_truth_mm"]) for result in scored)
+    scale_fit = None
+    if has_pairs:
+        flat_truth = np.concatenate([result["pair_truth_mm"] for result in scored])
+        flat_measured = np.concatenate([result["pair_measured_mm"] for result in scored])
+        scale_fit = fit_scale(flat_truth, flat_measured)
 
     per_session = [{
         "label": result["label"],
-        "cells_measured": len(result["cell_labels"]),
+        "blocks_measured": len(result["block_labels"]),
         "plane_rms_mm": result["plane_rms_mm"],
         "plane_point_count": result["plane_point_count"],
-        "ref_epipolar_offset_max_px": result["ref_epipolar_offset_max_px"],
-        "cell_epipolar_offset_max_px": result["cell_epipolar_offset_max_px"],
         "order_mismatch_count": result["order_mismatch_count"],
         "depth_mean_m": result["depth_mean_m"],
-        "scale": fit_scale(result["pair_truth_mm"], result["pair_measured_mm"])["scale"],
     } for result in scored]
 
     return {
         "sessions_scored": len(scored),
         "per_pair": per_pair,
-        "per_cell": per_cell,
+        "per_block": per_block,
         "per_session": per_session,
-        "scale_fit": fit_scale(flat_truth, flat_measured),
-        "mean_error_mm": float(errors.mean()),
-        "rms_error_mm": float(np.sqrt(np.mean(errors ** 2))),
-        "max_abs_error_mm": float(np.abs(errors).max()),
-        "mean_abs_relative_pct": float(np.nanmean(np.abs(relative))),
-        "max_abs_relative_pct": float(np.nanmax(np.abs(relative))),
+        "scale_fit": scale_fit,
+        "rms_error_mm": float(np.sqrt(np.mean(block_errors ** 2))) if len(block_errors) else float("nan"),
+        "max_abs_error_mm": float(np.abs(block_errors).max()) if len(block_errors) else float("nan"),
+        "repeatability_rms_mm": (
+            float(np.sqrt(np.mean(repeatability_values ** 2))) if len(repeatability_values) else None
+        ),
         "plane_rms_mean_mm": float(np.mean([result["plane_rms_mm"] for result in scored])),
-        "depth_mean_m": float(np.mean([result["depth_mean_m"] for result in scored])),
         "order_mismatch_total": int(sum(result["order_mismatch_count"] for result in scored)),
     }
 
@@ -335,18 +341,34 @@ def write_report(
 ) -> None:
     rule = "=" * 78
     thin = "-" * 78
+
+    fit = summary["scale_fit"]
+    if fit is not None:
+        headline = (
+            f"RESULT: scale error {fit['scale_error_pct']:+.3f} %  "
+            f"(residual {fit['residual_rms_mm']:.4f} mm rms)  --  "
+            f"{len(summary['per_block'])} block(s) across {summary['sessions_scored']} "
+            f"session(s)"
+        )
+    else:
+        headline = (
+            f"RESULT: no pairwise data this run (every session measured only one "
+            f"distinct block) -- {len(summary['per_block'])} block(s) across "
+            f"{summary['sessions_scored']} session(s)"
+        )
+    if summary["repeatability_rms_mm"] is not None:
+        headline += f", repeatability {summary['repeatability_rms_mm']:.4f} mm rms"
+
     lines = [
         rule,
         "DEPTH-GRID RELATIVE ACCURACY",
         rule,
+        headline,
+        "",
         f"extrinsics       : {context['extrinsics']}",
         f"target           : {context['target']}",
         f"ground truth     : {target.measured_by}",
-        f"grid             : {target.row_count}x{target.col_count}, "
-        f"pitch {target.pitch_mm:.1f} mm",
         f"uncertainty      : +/- {target.height_uncertainty_mm:.3f} mm per block",
-        f"reference corners: {target.reference_corner_count}",
-        f"sessions scored  : {summary['sessions_scored']}",
         f"cameras          : {context['camera_a']} (A) / {context['camera_b']} (B)",
         "",
     ]
@@ -357,97 +379,52 @@ def write_report(
         lines.extend(f"  {result['label']}: {result['skipped']}" for result in skipped)
         lines.append("")
 
+    lines.extend([
+        thin,
+        "PER BLOCK  (pooled across sessions -- accuracy vs. truth, and repeatability "
+        "from repeated clicks/sessions on the same block)",
+        thin,
+        f"{'truth mm':>9} {'n':>3} {'measured mm':>12} {'repeat. rms mm':>15} {'err mm':>9}",
+    ])
+    for entry in summary["per_block"]:
+        repeat = (
+            f"{entry['repeatability_rms_mm']:.4f}"
+            if entry["repeatability_rms_mm"] is not None else "--"
+        )
+        lines.append(
+            f"{entry['truth_mm']:>9.3f} {entry['samples']:>3} "
+            f"{entry['measured_mean_mm']:>12.3f} {repeat:>15} {entry['error_mm']:>+9.3f}"
+        )
+    lines.append("")
+
+    if fit is not None:
+        lines.extend([
+            thin,
+            "PAIRWISE SCALE FIT  (block-to-block separations, immune to any offset "
+            "in where the reference plane sits)",
+            thin,
+            f"  measured = a * true          a = {fit['scale']:.5f}  "
+            f"-> {fit['scale_error_pct']:+.3f} %",
+            f"  residual after scale         {fit['residual_rms_mm']:.4f} mm rms",
+            f"  measured = a * true + b      a = {fit['affine_slope']:.5f}  "
+            f"({fit['affine_slope_error_pct']:+.3f} %), b = {fit['affine_intercept_mm']:+.4f} mm",
+            f"  residual after affine        {fit['affine_residual_rms_mm']:.4f} mm rms",
+            "",
+            "  a-1 is systematic depth-scale error. A large b points at a fixed",
+            "  plane-fit bias rather than a proportional one.",
+            "",
+        ])
+
+    lines.extend([thin, "PER SESSION", thin])
     for result in results:
         if "skipped" in result:
             continue
-        lines.extend([
-            thin,
-            f"SESSION {result['label']}  --  {len(result['cell_labels'])} cells measured, "
-            f"plane fit from {result['plane_point_count']} reference points "
-            f"(rms {result['plane_rms_mm']:.4f} mm)",
-            thin,
-            f"{'cell':<8} {'true mm':>9} {'plane-to-cell mm':>17} {'err mm':>9}",
-        ])
-        order = sorted(
-            range(len(result["cell_labels"])),
-            key=lambda index: result["cell_truth_mm"][index],
-        )
-        for index in order:
-            row, col = result["cell_labels"][index]
-            truth = float(result["cell_truth_mm"][index])
-            measured = float(result["cell_measured_mm"][index])
-            lines.append(
-                f"({row},{col})".ljust(8) + f"{truth:>9.3f} {measured:>17.3f} "
-                f"{measured - truth:>+9.3f}"
-            )
-        if result["order_mismatch_count"]:
-            lines.append(
-                f"  warning: {result['order_mismatch_count']} adjacent pair(s) measured "
-                "out of the known height order -- check for a mislabeled click"
-            )
-        lines.append("")
-
-    fit = summary["scale_fit"]
-    lines.extend([
-        thin,
-        "PAIRWISE SCALE FIT  (the headline number -- cell-to-cell separations, "
-        "immune to any offset in where the reference plane sits)",
-        thin,
-        f"  measured = a * true          a = {fit['scale']:.5f}  "
-        f"-> {fit['scale_error_pct']:+.3f} %",
-        f"  residual after scale         {fit['residual_rms_mm']:.4f} mm rms",
-        f"  measured = a * true + b      a = {fit['affine_slope']:.5f}  "
-        f"({fit['affine_slope_error_pct']:+.3f} %), b = {fit['affine_intercept_mm']:+.4f} mm",
-        f"  residual after affine        {fit['affine_residual_rms_mm']:.4f} mm rms",
-        "",
-        "  a-1 is systematic depth-scale error. A large b points at a fixed",
-        "  plane-fit bias rather than a proportional one.",
-        "",
-        thin,
-        "OVERALL (pairwise)",
-        thin,
-        f"  mean error            {summary['mean_error_mm']:+.4f} mm",
-        f"  rms error             {summary['rms_error_mm']:.4f} mm",
-        f"  max abs error         {summary['max_abs_error_mm']:.4f} mm",
-        f"  mean abs relative     {summary['mean_abs_relative_pct']:.3f} %",
-        f"  max abs relative      {summary['max_abs_relative_pct']:.3f} %",
-        "",
-        thin,
-        "PER-CELL  (plane-to-cell, direct check -- exposes plane-fit bias; not "
-        "used for the scale fit)",
-        thin,
-        f"{'cell':<8} {'true mm':>9} {'mean meas mm':>13} {'err mm':>9} {'n':>4}",
-    ])
-    for entry in summary["per_cell"]:
         lines.append(
-            f"({entry['row']},{entry['col']})".ljust(8)
-            + f"{entry['truth_mm']:>9.3f} {entry['measured_mean_mm']:>13.3f} "
-            f"{entry['error_mm']:>+9.3f} {entry['samples']:>4}"
-        )
-    lines.extend([
-        "",
-        thin,
-        "MEASUREMENT QUALITY",
-        thin,
-        f"  mean plane RMS         {summary['plane_rms_mean_mm']:.4f} mm "
-        "(reference-point noise within a session)",
-        f"  mean working depth     {summary['depth_mean_m'] * 1000:.1f} mm",
-        f"  order-mismatch total   {summary['order_mismatch_total']} (cells that measured "
-        "out of known height rank -- see PAIRWISE note above; no automatic pattern check "
-        "protects click labeling here, unlike the line ladder's self-checking gaps)",
-        "",
-        thin,
-        "PER SESSION",
-        thin,
-        f"{'session':<24} {'cells':>6} {'depth mm':>9} {'scale %':>9} "
-        f"{'plane rms mm':>13} {'mismatches':>11}",
-    ])
-    for entry in summary["per_session"]:
-        lines.append(
-            f"{entry['label'][:24]:<24} {entry['cells_measured']:>6} "
-            f"{entry['depth_mean_m'] * 1000:>9.1f} "
-            f"{(entry['scale'] - 1) * 100:>+9.3f} "
-            f"{entry['plane_rms_mm']:>13.4f} {entry['order_mismatch_count']:>11}"
+            f"  {result['label']}: {len(result['block_labels'])} block(s), "
+            f"plane rms {result['plane_rms_mm']:.4f} mm from {result['plane_point_count']} "
+            f"reference points, depth {result['depth_mean_m'] * 1000:.0f} mm"
+            + (f", {result['order_mismatch_count']} order mismatch(es)"
+               if result["order_mismatch_count"] else "")
         )
 
     lines.append("")
