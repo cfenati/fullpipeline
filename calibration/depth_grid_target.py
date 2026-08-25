@@ -56,12 +56,18 @@ class DepthGridTarget:
         if any(height < 0.0 for row in self.heights_mm for height in row):
             raise ValueError("heights_mm must not contain negative heights")
         flat_heights = [height for row in self.heights_mm for height in row]
-        if len(set(flat_heights)) != len(flat_heights):
-            raise ValueError(
-                "heights_mm must not contain duplicate heights -- block "
-                "identification by engraved height requires every height to "
-                "be unique"
-            )
+        # Check that all heights are sufficiently distinct (within tolerance 1e-6).
+        # Use sorted adjacent-diff approach: O(n log n) and catches any pair too close.
+        sorted_heights = sorted(flat_heights)
+        tol = 1e-6
+        for i in range(len(sorted_heights) - 1):
+            if sorted_heights[i + 1] - sorted_heights[i] < tol:
+                raise ValueError(
+                    f"heights_mm must not contain heights closer than {tol} together -- "
+                    f"found {sorted_heights[i]} and {sorted_heights[i + 1]} which differ by "
+                    f"{sorted_heights[i + 1] - sorted_heights[i]}. Block identification by "
+                    f"engraved height requires every height to be unique (within tolerance)"
+                )
         if self.pitch_mm <= 0.0:
             raise ValueError(f"pitch_mm must be positive, got {self.pitch_mm}")
         if self.reference_corner_count < 3:
