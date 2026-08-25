@@ -58,6 +58,29 @@ happen to inherit.
 
 ## Method
 
+### 0. The reference plane still has to be fit first
+
+This part of the 2026-08-24 design is unchanged, and is not optional
+machinery: it's the only way to separate "height" from "sideways." Two
+blocks sit at different grid positions, so the raw 3D distance between their
+triangulated points mixes the height difference actually being measured
+(0.6-30 mm) with however far apart they happen to sit on the plate
+(10-40 mm, easily dwarfing the signal). The plate's mounting angle to the
+camera is never assumed, so the only way to know which direction *is* height
+is to fit a plane through several known-flat, spatially-spread points (the
+corner pads) first. That fit's normal becomes the one axis every other
+measurement is projected onto; its centroid becomes the zero datum.
+
+What *is* new: once that one fit exists, nothing downstream is special-cased
+to "block vs. reference plane" only. Every other clicked point -- from any
+block -- is projected onto that same normal to get a scalar height, and any
+two of those heights are directly comparable to each other, block-to-block,
+not only block-to-datum (`DepthGridTarget.pair_depths_mm` already runs over
+every pair of clicked blocks, not just pairs involving the reference -- this
+was true in the 2026-08-24 design too, just not stated this plainly). The
+simplification here is dropping the row/col grid bookkeeping around that,
+not the geometry itself.
+
 ### 1. Label at click time, using the number printed on the block
 
 Today: click everything, close the window, then type a label for every click
@@ -88,7 +111,7 @@ in order, from memory. New: `run_interactive` gains two small optional hooks
   plane and print the comparison for that one block:
   `"3.6mm: measured 3.52mm (delta -0.08mm)"`.
 - A label matching one already used earlier in the session is recognized as
-  a repeat, not a new cell, and reported as a repeatability sample:
+  a repeat, not a new block, and reported as a repeatability sample:
   `"3.6mm, sample 2/2: measured 3.60mm (spread so far: 0.057mm rms)"`.
 
 Reading a number off the physical block removes the one thing that was
@@ -121,9 +144,11 @@ new `on_point` callback see. This fixes the diagnostic for
 ### 3. Aggregate same-label clicks before building the pairwise table
 
 `measure_depth_session` groups completed clicks by label first. Each unique
-`(row, col)` becomes one entry: `cell_measured_mm` (mean of its samples),
-`cell_samples` (count), `cell_repeatability_rms_mm` (RMS about the mean,
-`None` when `cell_samples == 1`). `pair_depths_mm` then runs over this
+block becomes one entry: `block_measured_mm` (mean of its samples),
+`block_samples` (count), `block_repeatability_rms_mm` (RMS about the mean,
+`None` when `block_samples == 1`) -- internally keyed by the `(row, col)`
+`cell_at_height` resolves the engraved label to, but that indexing never
+surfaces past the target lookup. `pair_depths_mm` then runs over this
 deduplicated set, exactly as the 2026-08-24 design already intended --
 "all heights in this target are distinct" was already a stated invariant,
 just not one the old click-order-labeled flow could actually guarantee. This
@@ -132,40 +157,62 @@ truth of 0 mm can now only happen if the target itself had a duplicate
 height, which is now rejected at load time (see "Interfaces").
 
 This also settles a case the old code treated as an error: a session that
-visits only **one** distinct cell, clicked repeatedly (a pure repeatability
+visits only **one** distinct block, clicked repeatedly (a pure repeatability
 probe, in the spirit of the user's own "many points on one plane" idea, just
 scoped to one labeled block instead of a separate mode). `pair_depths_mm` on
-a one-cell set simply produces zero pairs -- no error -- so such a session is
-now valid and scored: it contributes its `cell_repeatability_rms_mm` and
-plane-to-cell numbers, but nothing to the pairwise scale fit (which needs
->= 2 distinct cells to have any pairs at all). The old
+a one-block set simply produces zero pairs -- no error -- so such a session
+is now valid and scored: it contributes its `block_repeatability_rms_mm` and
+plane-to-block numbers, but nothing to the pairwise scale fit (which needs
+>= 2 distinct blocks to have any pairs at all). The old
 `ValueError("need at least 2 cells...")` and the interactive skip threshold
 (`total_clicks < n_ref + 2`) both relax accordingly: a session is now
 acceptable once it has the `reference_corner_count` corners plus **one**
-labeled cell click, not two.
+labeled block click, not two.
 
 ## Reporting
 
-`report.txt` gains a one-line headline above everything else:
+Trimmed to what the stated goal actually needs -- "how precise can I be
+measuring a depth difference" -- rather than every table the old report
+accumulated. Three pieces, in order:
 
-```
-RESULT: pairwise scale error +0.42 %  (residual 0.031 mm rms)  --
-        6 cell(s) across 3 session(s), repeatability 0.028 mm rms
-```
+1. **One headline line.** The answer, without reading anything else:
+   ```
+   RESULT: scale error +0.42 %  (residual 0.031 mm rms)  --
+           6 block(s) across 3 session(s), repeatability 0.028 mm rms
+   ```
+2. **One core table, one row per distinct block clicked (pooled across
+   sessions).** `truth_mm`, `samples`, `measured_mean_mm`,
+   `repeatability_rms_mm` (blank when `samples == 1`), `error_mm` (vs.
+   truth). This alone answers both halves of the goal: `repeatability_rms_mm`
+   is precision (no ground truth involved, just how much repeated clicks on
+   the same block disagree with each other); `error_mm` is accuracy (vs. the
+   engraved truth). Replaces the old report's separate per-session cell
+   tables and its standalone "per-cell plane-to-cell" section, which showed
+   the same underlying numbers split across two places.
+3. **The pairwise scale fit** (kept -- see decision below), over every pair
+   of distinct blocks clicked, pooled across sessions: `measured = a*true`
+   and its affine variant, exactly as `check_line_accuracy.fit_scale` already
+   computes. This is the one place a systematic *proportional* depth-scale
+   error (vs. a fixed offset) would show up, which the plain per-block error
+   column can't separate on its own.
 
-so the answer to "is this within budget" doesn't require reading the tables.
-The per-cell table gains `samples` and `repeatability mm` columns (blank when
-`samples == 1`). Everything else -- the pairwise scale fit, the per-cell
-plane-to-cell table, the measurement-quality section, the per-session table --
-keeps its current shape; only the inputs feeding it change (deduplicated
-cells instead of raw clicks).
+Decision: keep the scale fit rather than dropping to plain error/RMS only --
+it's the one view that distinguishes a proportional scale error from a fixed
+offset, which a flat error table can't. Everything else that made the old
+report noisy (measurement-quality section, a separate per-session table with
+its own columns) is folded into the two pieces above or dropped as
+redundant with them.
+
+Per-session context (extrinsics/target paths, which sessions were skipped
+and why, plane-fit RMS at the moment each session's reference was completed)
+stays, but as short context lines, not another full table.
 
 No chart this round -- raised and discussed: the "measured" values plotted
-would still be genuine relative-depth quantities (plane-to-cell and
-cell-to-cell differences, never a raw absolute Z; see the 2026-08-24 design's
-"Two comparisons, not one" section), so it wasn't a correctness concern, but
-it's lower priority than the two real bugs and can be added later once real
-sessions confirm the fix.
+would still be genuine relative-depth quantities (block-to-plane and
+block-to-block differences, never a raw absolute Z; see the 2026-08-24
+design's "Two comparisons, not one" section), so it wasn't a correctness
+concern, but it's lower priority than the two real bugs and can be added
+later once real sessions confirm the fix.
 
 ## Interfaces
 
@@ -185,12 +232,13 @@ Changed:
   - Interactive flow rewritten around the new hooks, replacing
     `_prompt_cell_labels` (deleted).
   - `measure_depth_session` groups clicks by label before building the
-    pairwise table (see Method 3); its return dict gains `cell_samples` and
-    `cell_repeatability_rms_mm` per cell.
+    pairwise table (see Method 3); its return dict gains `block_samples` and
+    `block_repeatability_rms_mm` per block.
   - `--cell` CLI flag changes from `ROW,COL,AX,AY,BX,BY` to
     `HEIGHT,AX,AY,BX,BY`, so scripted and interactive sessions identify a
-    cell the same way. `--ref` is unchanged (corners carry no label).
-  - `write_report` adds the headline line and the two new per-cell columns.
+    block the same way. `--ref` is unchanged (corners carry no label).
+  - `write_report` rewritten around the leaner structure in "Reporting"
+    above: headline line, one core per-block table, the pairwise scale fit.
 
 Unchanged: everything about `--ref`, the plane fit itself
 (`fit_plane_3d`/`perpendicular_distance_to_plane`), the annotated-JPEG output,
