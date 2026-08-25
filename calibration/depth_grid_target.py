@@ -55,6 +55,13 @@ class DepthGridTarget:
             raise ValueError("heights_mm rows must all be the same length")
         if any(height < 0.0 for row in self.heights_mm for height in row):
             raise ValueError("heights_mm must not contain negative heights")
+        flat_heights = [height for row in self.heights_mm for height in row]
+        if len(set(flat_heights)) != len(flat_heights):
+            raise ValueError(
+                "heights_mm must not contain duplicate heights -- block "
+                "identification by engraved height requires every height to "
+                "be unique"
+            )
         if self.pitch_mm <= 0.0:
             raise ValueError(f"pitch_mm must be positive, got {self.pitch_mm}")
         if self.reference_corner_count < 3:
@@ -77,6 +84,23 @@ class DepthGridTarget:
 
     def height_at(self, row: int, col: int) -> float:
         return self.heights_mm[row][col]
+
+    def cell_at_height(self, height_mm: float, tol: float = 1e-6) -> Tuple[int, int]:
+        """Reverse lookup: which (row, col) carries this engraved height.
+
+        Every height in the grid is unique (enforced in __post_init__), so
+        this is well-defined. Raises with the sorted list of valid heights on
+        a miss, since a typo here would otherwise be silently indistinguishable
+        from a real measurement.
+        """
+        for row in range(self.row_count):
+            for col in range(self.col_count):
+                if abs(self.heights_mm[row][col] - height_mm) <= tol:
+                    return row, col
+        valid = sorted({height for row in self.heights_mm for height in row})
+        raise ValueError(
+            f"no block at height {height_mm} mm (tol {tol}); valid heights: {valid}"
+        )
 
     def pair_depths_mm(
         self, cells: Sequence[Tuple[int, int]],
