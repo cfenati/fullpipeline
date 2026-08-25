@@ -15,10 +15,12 @@ per session::
     a plane through them (this is the depth datum, NOT any assumed camera-
     to-plate standoff -- the plate's mounting angle to the camera is
     unknown and is never trusted)
-    click every grid cell you can see (some may be self-occluded from one
-    or both cameras -- that is expected, not a failure; see the target's
-    module docstring) -> triangulate -> signed perpendicular distance from
-    each cell's point to the fitted plane
+    click a block, type the height engraved on it when prompted (repeat
+    clicks on the same block are repeatability samples, not new blocks;
+    some blocks may be self-occluded from one or both cameras -- that is
+    expected, not a failure; see the target's module docstring) ->
+    triangulate -> signed perpendicular distance from each block's point
+    to the fitted plane
     compare cell-to-cell separations against the target's known height
     differences -- this is "relative depth": it never depends on where the
     plate sits relative to the camera, only on differences between points,
@@ -39,8 +41,8 @@ Two comparisons are reported per cell, deliberately different quantities:
     in where the fitted plane sits -- only the SEPARATION between cells
     matters, exactly like the line ladder's own pairwise gaps.
 
-``cell_measured_mm`` vs the target's ``heights_mm[row][col]`` (plane-to-cell)
-    Not used for the scale fit (a 0.6 mm cell barely moves a multiplicative
+``block_measured_mm`` vs the target's ``heights_mm[row][col]`` (plane-to-block)
+    Not used for the scale fit (a 0.6 mm block barely moves a multiplicative
     fit), but the most direct check, and the only one of the two that can
     expose a systematic bias in the plane fit itself.
 
@@ -134,6 +136,8 @@ def measure_depth_session(
     cell_clicks_b: np.ndarray,
     extrinsics: StereoExtrinsics,
     target: DepthGridTarget,
+    ref_offsets_px: Optional[np.ndarray] = None,
+    cell_offsets_px: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """Fit the baseplate plane from the reference clicks, then measure every
     labeled block's signed perpendicular distance to it.
@@ -144,7 +148,18 @@ def measure_depth_session(
     second block -- clicks are grouped by label before any pairwise or
     scale-fit computation runs, so a pairwise truth of 0 mm (which broke the
     scale fit before this rewrite) can no longer happen from a mislabeled
-    repeat.
+    repeat. The raw (undeduplicated) per-click labels and measured values are
+    also returned, alongside the deduplicated per-block summary, so
+    ``aggregate_depth_results`` can pool true click-to-click repeatability
+    across sessions.
+
+    ``ref_offsets_px``/``cell_offsets_px``, when provided (the interactive
+    path), override the epipolar-offset diagnostic recomputed below from the
+    already-snapped clicks with the real pre-snap value captured by
+    ``run_interactive``. When ``None`` (the non-interactive ``--ref``/
+    ``--cell`` path), the function falls back to its existing
+    ``triangulate_clicks``-based computation, which is correct there since
+    those clicks are genuinely raw.
     """
     ref_clicks_a = np.asarray(ref_clicks_a, dtype=np.float64).reshape(-1, 2)
     ref_clicks_b = np.asarray(ref_clicks_b, dtype=np.float64).reshape(-1, 2)
@@ -222,13 +237,21 @@ def measure_depth_session(
         "block_measured_mm": block_measured_mm,
         "block_samples": block_samples,
         "block_repeatability_rms_mm": block_repeatability_list,
+        "raw_labels": list(cell_labels),
+        "raw_measured_mm": cell_measured_mm,
         "pairs": pairs,
         "pair_truth_mm": pair_truth_mm,
         "pair_measured_mm": pair_measured_mm,
         "plane_rms_mm": plane_rms_m * 1000.0,
         "plane_point_count": len(ref_clicks_a),
-        "ref_epipolar_offset_max_px": float(np.max(ref_result["epipolar_offset_px"])),
-        "cell_epipolar_offset_max_px": float(np.max(cell_result["epipolar_offset_px"])),
+        "ref_epipolar_offset_max_px": (
+            float(np.max(ref_offsets_px)) if ref_offsets_px is not None
+            else float(np.max(ref_result["epipolar_offset_px"]))
+        ),
+        "cell_epipolar_offset_max_px": (
+            float(np.max(cell_offsets_px)) if cell_offsets_px is not None
+            else float(np.max(cell_result["epipolar_offset_px"]))
+        ),
         "order_mismatch_count": order_mismatch_count,
         "depth_mean_m": float(np.mean(all_points_m[:, 2])),
         "ref_clicks_a": ref_clicks_a,
@@ -245,12 +268,11 @@ def aggregate_depth_results(
 ) -> Dict[str, Any]:
     """Pool per-session pairwise and per-block measurements, then fit scale.
 
-    Each session already deduplicates repeat clicks on the same block into
-    one mean (measure_depth_session) -- this pools those per-session means
-    across sessions, so the reported repeatability_rms_mm answers "if I
-    measure this block on separate occasions, how much does the answer
-    vary," on top of (not instead of) each session's own within-session
-    block_repeatability_rms_mm.
+    The per-block table pools every RAW click across every session directly
+    (not each session's own per-block mean), so repeatability_rms_mm
+    reflects true click-to-click spread -- whether those repeat clicks
+    happened within one session or were split across several, whichever
+    occurred.
     """
     scored = [result for result in results if "skipped" not in result]
 
@@ -272,11 +294,11 @@ def aggregate_depth_results(
 
     block_buckets: Dict[Tuple[int, int], List[float]] = {}
     for result in scored:
-        for label, measured in zip(result["block_labels"], result["block_measured_mm"]):
+        for label, measured in zip(result["raw_labels"], result["raw_measured_mm"]):
             block_buckets.setdefault(tuple(label), []).append(float(measured))
 
     per_block: List[Dict[str, Any]] = []
-    for label in sorted(block_buckets):
+    for label in sorted(block_buckets, key=lambda entry: target.height_at(*entry)):
         truth = target.height_at(*label)
         values = np.asarray(block_buckets[label], dtype=np.float64)
         mean = float(values.mean())
@@ -456,13 +478,18 @@ class LabelingSession:
     instant the last one completes, then prompts for each subsequent
     block's engraved height and grades it immediately against that plane --
     replacing the old blind, post-hoc, click-order-matched labeling prompt.
+
+    Labels are keyed by click INDEX, not appended positionally: a click
+    whose prompt is aborted (Ctrl-C/Ctrl-D) or never reaches a valid answer
+    simply has no entry, rather than shifting every later label's position
+    and silently mislabeling a subsequent click after an undo.
     """
 
     def __init__(self, target: DepthGridTarget) -> None:
         self.target = target
         self.n_ref = target.reference_corner_count
-        self.labels: List[Tuple[int, int]] = []
-        self.samples: Dict[Tuple[int, int], List[float]] = {}
+        self.labels: Dict[int, Tuple[int, int]] = {}
+        self.measured_by_index: Dict[int, float] = {}
         self.plane: Optional[Tuple[np.ndarray, np.ndarray]] = None
 
     def on_point(self, index: int, result: Dict[str, Any]) -> None:
@@ -486,7 +513,11 @@ class LabelingSession:
         ) * 1000.0
 
         while True:
-            raw = input("  engraved height (mm) on this block > ").strip()
+            try:
+                raw = input("  engraved height (mm) on this block > ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("  no label entered -- this click will be skipped")
+                return
             try:
                 height = float(raw)
                 label = self.target.cell_at_height(height)
@@ -495,9 +526,11 @@ class LabelingSession:
                 continue
             break
 
-        self.labels.append(label)
-        history = self.samples.setdefault(label, [])
-        history.append(measured_mm)
+        self.labels[index] = label
+        self.measured_by_index[index] = measured_mm
+        history = [
+            self.measured_by_index[i] for i, other in self.labels.items() if other == label
+        ]
         if len(history) == 1:
             print(f"  {height}mm: measured {measured_mm:.3f}mm "
                   f"(delta {measured_mm - height:+.3f}mm)")
@@ -508,12 +541,10 @@ class LabelingSession:
                   f"(spread so far: {spread:.4f}mm rms)")
 
     def on_undo(self, new_count: int) -> None:
-        n_labels = max(0, new_count - self.n_ref)
-        removed = self.labels[n_labels:]
-        self.labels = self.labels[:n_labels]
-        for label in removed:
-            if self.samples.get(label):
-                self.samples[label].pop()
+        self.labels = {i: label for i, label in self.labels.items() if i < new_count}
+        self.measured_by_index = {
+            i: value for i, value in self.measured_by_index.items() if i < new_count
+        }
         if new_count < self.n_ref:
             self.plane = None
 
@@ -655,6 +686,8 @@ def main() -> int:
                 raise SystemExit(str(exc))
             cell_clicks_a = np.array([[cell[1], cell[2]] for cell in args.cell])
             cell_clicks_b = np.array([[cell[3], cell[4]] for cell in args.cell])
+            ref_offsets_px = None
+            cell_offsets_px = None
         else:
             print(f"{label}: click the {target.reference_corner_count} reference corners "
                   "first (any order among themselves) -- the plane fits itself in as soon "
@@ -671,7 +704,7 @@ def main() -> int:
             )
             n_ref = target.reference_corner_count
             total_clicks = len(raw_result.get("clicks_a", [])) if raw_result else 0
-            if total_clicks < n_ref + 1:
+            if total_clicks < n_ref + 1 or not session.labels:
                 results.append({
                     "label": label,
                     "skipped": f"fewer than {n_ref} reference + 1 labeled block click",
@@ -680,14 +713,22 @@ def main() -> int:
                 continue
             ref_clicks_a = np.array(raw_result["clicks_a"][:n_ref])
             ref_clicks_b = np.array(raw_result["clicks_b_snapped"][:n_ref])
-            cell_labels = session.labels
-            cell_clicks_a = np.array(raw_result["clicks_a"][n_ref:])
-            cell_clicks_b = np.array(raw_result["clicks_b_snapped"][n_ref:])
+            ref_offsets_px = np.array(raw_result["epipolar_offset_px"][:n_ref])
+            labeled_indices = sorted(session.labels)
+            cell_labels = [session.labels[i] for i in labeled_indices]
+            cell_clicks_a = np.array([raw_result["clicks_a"][i] for i in labeled_indices])
+            cell_clicks_b = np.array(
+                [raw_result["clicks_b_snapped"][i] for i in labeled_indices]
+            )
+            cell_offsets_px = np.array(
+                [raw_result["epipolar_offset_px"][i] for i in labeled_indices]
+            )
 
         try:
             measured = measure_depth_session(
                 ref_clicks_a, ref_clicks_b, cell_labels, cell_clicks_a, cell_clicks_b,
                 extrinsics, target,
+                ref_offsets_px=ref_offsets_px, cell_offsets_px=cell_offsets_px,
             )
         except ValueError as exc:
             results.append({"label": label, "skipped": str(exc)})

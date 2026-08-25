@@ -21,8 +21,10 @@ Unlike the line ladder, the number of points measured in a session is not
 fixed. This target's own rig-specific geometry (a 30 mm height range packed
 into a 50 mm footprint) makes self-occlusion from one or both cameras a real
 possibility for some cells -- a session that only measures 15 of the grid's
-cells is a normal, valid result, not a partial failure. Correspondences are
-therefore keyed by ``(row, col)`` grid index, not by click order or count.
+cells is a normal, valid result, not a partial failure. Internally
+correspondences are keyed by ``(row, col)`` grid index (never by click
+order or count), but the user-facing identity is the height engraved on
+each block -- ``cell_at_height`` resolves one to the other.
 """
 
 from __future__ import annotations
