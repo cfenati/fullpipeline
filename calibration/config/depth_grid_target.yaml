@@ -1,0 +1,63 @@
+# Depth-grid target used by check_depth_accuracy.py to validate this rig's
+# RELATIVE stereo depth precision (delta-Z between known points). This does
+# NOT validate absolute depth (distance from camera) -- only depth
+# differences, measured against the plane fitted through the 4 corner
+# reference fiducials. See docs/superpowers/specs/2026-08-24-check-depth-
+# accuracy-design.md for the full rationale.
+target_type: depth_grid
+
+# ---------------------------------------------------------------------------
+# PLACEHOLDERS. Replace with the AS-PRINTED block heights measured with
+# calipers after fabrication, not the values sent to the printer. Everything
+# downstream is graded against these -- a wrong value here is
+# indistinguishable from a real depth-precision error.
+# ---------------------------------------------------------------------------
+#
+# Row-major, [row][col], mm above the fitted reference plane. This is NOT the
+# left-to-right column order the design was first sketched in: it is
+# mirrored so the tallest column (originally the rightmost, 10-30 mm) sits at
+# col 0 instead of col 4. That flip was required -- verified with a
+# ray-box occlusion check against this rig's ACTUAL calibrated K/R/T
+# (baseline 49.93 mm, convergence 17.66 deg): the un-mirrored layout leaves
+# one cell (the 9.0 mm block next to the 30 mm block) shadowed from camera B,
+# because camera B sits offset toward +X and its oblique rays graze past the
+# tall column into its shorter neighbour. Mirrored, the sweep (base standoff
+# 170-185 mm, +-5 mm lateral offset in both axes) shows 0/25 cells occluded
+# from either camera -- not just the nominal pose, a robust margin around it.
+# Do not reorder these columns without rerunning that check.
+heights_mm:
+  - [10.0, 5.6, 3.2, 1.6, 0.6]
+  - [16.0, 6.0, 3.6, 1.8, 0.8]
+  - [20.0, 7.0, 4.0, 2.0, 1.0]
+  - [26.0, 8.0, 4.6, 2.4, 1.2]
+  - [30.0, 9.0, 5.0, 2.8, 1.4]
+
+# Centre-to-centre spacing between adjacent blocks. Confirmed: 50x50 mm
+# footprint over a 5x5 grid, tiling edge-to-edge with no gap.
+pitch_mm: 10.0
+
+# Flush (zero-height), non-collinear fiducials at the 4 grid corners, used
+# ONLY to fit the reference plane -- never graded against a known height
+# themselves, since the fitted plane through them IS the datum (0 mm by
+# definition). Mathematical minimum is 3; shipping at 4 keeps plane_rms_mm a
+# genuine diagnostic instead of an always-zero fit. Small pads (~4x4 mm),
+# not a full border, to keep the total footprint close to 50x50 mm -- this
+# rig's vertical FOV (23.92 deg) leaves little margin for a wider plate.
+reference_corner_count: 4
+
+# 1-sigma caliper uncertainty on each block height. Must be well below the
+# depth-precision effect being characterised.
+height_uncertainty_mm: 0.05
+
+# How ground truth was established. Update this once the grid is fabricated
+# and independently measured with calipers -- do NOT trust CAD/nominal
+# values, mirroring line_target.yaml's own provenance caveat.
+measured_by: "nominal (CAD) -- NOT verified"
+
+# Mounting guidance (not read by the script, recorded here for whoever
+# positions the target during a capture session): stand the grid off so the
+# TALLEST block tip sits at ~148-150 mm from camera A and the BASE sits at
+# ~178-180 mm. This centres the 30 mm height span inside the rig's confirmed
+# 0.13-0.19 m working window with margin at both ends, and keeps the
+# vertical FOV half-angle needed (~9.8 deg at 150 mm) under the ~12.0 deg
+# limit -- pushing the tip to the 130 mm edge would leave almost none.

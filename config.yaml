@@ -73,23 +73,34 @@ geometric_calibration:
   # comparing recovered corner-to-corner distances against the board's known
   # square size catches that in a way in-sample reprojection error cannot.
   cross_validation_captures: captures/cross-validation
+  # Independent metric ruler for check_line_accuracy.py. cross_validation_captures
+  # above holds out board *poses* but reuses the same board, with the same nominal
+  # square_size_m that set the fit's scale in the first place - so a mis-measured
+  # square cancels out exactly and reports zero error. It grades repeatability, not
+  # scale. This ladder is a separately fabricated plate whose gaps were measured
+  # with a different instrument, which is the only thing here that can catch a
+  # systematic scale error in every length the rig reports.
+  line_target: calibration/config/line_target.yaml
+  line_target_captures: captures/line_target
+
+  # Depth-grid target for check_depth_accuracy.py: validates RELATIVE stereo
+  # depth precision (delta-Z), the axis the line ladder above cannot touch
+  # since it's flat and depth-agnostic by construction.
+  depth_grid_target: calibration/config/depth_grid_target.yaml
+  depth_grid_target_captures: captures/depth_target
+
   extrinsics_rgb_cam1_rgb_cam2: calibration/results/stereo_rgb_cam1_rgb_cam2/extrinsics.json
 
 registration:
-  # Generate with: python register_pipeline.py --session captures/<session>
+  # Generate with: python register_board.py / register_features.py --session captures/<session>
   output_dir: registration/results
-  # Subject working-plane depth (metres). Used as the plane-sweep's fallback
-  # depth for pixels whose match is untrustworthy (see register_pipeline.py's
-  # filled_mask). Prefer this over the ChArUco board distance in
-  # extrinsics.json — board depth is only a last-resort fallback.
-  # 0.168 = midpoint of the confirmed 0.13-0.19 m subject working range
-  # (matches stereo_10's own board mean of 0.168 m — was 0.213, stale from
-  # before that range was pinned down and past its far edge).
+  # Midpoint of the confirmed 0.13-0.19 m subject working range. Used only as
+  # stereoRectify's reference_depth (principal-point alignment), never as a
+  # per-pixel Z. Every Z comes from triangulation (see triangulate.py).
   default_depth: 0.168
-  # Plane-sweep depth range (metres): register_pipeline.py's default
-  # --depth-min/--depth-max, i.e. the near/far edges of the candidate depths
-  # it searches. Padded slightly around the confirmed 0.13-0.19 m subject
-  # working range so real depth variation near the edges isn't clipped.
+  # Chirality / plausibility window on triangulated Z (metres). Padded
+  # slightly around the confirmed 0.13-0.19 m subject working range so real
+  # depth variation near the edges isn't clipped. Not a plane to project onto.
   depth_range: [0.11, 0.21]
   # cv2.stereoRectify free-scaling parameter: 0 crops to pixels valid in both
   # frames, 1 keeps everything (black borders). At the current as-built pose

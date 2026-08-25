@@ -965,12 +965,24 @@ def rectify(
     extrinsics: StereoExtrinsics,
     alpha: float = 0.0,
     reference_depth: Optional[float] = None,
+    zero_disparity: bool = True,
 ) -> Rectification:
     """Row-align the pair so a match differs only in its horizontal coordinate.
 
     ``alpha = 0`` keeps only pixels valid in both frames; ``alpha = 1`` keeps
     everything and leaves black borders. A strongly converging pair loses a lot of
     frame here, which is itself a useful verdict on the geometry.
+
+    ``zero_disparity`` (``cv2.CALIB_ZERO_DISPARITY``) forces the two principal
+    points to coincide, so a point at infinity has zero disparity. For a pair
+    converged on a close working plane nothing is near infinity, and enforcing
+    it makes ``cv2.stereoRectify`` size the canvas to the union of two mirrored
+    trapezoids to keep that property - on this rig's ~18 deg toe-in that roughly
+    halves ``valid_fraction`` at alpha=1.0 versus leaving it off (measured: ~35%
+    vs ~64% for camera A). Turning it off lets OpenCV shift the principal points
+    to cover the pair's actual image content instead, at the cost of a nonzero,
+    depth-dependent ``disparity_at_infinity_px`` that downstream disparity-range
+    budgeting (matcher search window, network ``max_disp``) must account for.
 
     ``cv2.stereoRectify`` always puts the rectified horizontal axis along the
     baseline. For a pair mounted one above the other that turns the images on
@@ -1009,7 +1021,7 @@ def rectify(
         (width, height),
         R_b,
         T_b.reshape(3, 1),
-        flags=cv2.CALIB_ZERO_DISPARITY,
+        flags=cv2.CALIB_ZERO_DISPARITY if zero_disparity else 0,
         alpha=alpha,
         newImageSize=output_size,
     )

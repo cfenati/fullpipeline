@@ -1,0 +1,46 @@
+# Parallel-line ladder used by check_line_accuracy.py to check that pixels convert
+# to millimetres correctly. This target is never used to fit calibration -- it is
+# the independent ruler the fitted calibration gets graded against.
+target_type: line_ladder
+
+# Vertical, because the stereo baseline T = [-49.1, 0.09, 9.10] mm is nearly pure-X,
+# so epipolar lines run nearly horizontal. A point on a line in camera A is located
+# in camera B by intersecting its epipolar line with the same line in B; vertical
+# target lines cross those epipolar lines near 90 deg, which is the well-conditioned
+# case. Horizontal lines would be near-degenerate and the intersection would slide.
+orientation: vertical
+
+# ---------------------------------------------------------------------------
+# PLACEHOLDERS. Replace with the AS-MARKED plate measured with calipers or an
+# optical comparator, not the numbers sent to the laser. Everything downstream
+# is graded against these, so a wrong value here is indistinguishable from a
+# calibration error -- exactly the failure this script exists to catch.
+# ---------------------------------------------------------------------------
+#
+# Centre-to-centre gaps between consecutive lines. Line count is len(gaps_mm) + 1.
+#
+# Strictly increasing on purpose: with equal gaps the ladder looks identical
+# shifted by one line, so a line lost off the edge of the frame would silently
+# renumber every distance. Increasing gaps pin the indexing and fix which end
+# is which.
+#
+# Span (sum) is 45 mm deliberately. Camera A sees only ~87 x 66 mm at the 0.155 m
+# mean working depth, and the stereo overlap is smaller still at 17.6 deg vergence,
+# so a wider ladder would not stay fully inside both views across 0.12-0.18 m.
+gaps_mm: [3.0, 5.0, 8.0, 10.0, 19.0]
+
+# Marked line width. ~1 mm is ~53 px at working distance: wide enough that both
+# of its edges are found cleanly, narrow enough that six lines plus margin fit.
+# The value is documentation only -- distances are measured between the midlines
+# of each line's two edges, so kerf and marking width cancel out.
+line_width_mm: 20.0
+
+# 1-sigma uncertainty on gaps_mm. This is the accuracy ceiling of the whole
+# experiment: it must be well below the effect being measured. Laser positioning
+# of ~0.05 mm over the 45 mm span is ~0.11 %, enough to resolve the 0.2-0.5 %
+# scale error a mis-measured ChArUco square would cause -- but only if the plate
+# is actually verified rather than assumed.
+gaps_uncertainty_mm: 0.05
+
+# How ground truth was established. Update this when the plate is measured.
+measured_by: "nominal (CAD) -- NOT verified"

@@ -1,0 +1,728 @@
+#!/usr/bin/env python3
+"""Check this rig's RELATIVE stereo depth (Z-axis) precision.
+
+``check_line_accuracy.py`` validates lateral (X-Y) triangulation accuracy using
+a flat line-ladder plate -- but a flat, fronto-parallel target has ~zero depth
+variation across it by construction, so it can never touch the depth axis,
+which is driven by different error sources entirely (stereo disparity
+precision, baseline, convergence) than in-plane accuracy.
+
+This script does the depth-axis equivalent, using ``calibration/
+depth_grid_target.py``'s grid of blocks at known, distinct heights. Method,
+per session::
+
+    click 4 flush corner fiducials on the baseplate -> triangulate -> fit
+    a plane through them (this is the depth datum, NOT any assumed camera-
+    to-plate standoff -- the plate's mounting angle to the camera is
+    unknown and is never trusted)
+    click every grid cell you can see (some may be self-occluded from one
+    or both cameras -- that is expected, not a failure; see the target's
+    module docstring) -> triangulate -> signed perpendicular distance from
+    each cell's point to the fitted plane
+    compare cell-to-cell separations against the target's known height
+    differences -- this is "relative depth": it never depends on where the
+    plate sits relative to the camera, only on differences between points,
+    which sidesteps the camera's unknown internal optical-centre offset
+
+Why relative, not absolute. ``measure_points.py``'s ``depth_mm`` is a single
+triangulated point's raw Z in camera A's optical frame -- useful, but it is
+not comparable to a physical "height" unless the camera's Z axis happens to
+be aligned with it, which this rig's 17.66 deg convergence angle guarantees
+it is not. Comparing DIFFERENCES between two triangulated points removes that
+whole problem, the same way the line ladder's gaps are relative distances,
+never an absolute plate position.
+
+Two comparisons are reported per cell, deliberately different quantities:
+
+``pair_measured_mm`` vs ``pair_truth_mm`` (cell-to-cell)
+    The headline number, fed to the scale fit. Immune to any constant offset
+    in where the fitted plane sits -- only the SEPARATION between cells
+    matters, exactly like the line ladder's own pairwise gaps.
+
+``cell_measured_mm`` vs the target's ``heights_mm[row][col]`` (plane-to-cell)
+    Not used for the scale fit (a 0.6 mm cell barely moves a multiplicative
+    fit), but the most direct check, and the only one of the two that can
+    expose a systematic bias in the plane fit itself.
+
+Usage:
+    python check_depth_accuracy.py --captures captures/depth_target
+    python check_depth_accuracy.py --session captures/depth_target/<timestamp>
+    python check_depth_accuracy.py --session captures/depth_target/<timestamp> \\
+        --ref 100,200,90,205 --ref 900,200,890,205 \\
+        --ref 100,900,90,905 --ref 900,900,890,905 \\
+        --cell 0,0,300,400,290,405 --cell 4,4,700,600,690,605   # non-interactive
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Sequence, Tuple
+
+import cv2
+import numpy as np
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from calibrate_cameras import load_config, resolve_path  # noqa: E402
+from calibration.depth_grid_target import (  # noqa: E402
+    DEFAULT_DEPTH_GRID_TARGET_CONFIG,
+    DepthGridTarget,
+)
+from calibration.stereo import StereoExtrinsics, collect_session_pairs  # noqa: E402
+from check_line_accuracy import fit_scale  # noqa: E402
+from measure_points import (  # noqa: E402
+    DEFAULT_BLOB_RADIUS_PX,
+    DEFAULT_LOUPE_ZOOM,
+    DEFAULT_MAX_WINDOW,
+    annotate as annotate_points,
+    measure_points as triangulate_clicks,
+    parse_point,
+    run_interactive,
+)
+from registration_io import default_extrinsics_path, undistort_pair  # noqa: E402
+
+DEFAULT_DEPTH_TARGET_CAPTURES = "captures/depth_target"
+DEFAULT_OUTPUT_SUBDIR = "depth_accuracy"
+
+
+# --------------------------------------------------------------------------- #
+# Geometry: one dimension up from check_line_accuracy's line fit
+# --------------------------------------------------------------------------- #
+
+def fit_plane_3d(points: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
+    """PCA plane fit. Returns centroid, unit normal, and RMS distance to plane.
+
+    One dimension up from check_line_accuracy.fit_line_3d: there the fitted
+    direction is the LARGEST singular vector (a line's tangent). Here the
+    normal is the SMALLEST singular vector -- the direction of least
+    variance across points that are meant to be coplanar.
+    """
+    points = np.asarray(points, dtype=np.float64)
+    if len(points) < 3:
+        raise ValueError(f"need at least 3 points to fit a plane, got {len(points)}")
+    centroid = points.mean(axis=0)
+    centred = points - centroid
+    _, _, vt = np.linalg.svd(centred, full_matrices=False)
+    normal = vt[-1] / np.linalg.norm(vt[-1])
+    residual = centred @ normal
+    return centroid, normal, float(np.sqrt(np.mean(residual ** 2)))
+
+
+def perpendicular_distance_to_plane(
+    point: np.ndarray, plane_centroid: np.ndarray, plane_normal: np.ndarray,
+) -> float:
+    """Signed perpendicular distance from a point to a fitted plane."""
+    offset = np.asarray(point, dtype=np.float64) - np.asarray(plane_centroid, dtype=np.float64)
+    return float(offset @ plane_normal)
+
+
+# --------------------------------------------------------------------------- #
+# Measurement
+# --------------------------------------------------------------------------- #
+
+def measure_depth_session(
+    ref_clicks_a: np.ndarray,
+    ref_clicks_b: np.ndarray,
+    cell_labels: Sequence[Tuple[int, int]],
+    cell_clicks_a: np.ndarray,
+    cell_clicks_b: np.ndarray,
+    extrinsics: StereoExtrinsics,
+    target: DepthGridTarget,
+) -> Dict[str, Any]:
+    """Fit the baseplate plane from the reference clicks, then measure each
+    clicked cell's signed perpendicular distance to it.
+
+    ``cell_labels`` pairs 1:1 by index with ``cell_clicks_a``/``cell_clicks_b``
+    -- that pairing IS the correspondence, not click order. Unlike the line
+    ladder, there is no fixed count: however many cells were visible and
+    clicked this session is what gets measured.
+    """
+    ref_clicks_a = np.asarray(ref_clicks_a, dtype=np.float64).reshape(-1, 2)
+    ref_clicks_b = np.asarray(ref_clicks_b, dtype=np.float64).reshape(-1, 2)
+    cell_clicks_a = np.asarray(cell_clicks_a, dtype=np.float64).reshape(-1, 2)
+    cell_clicks_b = np.asarray(cell_clicks_b, dtype=np.float64).reshape(-1, 2)
+
+    if len(ref_clicks_a) != target.reference_corner_count:
+        raise ValueError(
+            f"expected {target.reference_corner_count} reference clicks, "
+            f"got {len(ref_clicks_a)}"
+        )
+    if not (len(cell_labels) == len(cell_clicks_a) == len(cell_clicks_b)):
+        raise ValueError("cell_labels, cell_clicks_a, cell_clicks_b must be the same length")
+    if len(cell_labels) < 2:
+        raise ValueError(
+            f"need at least 2 cells to measure a depth difference, got {len(cell_labels)}"
+        )
+
+    ref_result = triangulate_clicks(ref_clicks_a, ref_clicks_b, extrinsics)
+    reference_points_mm = np.asarray(ref_result["points_mm"], dtype=np.float64)
+    centroid, normal, plane_rms_m = fit_plane_3d(reference_points_mm / 1000.0)
+    # Orient toward camera A's optical centre (the origin in this frame), so a
+    # block protruding toward the camera reads a POSITIVE depth, matching the
+    # target's own height_mm sign convention.
+    if normal @ (-centroid) < 0.0:
+        normal = -normal
+
+    cell_result = triangulate_clicks(cell_clicks_a, cell_clicks_b, extrinsics)
+    cell_points_mm = np.asarray(cell_result["points_mm"], dtype=np.float64)
+    cell_measured_mm = np.array([
+        perpendicular_distance_to_plane(point / 1000.0, centroid, normal) * 1000.0
+        for point in cell_points_mm
+    ])
+    cell_truth_mm = np.array([target.height_at(row, col) for row, col in cell_labels])
+
+    pairs, pair_truth_mm = target.pair_depths_mm(cell_labels)
+    pair_measured_mm = cell_measured_mm[pairs[:, 1]] - cell_measured_mm[pairs[:, 0]]
+
+    # No automatic pattern check protects click labeling here, unlike the line
+    # ladder's self-checking gaps -- this is a cheap, non-fatal warning, not a
+    # guarantee: rank the clicked cells by their KNOWN heights (all heights in
+    # this target are distinct, so the rank order is well defined) and count
+    # adjacent pairs where the MEASURED order disagrees.
+    rank = np.argsort(cell_truth_mm)
+    ranked_measured = cell_measured_mm[rank]
+    order_mismatch_count = int(np.sum(np.diff(ranked_measured) < 0)) if len(rank) > 1 else 0
+
+    all_points_m = np.concatenate([reference_points_mm, cell_points_mm]) / 1000.0
+
+    return {
+        "cell_labels": list(cell_labels),
+        "cell_truth_mm": cell_truth_mm,
+        "cell_measured_mm": cell_measured_mm,
+        "pairs": pairs,
+        "pair_truth_mm": pair_truth_mm,
+        "pair_measured_mm": pair_measured_mm,
+        "plane_rms_mm": plane_rms_m * 1000.0,
+        "plane_point_count": len(ref_clicks_a),
+        "ref_epipolar_offset_max_px": float(np.max(ref_result["epipolar_offset_px"])),
+        "cell_epipolar_offset_max_px": float(np.max(cell_result["epipolar_offset_px"])),
+        "order_mismatch_count": order_mismatch_count,
+        "depth_mean_m": float(np.mean(all_points_m[:, 2])),
+        "ref_clicks_a": ref_clicks_a,
+        "ref_clicks_b": np.asarray(ref_result["clicks_b_snapped"]),
+        "ref_points_mm": reference_points_mm,
+        "cell_clicks_a": cell_clicks_a,
+        "cell_clicks_b": np.asarray(cell_result["clicks_b_snapped"]),
+        "cell_points_mm": cell_points_mm,
+    }
+
+
+def aggregate_depth_results(
+    results: Sequence[Dict[str, Any]], target: DepthGridTarget,
+) -> Dict[str, Any]:
+    """Pool per-session pairwise and per-cell measurements, then fit scale.
+
+    Structured like check_line_accuracy.aggregate_results (bucket-by-truth
+    pairwise table, pooled scale fit, per-session quality table), adapted:
+    plane_rms_mm/epipolar-offset diagnostics instead of straightness/
+    intersection-angle, plus a per-cell table for the direct plane-to-cell
+    check that isolates plane-fit bias (see module docstring).
+    """
+    scored = [result for result in results if "skipped" not in result]
+
+    pair_buckets: Dict[float, List[float]] = {}
+    for result in scored:
+        for truth, measured in zip(result["pair_truth_mm"], result["pair_measured_mm"]):
+            pair_buckets.setdefault(round(float(truth), 6), []).append(float(measured))
+
+    per_pair: List[Dict[str, Any]] = []
+    for truth in sorted(pair_buckets):
+        values = np.asarray(pair_buckets[truth], dtype=np.float64)
+        mean = float(values.mean())
+        per_pair.append({
+            "truth_mm": truth,
+            "samples": int(values.size),
+            "measured_mean_mm": mean,
+            "error_mm": mean - truth,
+            "error_pct": (mean - truth) / truth * 100.0 if truth else float("nan"),
+        })
+
+    cell_buckets: Dict[Tuple[int, int], List[float]] = {}
+    for result in scored:
+        for label, measured in zip(result["cell_labels"], result["cell_measured_mm"]):
+            cell_buckets.setdefault(tuple(label), []).append(float(measured))
+
+    per_cell: List[Dict[str, Any]] = []
+    for label in sorted(cell_buckets):
+        truth = target.height_at(*label)
+        values = np.asarray(cell_buckets[label], dtype=np.float64)
+        mean = float(values.mean())
+        per_cell.append({
+            "row": label[0], "col": label[1],
+            "truth_mm": truth,
+            "samples": int(values.size),
+            "measured_mean_mm": mean,
+            "error_mm": mean - truth,
+        })
+
+    errors = np.array([entry["error_mm"] for entry in per_pair])
+    relative = np.array([entry["error_pct"] for entry in per_pair])
+
+    flat_truth = np.concatenate([result["pair_truth_mm"] for result in scored])
+    flat_measured = np.concatenate([result["pair_measured_mm"] for result in scored])
+
+    per_session = [{
+        "label": result["label"],
+        "cells_measured": len(result["cell_labels"]),
+        "plane_rms_mm": result["plane_rms_mm"],
+        "plane_point_count": result["plane_point_count"],
+        "ref_epipolar_offset_max_px": result["ref_epipolar_offset_max_px"],
+        "cell_epipolar_offset_max_px": result["cell_epipolar_offset_max_px"],
+        "order_mismatch_count": result["order_mismatch_count"],
+        "depth_mean_m": result["depth_mean_m"],
+        "scale": fit_scale(result["pair_truth_mm"], result["pair_measured_mm"])["scale"],
+    } for result in scored]
+
+    return {
+        "sessions_scored": len(scored),
+        "per_pair": per_pair,
+        "per_cell": per_cell,
+        "per_session": per_session,
+        "scale_fit": fit_scale(flat_truth, flat_measured),
+        "mean_error_mm": float(errors.mean()),
+        "rms_error_mm": float(np.sqrt(np.mean(errors ** 2))),
+        "max_abs_error_mm": float(np.abs(errors).max()),
+        "mean_abs_relative_pct": float(np.nanmean(np.abs(relative))),
+        "max_abs_relative_pct": float(np.nanmax(np.abs(relative))),
+        "plane_rms_mean_mm": float(np.mean([result["plane_rms_mm"] for result in scored])),
+        "depth_mean_m": float(np.mean([result["depth_mean_m"] for result in scored])),
+        "order_mismatch_total": int(sum(result["order_mismatch_count"] for result in scored)),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Output
+# --------------------------------------------------------------------------- #
+
+def write_report(
+    summary: Dict[str, Any],
+    results: Sequence[Dict[str, Any]],
+    target: DepthGridTarget,
+    context: Dict[str, Any],
+    path: Path,
+) -> None:
+    rule = "=" * 78
+    thin = "-" * 78
+    lines = [
+        rule,
+        "DEPTH-GRID RELATIVE ACCURACY",
+        rule,
+        f"extrinsics       : {context['extrinsics']}",
+        f"target           : {context['target']}",
+        f"ground truth     : {target.measured_by}",
+        f"grid             : {target.row_count}x{target.col_count}, "
+        f"pitch {target.pitch_mm:.1f} mm",
+        f"uncertainty      : +/- {target.height_uncertainty_mm:.3f} mm per block",
+        f"reference corners: {target.reference_corner_count}",
+        f"sessions scored  : {summary['sessions_scored']}",
+        f"cameras          : {context['camera_a']} (A) / {context['camera_b']} (B)",
+        "",
+    ]
+
+    skipped = [result for result in results if "skipped" in result]
+    if skipped:
+        lines.extend([thin, "SKIPPED SESSIONS", thin])
+        lines.extend(f"  {result['label']}: {result['skipped']}" for result in skipped)
+        lines.append("")
+
+    for result in results:
+        if "skipped" in result:
+            continue
+        lines.extend([
+            thin,
+            f"SESSION {result['label']}  --  {len(result['cell_labels'])} cells measured, "
+            f"plane fit from {result['plane_point_count']} reference points "
+            f"(rms {result['plane_rms_mm']:.4f} mm)",
+            thin,
+            f"{'cell':<8} {'true mm':>9} {'plane-to-cell mm':>17} {'err mm':>9}",
+        ])
+        order = sorted(
+            range(len(result["cell_labels"])),
+            key=lambda index: result["cell_truth_mm"][index],
+        )
+        for index in order:
+            row, col = result["cell_labels"][index]
+            truth = float(result["cell_truth_mm"][index])
+            measured = float(result["cell_measured_mm"][index])
+            lines.append(
+                f"({row},{col})".ljust(8) + f"{truth:>9.3f} {measured:>17.3f} "
+                f"{measured - truth:>+9.3f}"
+            )
+        if result["order_mismatch_count"]:
+            lines.append(
+                f"  warning: {result['order_mismatch_count']} adjacent pair(s) measured "
+                "out of the known height order -- check for a mislabeled click"
+            )
+        lines.append("")
+
+    fit = summary["scale_fit"]
+    lines.extend([
+        thin,
+        "PAIRWISE SCALE FIT  (the headline number -- cell-to-cell separations, "
+        "immune to any offset in where the reference plane sits)",
+        thin,
+        f"  measured = a * true          a = {fit['scale']:.5f}  "
+        f"-> {fit['scale_error_pct']:+.3f} %",
+        f"  residual after scale         {fit['residual_rms_mm']:.4f} mm rms",
+        f"  measured = a * true + b      a = {fit['affine_slope']:.5f}  "
+        f"({fit['affine_slope_error_pct']:+.3f} %), b = {fit['affine_intercept_mm']:+.4f} mm",
+        f"  residual after affine        {fit['affine_residual_rms_mm']:.4f} mm rms",
+        "",
+        "  a-1 is systematic depth-scale error. A large b points at a fixed",
+        "  plane-fit bias rather than a proportional one.",
+        "",
+        thin,
+        "OVERALL (pairwise)",
+        thin,
+        f"  mean error            {summary['mean_error_mm']:+.4f} mm",
+        f"  rms error             {summary['rms_error_mm']:.4f} mm",
+        f"  max abs error         {summary['max_abs_error_mm']:.4f} mm",
+        f"  mean abs relative     {summary['mean_abs_relative_pct']:.3f} %",
+        f"  max abs relative      {summary['max_abs_relative_pct']:.3f} %",
+        "",
+        thin,
+        "PER-CELL  (plane-to-cell, direct check -- exposes plane-fit bias; not "
+        "used for the scale fit)",
+        thin,
+        f"{'cell':<8} {'true mm':>9} {'mean meas mm':>13} {'err mm':>9} {'n':>4}",
+    ])
+    for entry in summary["per_cell"]:
+        lines.append(
+            f"({entry['row']},{entry['col']})".ljust(8)
+            + f"{entry['truth_mm']:>9.3f} {entry['measured_mean_mm']:>13.3f} "
+            f"{entry['error_mm']:>+9.3f} {entry['samples']:>4}"
+        )
+    lines.extend([
+        "",
+        thin,
+        "MEASUREMENT QUALITY",
+        thin,
+        f"  mean plane RMS         {summary['plane_rms_mean_mm']:.4f} mm "
+        "(reference-point noise within a session)",
+        f"  mean working depth     {summary['depth_mean_m'] * 1000:.1f} mm",
+        f"  order-mismatch total   {summary['order_mismatch_total']} (cells that measured "
+        "out of known height rank -- see PAIRWISE note above; no automatic pattern check "
+        "protects click labeling here, unlike the line ladder's self-checking gaps)",
+        "",
+        thin,
+        "PER SESSION",
+        thin,
+        f"{'session':<24} {'cells':>6} {'depth mm':>9} {'scale %':>9} "
+        f"{'plane rms mm':>13} {'mismatches':>11}",
+    ])
+    for entry in summary["per_session"]:
+        lines.append(
+            f"{entry['label'][:24]:<24} {entry['cells_measured']:>6} "
+            f"{entry['depth_mean_m'] * 1000:>9.1f} "
+            f"{(entry['scale'] - 1) * 100:>+9.3f} "
+            f"{entry['plane_rms_mm']:>13.4f} {entry['order_mismatch_count']:>11}"
+        )
+
+    lines.append("")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+
+def parse_cell(text: str) -> Tuple[int, int, float, float, float, float]:
+    parts = text.replace(" ", "").split(",")
+    if len(parts) != 6:
+        raise argparse.ArgumentTypeError(
+            f"--cell wants ROW,COL,AX,AY,BX,BY, got '{text}'"
+        )
+    try:
+        row, col = int(parts[0]), int(parts[1])
+        ax, ay, bx, by = (float(value) for value in parts[2:])
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"--cell could not parse '{text}': {exc}") from exc
+    return row, col, ax, ay, bx, by
+
+
+def _prompt_cell_labels(count: int, target: DepthGridTarget) -> List[Tuple[int, int]]:
+    """Ask, in click order, which grid cell each non-reference click was.
+
+    run_interactive (measure_points.py) collects clicks anonymously with no
+    hook for per-click metadata, and it is reused here unmodified -- so
+    labeling happens once, right after the session ends, in the same order
+    the points were clicked. The user just clicked them and knows that order.
+    """
+    print(f"\n{count} cell click(s) recorded. Label each one, in the order you clicked "
+          f"it (grid is {target.row_count} rows x {target.col_count} cols, 0-indexed).")
+    labels: List[Tuple[int, int]] = []
+    for index in range(count):
+        while True:
+            raw = input(f"  click {index}: row,col > ").strip()
+            try:
+                row_text, col_text = raw.split(",")
+                row, col = int(row_text), int(col_text)
+                if not (0 <= row < target.row_count and 0 <= col < target.col_count):
+                    raise ValueError
+            except ValueError:
+                print(f"    enter as ROW,COL within 0-{target.row_count - 1},"
+                      f"0-{target.col_count - 1}")
+                continue
+            labels.append((row, col))
+            break
+    return labels
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Check triangulated depth differences against a measured depth-grid "
+                    "target.",
+    )
+    parser.add_argument(
+        "--captures", nargs="+", default=None,
+        help="Directories holding depth-grid capture sessions (default: "
+             "geometric_calibration.depth_grid_target_captures, else "
+             f"{DEFAULT_DEPTH_TARGET_CAPTURES}).",
+    )
+    parser.add_argument(
+        "--session", default=None,
+        help="Restrict to one session folder instead of every session under --captures.",
+    )
+    parser.add_argument("--camera-a", default="rgb_cam1")
+    parser.add_argument("--camera-b", default="rgb_cam2")
+    parser.add_argument("--extrinsics", default=None,
+                        help="Stereo extrinsics JSON (default: geometric_calibration."
+                             "extrinsics_<a>_<b> in config, else "
+                             "calibration/results/stereo_<a>_<b>/extrinsics.json).")
+    parser.add_argument("--target", default=None,
+                        help="Depth grid target YAML (default: geometric_calibration."
+                             f"depth_grid_target in config, else "
+                             f"{DEFAULT_DEPTH_GRID_TARGET_CONFIG}).")
+    parser.add_argument("--ref", type=parse_point, action="append", default=None,
+                        metavar="AX,AY,BX,BY",
+                        help="Non-interactive: one reference-corner click pair, in "
+                             "undistorted full-res pixels. Repeat exactly "
+                             "reference_corner_count times, any order among themselves.")
+    parser.add_argument("--cell", type=parse_cell, action="append", default=None,
+                        metavar="ROW,COL,AX,AY,BX,BY",
+                        help="Non-interactive: one grid-cell click pair, labeled by its "
+                             "(row, col) in the target's heights_mm grid. Repeat for every "
+                             "cell visible this session -- occluded cells are simply "
+                             "omitted, not required.")
+    parser.add_argument("--zoom", type=int, default=DEFAULT_LOUPE_ZOOM,
+                        help="Initial loupe magnification (default: %(default)s).")
+    parser.add_argument("--window", type=int, nargs=2, default=list(DEFAULT_MAX_WINDOW),
+                        metavar=("W", "H"),
+                        help="Window size in pixels (default: %(default)s).")
+    parser.add_argument("--blob-radius", type=int, default=DEFAULT_BLOB_RADIUS_PX,
+                        help="Search radius when snapping a click to a dot's centroid, "
+                             "in full-resolution pixels (default: %(default)s).")
+    parser.add_argument("--blob-snap", action="store_true",
+                        help="Move each click onto the intensity centroid of the marker "
+                             "underneath it. Off by default so a click lands exactly where "
+                             "you put it.")
+    parser.add_argument("--out", "--output", dest="output", default=None,
+                        help="Output directory (default: geometric_calibration.output_dir "
+                             f"in config) / {DEFAULT_OUTPUT_SUBDIR}.")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    geo_config = load_config().get("geometric_calibration", {}) or {}
+    reg_config = load_config().get("registration", {}) or {}
+    depth_range = reg_config.get("depth_range", [0.11, 0.21])
+    depth_range = (float(depth_range[0]), float(depth_range[1]))
+
+    extrinsics_path = resolve_path(
+        args.extrinsics or default_extrinsics_path(args.camera_a, args.camera_b)
+    )
+    if not extrinsics_path.exists():
+        raise SystemExit(f"No stereo extrinsics at {extrinsics_path}.")
+    extrinsics = StereoExtrinsics.load_json(extrinsics_path)
+
+    target_path = resolve_path(
+        args.target or geo_config.get("depth_grid_target", DEFAULT_DEPTH_GRID_TARGET_CONFIG)
+    )
+    target = DepthGridTarget.from_yaml(target_path)
+    all_heights = [height for row in target.heights_mm for height in row]
+    print(f"depth grid: {target.row_count}x{target.col_count}, pitch {target.pitch_mm:.1f} mm, "
+          f"heights {min(all_heights):.1f}-{max(all_heights):.1f} mm, "
+          f"{target.reference_corner_count} reference corners")
+    if "NOT verified" in target.measured_by:
+        print(f"warning: {target_path.name} still carries unverified ground truth "
+              f"({target.measured_by}). Every number below is only as good as that.")
+
+    if args.ref or args.cell:
+        if not args.session:
+            raise SystemExit("--ref/--cell require --session (they supply coordinates for "
+                             "exactly one session).")
+        if args.captures:
+            raise SystemExit("--ref/--cell cannot be combined with --captures.")
+        if not args.ref or len(args.ref) != target.reference_corner_count:
+            raise SystemExit(
+                f"{target_path.name} needs exactly {target.reference_corner_count} --ref "
+                f"clicks, got {len(args.ref) if args.ref else 0}."
+            )
+        if not args.cell or len(args.cell) < 2:
+            raise SystemExit("Need at least 2 --cell clicks to measure a depth difference.")
+        for row, col, *_ in args.cell:
+            if not (0 <= row < target.row_count and 0 <= col < target.col_count):
+                raise SystemExit(
+                    f"--cell {row},{col} is out of range for a {target.row_count}x"
+                    f"{target.col_count} grid."
+                )
+
+    if args.session:
+        session_dir = resolve_path(args.session)
+        paths = [session_dir / f"{camera}.jpg" for camera in (args.camera_a, args.camera_b)]
+        missing = [path.name for path in paths if not path.exists()]
+        if missing:
+            raise SystemExit(f"{session_dir} is missing {', '.join(missing)}.")
+        session_pairs, notes = [(session_dir.name, paths[0], paths[1])], []
+    else:
+        capture_values = args.captures or geo_config.get("depth_grid_target_captures") \
+            or DEFAULT_DEPTH_TARGET_CAPTURES
+        if isinstance(capture_values, str):
+            capture_values = [capture_values]
+        capture_dirs = [resolve_path(value) for value in capture_values]
+        session_pairs, notes = collect_session_pairs(capture_dirs, args.camera_a, args.camera_b)
+    for note in notes:
+        print(note)
+    if not session_pairs:
+        raise SystemExit(f"No {args.camera_a}/{args.camera_b} sessions found.")
+
+    output_dir = resolve_path(
+        args.output or geo_config.get("output_dir", "calibration/results")
+    ) / DEFAULT_OUTPUT_SUBDIR
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    results: List[Dict[str, Any]] = []
+    for label, path_a, path_b in session_pairs:
+        raw_a, raw_b = cv2.imread(str(path_a)), cv2.imread(str(path_b))
+        if raw_a is None or raw_b is None:
+            results.append({"label": label, "skipped": "failed to decode one of the images"})
+            print(f"{label}: skipped: failed to decode")
+            continue
+        image_a, image_b = undistort_pair(raw_a, raw_b, extrinsics)
+
+        if args.ref:
+            ref_clicks_a = np.array([[point[0], point[1]] for point in args.ref])
+            ref_clicks_b = np.array([[point[2], point[3]] for point in args.ref])
+            cell_labels = [(cell[0], cell[1]) for cell in args.cell]
+            cell_clicks_a = np.array([[cell[2], cell[3]] for cell in args.cell])
+            cell_clicks_b = np.array([[cell[4], cell[5]] for cell in args.cell])
+        else:
+            print(f"{label}: click the {target.reference_corner_count} reference corners "
+                  "first (any order among themselves), then click every grid cell you can "
+                  "see -- skip ones you can't. Press q/Esc to finish.")
+            raw_result = run_interactive(
+                image_a, image_b, extrinsics, depth_range,
+                max(2, args.zoom), (int(args.window[0]), int(args.window[1])),
+                max(3, args.blob_radius) if args.blob_snap else 0,
+                float(reg_config.get("default_depth", 0.168)),
+            )
+            n_ref = target.reference_corner_count
+            total_clicks = len(raw_result.get("clicks_a", [])) if raw_result else 0
+            if total_clicks < n_ref + 2:
+                results.append({
+                    "label": label,
+                    "skipped": f"fewer than {n_ref} reference + 2 cell clicks",
+                })
+                print(f"{label}: skipped: not enough points clicked")
+                continue
+            ref_clicks_a = np.array(raw_result["clicks_a"][:n_ref])
+            ref_clicks_b = np.array(raw_result["clicks_b_snapped"][:n_ref])
+            remaining_a = raw_result["clicks_a"][n_ref:]
+            remaining_b = raw_result["clicks_b_snapped"][n_ref:]
+            cell_labels = _prompt_cell_labels(len(remaining_a), target)
+            cell_clicks_a = np.array(remaining_a)
+            cell_clicks_b = np.array(remaining_b)
+
+        try:
+            measured = measure_depth_session(
+                ref_clicks_a, ref_clicks_b, cell_labels, cell_clicks_a, cell_clicks_b,
+                extrinsics, target,
+            )
+        except ValueError as exc:
+            results.append({"label": label, "skipped": str(exc)})
+            print(f"{label}: skipped: {exc}")
+            continue
+
+        measured["label"] = label
+        results.append(measured)
+
+        combined = {
+            "clicks_a": np.vstack([measured["ref_clicks_a"], measured["cell_clicks_a"]]).tolist(),
+            "clicks_b_snapped": np.vstack(
+                [measured["ref_clicks_b"], measured["cell_clicks_b"]]
+            ).tolist(),
+            "points_mm": np.vstack([measured["ref_points_mm"], measured["cell_points_mm"]]).tolist(),
+        }
+        cv2.imwrite(
+            str(output_dir / f"{label}_correspondences.jpg"),
+            annotate_points(image_a, image_b, combined,
+                            (int(args.window[0]), int(args.window[1]))),
+        )
+
+        session_scale = fit_scale(measured["pair_truth_mm"], measured["pair_measured_mm"])
+        print(f"{label}: scale {session_scale['scale_error_pct']:+.3f} %, "
+              f"cells {len(measured['cell_labels'])}, "
+              f"plane rms {measured['plane_rms_mm']:.4f} mm, "
+              f"depth {measured['depth_mean_m'] * 1000:.0f} mm")
+
+    if not any("skipped" not in result for result in results):
+        raise SystemExit("No session could be measured; see the skip reasons above.")
+
+    summary = aggregate_depth_results(results, target)
+    context = {
+        "extrinsics": str(extrinsics_path),
+        "target": str(target_path),
+        "camera_a": args.camera_a,
+        "camera_b": args.camera_b,
+    }
+
+    write_report(summary, results, target, context, output_dir / "report.txt")
+
+    payload = {
+        "extrinsics": str(extrinsics_path),
+        "target": target.to_dict(),
+        "target_path": str(target_path),
+        "summary": summary,
+        "sessions": [
+            {"label": result["label"], "skipped": result["skipped"]}
+            if "skipped" in result else
+            {
+                "label": result["label"],
+                "cell_labels": result["cell_labels"],
+                "cell_truth_mm": result["cell_truth_mm"].tolist(),
+                "cell_measured_mm": result["cell_measured_mm"].tolist(),
+                "pairs": result["pairs"].tolist(),
+                "pair_truth_mm": result["pair_truth_mm"].tolist(),
+                "pair_measured_mm": result["pair_measured_mm"].tolist(),
+                "plane_rms_mm": result["plane_rms_mm"],
+                "plane_point_count": result["plane_point_count"],
+                "ref_epipolar_offset_max_px": result["ref_epipolar_offset_max_px"],
+                "cell_epipolar_offset_max_px": result["cell_epipolar_offset_max_px"],
+                "order_mismatch_count": result["order_mismatch_count"],
+                "depth_mean_m": result["depth_mean_m"],
+            }
+            for result in results
+        ],
+    }
+    with (output_dir / "result.json").open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+
+    fit = summary["scale_fit"]
+    print()
+    print(f"scale error   {fit['scale_error_pct']:+.3f} %  "
+          f"(a = {fit['scale']:.5f}, residual {fit['residual_rms_mm']:.4f} mm rms)")
+    print(f"mean abs err  {summary['mean_abs_relative_pct']:.3f} %  "
+          f"({summary['rms_error_mm']:.4f} mm rms, max {summary['max_abs_error_mm']:.4f} mm)")
+    print(f"Saved report.txt / result.json / *_correspondences.jpg to {output_dir}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
