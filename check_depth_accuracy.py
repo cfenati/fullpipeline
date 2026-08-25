@@ -59,7 +59,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -134,13 +134,16 @@ def measure_depth_session(
     extrinsics: StereoExtrinsics,
     target: DepthGridTarget,
 ) -> Dict[str, Any]:
-    """Fit the baseplate plane from the reference clicks, then measure each
-    clicked cell's signed perpendicular distance to it.
+    """Fit the baseplate plane from the reference clicks, then measure every
+    labeled block's signed perpendicular distance to it.
 
     ``cell_labels`` pairs 1:1 by index with ``cell_clicks_a``/``cell_clicks_b``
-    -- that pairing IS the correspondence, not click order. Unlike the line
-    ladder, there is no fixed count: however many cells were visible and
-    clicked this session is what gets measured.
+    -- that pairing IS the correspondence, not click order. A label repeated
+    across multiple clicks is a repeatability sample of the SAME block, not a
+    second block -- clicks are grouped by label before any pairwise or
+    scale-fit computation runs, so a pairwise truth of 0 mm (which broke the
+    scale fit before this rewrite) can no longer happen from a mislabeled
+    repeat.
     """
     ref_clicks_a = np.asarray(ref_clicks_a, dtype=np.float64).reshape(-1, 2)
     ref_clicks_b = np.asarray(ref_clicks_b, dtype=np.float64).reshape(-1, 2)
@@ -154,10 +157,8 @@ def measure_depth_session(
         )
     if not (len(cell_labels) == len(cell_clicks_a) == len(cell_clicks_b)):
         raise ValueError("cell_labels, cell_clicks_a, cell_clicks_b must be the same length")
-    if len(cell_labels) < 2:
-        raise ValueError(
-            f"need at least 2 cells to measure a depth difference, got {len(cell_labels)}"
-        )
+    if len(cell_labels) < 1:
+        raise ValueError(f"need at least 1 labeled block click, got {len(cell_labels)}")
 
     ref_result = triangulate_clicks(ref_clicks_a, ref_clicks_b, extrinsics)
     reference_points_mm = np.asarray(ref_result["points_mm"], dtype=np.float64)
@@ -174,26 +175,52 @@ def measure_depth_session(
         perpendicular_distance_to_plane(point / 1000.0, centroid, normal) * 1000.0
         for point in cell_points_mm
     ])
-    cell_truth_mm = np.array([target.height_at(row, col) for row, col in cell_labels])
 
-    pairs, pair_truth_mm = target.pair_depths_mm(cell_labels)
-    pair_measured_mm = cell_measured_mm[pairs[:, 1]] - cell_measured_mm[pairs[:, 0]]
+    # Group repeat clicks on the same block into one entry: mean measured
+    # height, sample count, and repeatability RMS (None for a single sample).
+    unique_labels: List[Tuple[int, int]] = []
+    block_measured_list: List[float] = []
+    block_truth_list: List[float] = []
+    block_samples_list: List[int] = []
+    block_repeatability_list: List[Any] = []
+    for label in cell_labels:
+        if label in unique_labels:
+            continue
+        indices = [index for index, other in enumerate(cell_labels) if other == label]
+        samples = cell_measured_mm[indices]
+        unique_labels.append(label)
+        block_measured_list.append(float(samples.mean()))
+        block_truth_list.append(target.height_at(*label))
+        block_samples_list.append(int(samples.size))
+        block_repeatability_list.append(
+            float(np.sqrt(np.mean((samples - samples.mean()) ** 2)))
+            if samples.size > 1 else None
+        )
+    block_measured_mm = np.array(block_measured_list)
+    block_truth_mm = np.array(block_truth_list)
+    block_samples = np.array(block_samples_list)
 
-    # No automatic pattern check protects click labeling here, unlike the line
-    # ladder's self-checking gaps -- this is a cheap, non-fatal warning, not a
-    # guarantee: rank the clicked cells by their KNOWN heights (all heights in
-    # this target are distinct, so the rank order is well defined) and count
-    # adjacent pairs where the MEASURED order disagrees.
-    rank = np.argsort(cell_truth_mm)
-    ranked_measured = cell_measured_mm[rank]
-    order_mismatch_count = int(np.sum(np.diff(ranked_measured) < 0)) if len(rank) > 1 else 0
+    pairs, pair_truth_mm = target.pair_depths_mm(unique_labels)
+    pair_measured_mm = block_measured_mm[pairs[:, 1]] - block_measured_mm[pairs[:, 0]]
+
+    # Best-effort order-mismatch warning, at block granularity: all of the
+    # target's heights are distinct, so the clicked blocks have a well-defined
+    # true rank order to check the measured order against.
+    if len(unique_labels) > 1:
+        rank = np.argsort(block_truth_mm)
+        ranked_measured = block_measured_mm[rank]
+        order_mismatch_count = int(np.sum(np.diff(ranked_measured) < 0))
+    else:
+        order_mismatch_count = 0
 
     all_points_m = np.concatenate([reference_points_mm, cell_points_mm]) / 1000.0
 
     return {
-        "cell_labels": list(cell_labels),
-        "cell_truth_mm": cell_truth_mm,
-        "cell_measured_mm": cell_measured_mm,
+        "block_labels": unique_labels,
+        "block_truth_mm": block_truth_mm,
+        "block_measured_mm": block_measured_mm,
+        "block_samples": block_samples,
+        "block_repeatability_rms_mm": block_repeatability_list,
         "pairs": pairs,
         "pair_truth_mm": pair_truth_mm,
         "pair_measured_mm": pair_measured_mm,
