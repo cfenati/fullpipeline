@@ -466,7 +466,9 @@ def handle_interactive_key(
         if on_undo is not None:
             on_undo(0)
     elif key == ord("n"):
-        if on_advance is not None:
+        if state["pending_a"] is not None:
+            print("  finish or cancel the current click (click in camera B, or press u) before pressing n")
+        elif on_advance is not None:
             prompt = on_advance()
             if prompt is not None:
                 state["text_mode"] = True

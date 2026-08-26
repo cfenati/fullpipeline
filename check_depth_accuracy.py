@@ -15,12 +15,15 @@ per session::
     press n -> triangulate -> fit a plane through them (this is the depth
     datum, NOT any assumed camera-to-plate standoff -- the plate's mounting
     angle to the camera is unknown and is never trusted)
-    click a block's points (even just one; repeat clicks average together
-    for a repeatability sample, not a new block), press n, type its
-    row,col when prompted -- some blocks may be self-occluded from one or
-    both cameras, that is expected, not a failure; see the target's module
-    docstring -> triangulate -> mean perpendicular distance from the
-    block's points to the fitted plane
+    when prompted (immediately after the reference plane fits, and again
+    after every block you finish), type the row,col of the block you're
+    about to measure and press Enter -- then click that block's points
+    (even just one; repeat clicks average together for a repeatability
+    sample, not a new block) and press n: this finalizes the block
+    (mean perpendicular distance from its points to the fitted plane) and
+    immediately reprompts for the NEXT block's row,col. Some blocks may be
+    self-occluded from one or both cameras, that is expected, not a
+    failure; see the target's module docstring
     compare cell-to-cell separations against the target's known height
     differences -- this is "relative depth": it never depends on where the
     plate sits relative to the camera, only on differences between points,
@@ -594,8 +597,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ref", type=parse_point, action="append", default=None,
                         metavar="AX,AY,BX,BY",
                         help="Non-interactive: one reference-corner click pair, in "
-                             "undistorted full-res pixels. Repeat exactly "
-                             "reference_corner_count times, any order among themselves.")
+                             "undistorted full-res pixels. Repeat at least 3 times, any "
+                             "order among themselves.")
     parser.add_argument("--cell", type=parse_cell, action="append", default=None,
                         metavar="ROW,COL,AX,AY,BX,BY",
                         help="Non-interactive: one block click pair, labeled by its "
@@ -642,7 +645,7 @@ def main() -> int:
     all_heights = [height for row in target.heights_mm for height in row]
     print(f"depth grid: {target.row_count}x{target.col_count}, pitch {target.pitch_mm:.1f} mm, "
           f"heights {min(all_heights):.1f}-{max(all_heights):.1f} mm, "
-          f"{target.reference_corner_count} reference corners")
+          "at least 3 reference corners")
     if "NOT verified" in target.measured_by:
         print(f"warning: {target_path.name} still carries unverified ground truth "
               f"({target.measured_by}). Every number below is only as good as that.")
@@ -711,9 +714,11 @@ def main() -> int:
         else:
             print(f"{label}: click reference points on the flat baseplate (at least 3, "
                   "spread out) then press n -- the plane fits and its rms prints "
-                  "immediately. Then click a block's points (as many as you like, even "
-                  "just one) and press n again: type its row,col when prompted, Enter "
-                  "to confirm. Repeat for every block you can see. Press q/Esc to finish.")
+                  "immediately, and you'll be prompted for a block's row,col right away. "
+                  "Type it, Enter, then click that block's points (as many as you like, "
+                  "even just one) and press n: it finalizes that block and immediately "
+                  "prompts for the next block's row,col. Repeat for every block you can "
+                  "see. Press q/Esc to finish.")
             session = PlaneCollectionSession(target)
             raw_result = run_interactive(
                 image_a, image_b, extrinsics, depth_range,
