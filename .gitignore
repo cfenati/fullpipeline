@@ -19,6 +19,7 @@ registration/results/
 
 # Nested git worktrees (each is its own checkout; never embed in this repo)
 .claude/worktrees/
+.worktrees/
 
 # Personal Claude Code settings (permissions etc.) -- local to this machine
 .claude/settings.local.json
