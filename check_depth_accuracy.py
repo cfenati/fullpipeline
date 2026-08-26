@@ -166,10 +166,9 @@ def measure_depth_session(
     cell_clicks_a = np.asarray(cell_clicks_a, dtype=np.float64).reshape(-1, 2)
     cell_clicks_b = np.asarray(cell_clicks_b, dtype=np.float64).reshape(-1, 2)
 
-    if len(ref_clicks_a) != target.reference_corner_count:
+    if len(ref_clicks_a) < 3:
         raise ValueError(
-            f"expected {target.reference_corner_count} reference clicks, "
-            f"got {len(ref_clicks_a)}"
+            f"need at least 3 reference clicks for a plane fit, got {len(ref_clicks_a)}"
         )
     if not (len(cell_labels) == len(cell_clicks_a) == len(cell_clicks_b)):
         raise ValueError("cell_labels, cell_clicks_a, cell_clicks_b must be the same length")
@@ -707,40 +706,55 @@ def main() -> int:
             ref_offsets_px = None
             cell_offsets_px = None
         else:
-            print(f"{label}: click the {target.reference_corner_count} reference corners "
-                  "first (any order among themselves) -- the plane fits itself in as soon "
-                  "as the last one lands. After that, click a block and type the height "
-                  "engraved on it when prompted; click the same block again anytime for a "
-                  "repeatability sample. Press q/Esc to finish.")
-            session = LabelingSession(target)
+            print(f"{label}: click reference points on the flat baseplate (at least 3, "
+                  "spread out) then press n -- the plane fits and its rms prints "
+                  "immediately. Then click a block's points (as many as you like, even "
+                  "just one) and press n again: type its row,col when prompted, Enter "
+                  "to confirm. Repeat for every block you can see. Press q/Esc to finish.")
+            session = PlaneCollectionSession(target)
             raw_result = run_interactive(
                 image_a, image_b, extrinsics, depth_range,
                 max(2, args.zoom), (int(args.window[0]), int(args.window[1])),
                 max(3, args.blob_radius) if args.blob_snap else 0,
                 float(reg_config.get("default_depth", 0.168)),
                 on_point=session.on_point, on_undo=session.on_undo,
+                on_advance=session.on_advance, on_text_submit=session.on_text_submit,
             )
-            n_ref = target.reference_corner_count
-            total_clicks = len(raw_result.get("clicks_a", [])) if raw_result else 0
-            if total_clicks < n_ref + 1 or not session.labels:
+            if not raw_result.get("clicks_a", []):
+                results.append({"label": label, "skipped": "no points clicked"})
+                print(f"{label}: skipped: no points clicked")
+                continue
+            labeled_batches = [
+                (batch_label, indices) for batch_label, indices in session.batches
+                if batch_label is not None and indices
+            ]
+            if len(session.batches[0][1]) < 3 or not labeled_batches:
                 results.append({
                     "label": label,
-                    "skipped": f"fewer than {n_ref} reference + 1 labeled block click",
+                    "skipped": "fewer than 3 reference points or no labeled block batches",
                 })
                 print(f"{label}: skipped: not enough points clicked")
                 continue
-            ref_clicks_a = np.array(raw_result["clicks_a"][:n_ref])
-            ref_clicks_b = np.array(raw_result["clicks_b_snapped"][:n_ref])
-            ref_offsets_px = np.array(raw_result["epipolar_offset_px"][:n_ref])
-            labeled_indices = sorted(session.labels)
-            cell_labels = [session.labels[i] for i in labeled_indices]
-            cell_clicks_a = np.array([raw_result["clicks_a"][i] for i in labeled_indices])
-            cell_clicks_b = np.array(
-                [raw_result["clicks_b_snapped"][i] for i in labeled_indices]
+            ref_indices = session.batches[0][1]
+            ref_clicks_a = np.array([raw_result["clicks_a"][i] for i in ref_indices])
+            ref_clicks_b = np.array([raw_result["clicks_b_snapped"][i] for i in ref_indices])
+            ref_offsets_px = np.array(
+                [raw_result["epipolar_offset_px"][i] for i in ref_indices]
             )
-            cell_offsets_px = np.array(
-                [raw_result["epipolar_offset_px"][i] for i in labeled_indices]
-            )
+            cell_labels = [
+                batch_label for batch_label, indices in labeled_batches for _ in indices
+            ]
+            cell_clicks_a = np.array([
+                raw_result["clicks_a"][i] for _, indices in labeled_batches for i in indices
+            ])
+            cell_clicks_b = np.array([
+                raw_result["clicks_b_snapped"][i]
+                for _, indices in labeled_batches for i in indices
+            ])
+            cell_offsets_px = np.array([
+                raw_result["epipolar_offset_px"][i]
+                for _, indices in labeled_batches for i in indices
+            ])
 
         try:
             measured = measure_depth_session(
