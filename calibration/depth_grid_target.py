@@ -21,10 +21,8 @@ Unlike the line ladder, the number of points measured in a session is not
 fixed. This target's own rig-specific geometry (a 30 mm height range packed
 into a 50 mm footprint) makes self-occlusion from one or both cameras a real
 possibility for some cells -- a session that only measures 15 of the grid's
-cells is a normal, valid result, not a partial failure. Internally
-correspondences are keyed by ``(row, col)`` grid index (never by click
-order or count), but the user-facing identity is the height engraved on
-each block -- ``cell_at_height`` resolves one to the other.
+cells is a normal, valid result, not a partial failure. Correspondences are
+keyed by ``(row, col)`` grid index, not by click order or count.
 """
 
 from __future__ import annotations
@@ -57,19 +55,6 @@ class DepthGridTarget:
             raise ValueError("heights_mm rows must all be the same length")
         if any(height < 0.0 for row in self.heights_mm for height in row):
             raise ValueError("heights_mm must not contain negative heights")
-        flat_heights = [height for row in self.heights_mm for height in row]
-        # Check that all heights are sufficiently distinct (within tolerance 1e-6).
-        # Use sorted adjacent-diff approach: O(n log n) and catches any pair too close.
-        sorted_heights = sorted(flat_heights)
-        tol = 1e-6
-        for i in range(len(sorted_heights) - 1):
-            if sorted_heights[i + 1] - sorted_heights[i] < tol:
-                raise ValueError(
-                    f"heights_mm must not contain heights closer than {tol} together -- "
-                    f"found {sorted_heights[i]} and {sorted_heights[i + 1]} which differ by "
-                    f"{sorted_heights[i + 1] - sorted_heights[i]}. Block identification by "
-                    f"engraved height requires every height to be unique (within tolerance)"
-                )
         if self.pitch_mm <= 0.0:
             raise ValueError(f"pitch_mm must be positive, got {self.pitch_mm}")
         if self.reference_corner_count < 3:
@@ -92,23 +77,6 @@ class DepthGridTarget:
 
     def height_at(self, row: int, col: int) -> float:
         return self.heights_mm[row][col]
-
-    def cell_at_height(self, height_mm: float, tol: float = 1e-6) -> Tuple[int, int]:
-        """Reverse lookup: which (row, col) carries this engraved height.
-
-        Every height in the grid is unique (enforced in __post_init__), so
-        this is well-defined. Raises with the sorted list of valid heights on
-        a miss, since a typo here would otherwise be silently indistinguishable
-        from a real measurement.
-        """
-        for row in range(self.row_count):
-            for col in range(self.col_count):
-                if abs(self.heights_mm[row][col] - height_mm) <= tol:
-                    return row, col
-        valid = sorted({height for row in self.heights_mm for height in row})
-        raise ValueError(
-            f"no block at height {height_mm} mm (tol {tol}); valid heights: {valid}"
-        )
 
     def pair_depths_mm(
         self, cells: Sequence[Tuple[int, int]],
