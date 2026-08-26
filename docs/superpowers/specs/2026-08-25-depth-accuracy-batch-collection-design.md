@@ -46,6 +46,14 @@ bar. Enter hands the finished string to a callback; Esc cancels back to normal
 click mode. This is generic -- `run_interactive` has no idea the text means
 "row,col" -- so it stays reusable the way `on_point`/`on_undo` already are.
 
+The character set is deliberately narrow (digits and `,` only): any other
+key, while in text-entry mode, is silently ignored -- NOT appended to the
+buffer and NOT treated as a hotkey either. This is a hard constraint, not a
+convenience default: `on_text_submit`'s only real caller (`row,col` parsing)
+never needs anything else, and accepting arbitrary characters here has
+already caused one plan/verification-script mismatch during implementation
+-- see the git history around 2026-08-26 if this contradiction resurfaces.
+
 No blocking call exists anywhere in the interactive loop after this change.
 The window keeps processing `cv2.waitKey()` continuously regardless of
 whether the user is clicking or typing.
@@ -169,6 +177,33 @@ Changed:
 Unchanged: `measure_depth_session`, `aggregate_depth_results`, `write_report`,
 `fit_plane_3d`, `perpendicular_distance_to_plane`, everything about
 `--ref`'s CLI shape, the annotated-JPEG output, `result.json`'s shape.
+
+## Deferred (not this plan): per-block plane fit + plane-to-plane distance
+
+The user's longer-term direction (stated 2026-08-26, explicitly deferred past
+this plan): once a block has enough points, fit an independent plane through
+*its* points too -- the same `fit_plane_3d` already used for the reference --
+and report the distance BETWEEN the reference plane and the block's own
+fitted plane, rather than Method 4's mean of per-point perpendicular
+distances to the reference plane's normal.
+
+This is a direct reversal of Method 4's rejection of per-block plane fits, so
+it is not a small follow-on -- it needs its own design pass, at minimum:
+- A real minimum point count for a block batch (Method 4's `>= 1` stops being
+  enough; a plane fit needs `>= 3` non-collinear points, same as the
+  reference), which changes the "just click once" ergonomics this plan is
+  built around.
+- A plane-to-plane distance definition given the two planes' normals may not
+  be exactly parallel (measurement noise) -- likely centroid-to-centroid
+  projected along the reference normal, or an average of the two normals;
+  needs to be chosen deliberately, not implicitly.
+- Whether this fully replaces Method 4's approach or becomes an alternative
+  mode (e.g. only when a block has >= 3 points, falling back to Method 4's
+  mean-distance for 1-2 point blocks).
+
+Revisit after this plan lands and gets real hardware use -- do not fold it
+into Task 2/3's `PlaneCollectionSession`, which this plan's Global
+Constraints explicitly scope to the mean-distance-to-reference-normal method.
 
 ## Out of scope
 
