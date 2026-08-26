@@ -413,12 +413,86 @@ def render(state: Dict[str, Any]) -> np.ndarray:
 # Interactive session
 # --------------------------------------------------------------------------- #
 
+def handle_interactive_key(
+    state: Dict[str, Any], key: int, extrinsics: StereoExtrinsics,
+    on_undo: Optional[Callable[[int], None]],
+    on_advance: Optional[Callable[[], Optional[str]]],
+    on_text_submit: Optional[Callable[[str], Optional[str]]],
+    recompute: Callable[[], None],
+) -> bool:
+    """Handle one already-``& 0xFF``-masked key code. Returns True if the
+    session should end (q/Esc outside text-entry mode).
+
+    Extracted from run_interactive's main loop so the key-handling state
+    machine -- including the text-entry mode -- is testable with a synthetic
+    state dict and key codes, without a real window.
+    """
+    if state["text_mode"]:
+        if key in (13, 10):
+            if on_text_submit is not None:
+                error = on_text_submit(state["text_buffer"])
+                if error is None:
+                    state["text_mode"] = False
+                    state["text_prompt"] = ""
+                    state["text_buffer"] = ""
+                else:
+                    print(f"  {error}")
+                    state["text_buffer"] = ""
+        elif key == 27:
+            state["text_mode"] = False
+            state["text_prompt"] = ""
+            state["text_buffer"] = ""
+        elif key in (8, 127):
+            state["text_buffer"] = state["text_buffer"][:-1]
+        elif key >= 32 and key < 127:
+            state["text_buffer"] += chr(key)
+        return False
+
+    if key in (ord("q"), ord("Q"), 27):
+        return True
+    if key == ord("u"):
+        if state["pending_a"] is not None:
+            state["pending_a"] = None
+        elif state["clicks_b"]:
+            state["clicks_a"].pop(); state["clicks_b"].pop()
+            state["click_offsets_px"].pop()
+            recompute()
+            if on_undo is not None:
+                on_undo(len(state["clicks_a"]))
+    elif key == ord("r"):
+        state["clicks_a"].clear(); state["clicks_b"].clear()
+        state["click_offsets_px"].clear()
+        state["pending_a"] = None; recompute()
+        if on_undo is not None:
+            on_undo(0)
+    elif key == ord("n"):
+        if on_advance is not None:
+            prompt = on_advance()
+            if prompt is not None:
+                state["text_mode"] = True
+                state["text_prompt"] = prompt
+                state["text_buffer"] = ""
+    elif key == ord("0"):
+        state["panel_a"].fit(); state["panel_b"].fit()
+    elif key == ord("l"):
+        state["linked"] = not state["linked"]
+        if state["linked"]:
+            link_view(state["panel_a"], state["panel_b"], extrinsics, state["depth_hint"])
+    elif key in (ord("+"), ord("=")):
+        state["zoom"] = min(32, state["zoom"] * 2)
+    elif key == ord("-"):
+        state["zoom"] = max(2, state["zoom"] // 2)
+    return False
+
 def run_interactive(image_a: np.ndarray, image_b: np.ndarray,
                     extrinsics: StereoExtrinsics, depth_range: Tuple[float, float],
                     zoom: int, max_window: Tuple[int, int], blob_radius: int,
                     depth_m: float,
                     on_point: Optional[Callable[[int, Dict[str, Any]], None]] = None,
-                    on_undo: Optional[Callable[[int], None]] = None) -> Dict[str, Any]:
+                    on_undo: Optional[Callable[[int], None]] = None,
+                    on_advance: Optional[Callable[[], Optional[str]]] = None,
+                    on_text_submit: Optional[Callable[[str], Optional[str]]] = None,
+                    ) -> Dict[str, Any]:
     fundamental = fundamental_for_undistorted(
         extrinsics.camera_matrix_a, extrinsics.camera_matrix_b, extrinsics.essential,
     )
@@ -431,6 +505,12 @@ def run_interactive(image_a: np.ndarray, image_b: np.ndarray,
         "zoom": zoom, "clicks_a": [], "clicks_b": [], "pending_a": None,
         "pending_line": None, "cursor": None, "status": [], "consecutive": [],
         "click_offsets_px": [],
+        # Modal text entry (row,col labels etc.), driven entirely through this
+        # same key-handling loop -- NEVER through input(), which would block
+        # cv2's event pump and freeze the window until it gets force-killed.
+        # This is not a hypothetical: it's exactly what happened running the
+        # previous (input()-based) design on real hardware.
+        "text_mode": False, "text_prompt": "", "text_buffer": "",
         "drag": None, "linked": True,
         # Best guess at how far away the subject is, used ONLY to aim camera B's
         # view. Starts at the configured nominal and is replaced by the depth of
@@ -461,6 +541,8 @@ def run_interactive(image_a: np.ndarray, image_b: np.ndarray,
             state["result"] = result
 
     def on_mouse(event, x, y, flags, _param):
+        if state["text_mode"]:
+            return
         state["cursor"] = (x, y)
         split = state["panel_a"].width
         on_b = x >= split
@@ -535,18 +617,24 @@ def run_interactive(image_a: np.ndarray, image_b: np.ndarray,
 
     while True:
         placed = len(state["clicks_a"])
-        head = (f"point {placed}: click the SAME feature in camera B, near the blue line"
-                if state["pending_a"] is not None
-                else f"point {placed}: click a feature in camera A")
-        recent = "   ".join(f"{i}->{i+1}: {d:.3f}mm"
-                            for i, d in enumerate(state["consecutive"]))[-140:]
-        state["status"] = [
-            head,
-            f"measurements: {recent}" if recent else "measurements: (need two points)",
-            ("wheel = zoom (camera A drags B along)   right-drag = pan   "
-             f"0 = fit   l = link {'ON' if state['linked'] else 'OFF'}"),
-            "u undo | r reset | q or Esc = finish and print the report",
-        ]
+        if state["text_mode"]:
+            state["status"] = [
+                f"{state['text_prompt']}{state['text_buffer']}_",
+                "type digits and , then Enter to confirm, Esc to cancel",
+            ]
+        else:
+            head = (f"point {placed}: click the SAME feature in camera B, near the blue line"
+                    if state["pending_a"] is not None
+                    else f"point {placed}: click a feature in camera A")
+            recent = "   ".join(f"{i}->{i+1}: {d:.3f}mm"
+                                for i, d in enumerate(state["consecutive"]))[-140:]
+            state["status"] = [
+                head,
+                f"measurements: {recent}" if recent else "measurements: (need two points)",
+                ("wheel = zoom (camera A drags B along)   right-drag = pan   "
+                 f"0 = fit   l = link {'ON' if state['linked'] else 'OFF'}"),
+                "u undo | r reset | n advance/label | q or Esc = finish and print the report",
+            ]
         cv2.imshow(window, render(state))
         key = cv2.waitKey(20)
         # Closing the window with its X button must end the session too, or the
@@ -556,34 +644,10 @@ def run_interactive(image_a: np.ndarray, image_b: np.ndarray,
         if key == -1:
             continue
         key &= 0xFF
-        if key in (ord("q"), ord("Q"), 27):
+        if handle_interactive_key(
+            state, key, extrinsics, on_undo, on_advance, on_text_submit, recompute,
+        ):
             break
-        if key == ord("u"):
-            if state["pending_a"] is not None:
-                state["pending_a"] = None
-            elif state["clicks_b"]:
-                state["clicks_a"].pop(); state["clicks_b"].pop()
-                state["click_offsets_px"].pop()
-                recompute()
-                if on_undo is not None:
-                    on_undo(len(state["clicks_a"]))
-        elif key == ord("r"):
-            state["clicks_a"].clear(); state["clicks_b"].clear()
-            state["click_offsets_px"].clear()
-            state["pending_a"] = None; recompute()
-            if on_undo is not None:
-                on_undo(0)
-        elif key == ord("0"):
-            state["panel_a"].fit(); state["panel_b"].fit()
-        elif key == ord("l"):
-            state["linked"] = not state["linked"]
-            if state["linked"]:
-                link_view(state["panel_a"], state["panel_b"], extrinsics,
-                          state["depth_hint"])
-        elif key in (ord("+"), ord("=")):
-            state["zoom"] = min(32, state["zoom"] * 2)
-        elif key == ord("-"):
-            state["zoom"] = max(2, state["zoom"] // 2)
 
     cv2.destroyAllWindows()
     cv2.waitKey(1)
