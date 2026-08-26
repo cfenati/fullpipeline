@@ -444,7 +444,7 @@ def handle_interactive_key(
             state["text_buffer"] = ""
         elif key in (8, 127):
             state["text_buffer"] = state["text_buffer"][:-1]
-        elif key >= 32 and key < 127:
+        elif 48 <= key <= 57 or key == ord(","):
             state["text_buffer"] += chr(key)
         return False
 
