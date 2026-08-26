@@ -11,16 +11,16 @@ This script does the depth-axis equivalent, using ``calibration/
 depth_grid_target.py``'s grid of blocks at known, distinct heights. Method,
 per session::
 
-    click 4 flush corner fiducials on the baseplate -> triangulate -> fit
-    a plane through them (this is the depth datum, NOT any assumed camera-
-    to-plate standoff -- the plate's mounting angle to the camera is
-    unknown and is never trusted)
-    click a block, type the height engraved on it when prompted (repeat
-    clicks on the same block are repeatability samples, not new blocks;
-    some blocks may be self-occluded from one or both cameras -- that is
-    expected, not a failure; see the target's module docstring) ->
-    triangulate -> signed perpendicular distance from each block's point
-    to the fitted plane
+    click at least 3 spread-out reference points on the flat baseplate,
+    press n -> triangulate -> fit a plane through them (this is the depth
+    datum, NOT any assumed camera-to-plate standoff -- the plate's mounting
+    angle to the camera is unknown and is never trusted)
+    click a block's points (even just one; repeat clicks average together
+    for a repeatability sample, not a new block), press n, type its
+    row,col when prompted -- some blocks may be self-occluded from one or
+    both cameras, that is expected, not a failure; see the target's module
+    docstring -> triangulate -> mean perpendicular distance from the
+    block's points to the fitted plane
     compare cell-to-cell separations against the target's known height
     differences -- this is "relative depth": it never depends on where the
     plate sits relative to the camera, only on differences between points,
@@ -52,8 +52,7 @@ Usage:
     python check_depth_accuracy.py --session captures/depth_target/<timestamp> \\
         --ref 100,200,90,205 --ref 900,200,890,205 \\
         --ref 100,900,90,905 --ref 900,900,890,905 \\
-        --cell 0.6,300,400,290,405 --cell 30.0,700,600,690,605   # non-interactive;
-        # HEIGHT,AX,AY,BX,BY -- identify a block by the number engraved on it
+        --cell 0,0,300,400,290,405 --cell 4,4,700,600,690,605   # non-interactive
 """
 
 from __future__ import annotations
@@ -457,17 +456,18 @@ def write_report(
 # CLI
 # --------------------------------------------------------------------------- #
 
-def parse_cell(text: str) -> Tuple[float, float, float, float, float]:
+def parse_cell(text: str) -> Tuple[int, int, float, float, float, float]:
     parts = text.replace(" ", "").split(",")
-    if len(parts) != 5:
+    if len(parts) != 6:
         raise argparse.ArgumentTypeError(
-            f"--cell wants HEIGHT,AX,AY,BX,BY, got '{text}'"
+            f"--cell wants ROW,COL,AX,AY,BX,BY, got '{text}'"
         )
     try:
-        height, ax, ay, bx, by = (float(value) for value in parts)
+        row, col = int(parts[0]), int(parts[1])
+        ax, ay, bx, by = (float(value) for value in parts[2:])
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"--cell could not parse '{text}': {exc}") from exc
-    return height, ax, ay, bx, by
+    return row, col, ax, ay, bx, by
 
 
 class PlaneCollectionSession:
@@ -597,12 +597,12 @@ def parse_args() -> argparse.Namespace:
                              "undistorted full-res pixels. Repeat exactly "
                              "reference_corner_count times, any order among themselves.")
     parser.add_argument("--cell", type=parse_cell, action="append", default=None,
-                        metavar="HEIGHT,AX,AY,BX,BY",
-                        help="Non-interactive: one block click pair, labeled by the height "
-                             "(mm) engraved on it -- must match one of the target's "
-                             "heights_mm values. Repeat for every block visible this "
-                             "session (a block may repeat for a repeatability sample); "
-                             "occluded blocks are simply omitted, not required.")
+                        metavar="ROW,COL,AX,AY,BX,BY",
+                        help="Non-interactive: one block click pair, labeled by its "
+                             "(row, col) in the target's heights_mm grid. Repeat for every "
+                             "block visible this session (a block may repeat for a "
+                             "repeatability sample); occluded blocks are simply omitted, "
+                             "not required.")
     parser.add_argument("--zoom", type=int, default=DEFAULT_LOUPE_ZOOM,
                         help="Initial loupe magnification (default: %(default)s).")
     parser.add_argument("--window", type=int, nargs=2, default=list(DEFAULT_MAX_WINDOW),
@@ -653,13 +653,19 @@ def main() -> int:
                              "exactly one session).")
         if args.captures:
             raise SystemExit("--ref/--cell cannot be combined with --captures.")
-        if not args.ref or len(args.ref) != target.reference_corner_count:
+        if not args.ref or len(args.ref) < 3:
             raise SystemExit(
-                f"{target_path.name} needs exactly {target.reference_corner_count} --ref "
-                f"clicks, got {len(args.ref) if args.ref else 0}."
+                f"Need at least 3 --ref clicks for a plane fit, got "
+                f"{len(args.ref) if args.ref else 0}."
             )
         if not args.cell:
             raise SystemExit("Need at least 1 --cell click to measure a block's depth.")
+        for row, col, *_ in args.cell:
+            if not (0 <= row < target.row_count and 0 <= col < target.col_count):
+                raise SystemExit(
+                    f"--cell {row},{col} is out of range for a {target.row_count}x"
+                    f"{target.col_count} grid."
+                )
 
     if args.session:
         session_dir = resolve_path(args.session)
@@ -697,12 +703,9 @@ def main() -> int:
         if args.ref:
             ref_clicks_a = np.array([[point[0], point[1]] for point in args.ref])
             ref_clicks_b = np.array([[point[2], point[3]] for point in args.ref])
-            try:
-                cell_labels = [target.cell_at_height(cell[0]) for cell in args.cell]
-            except ValueError as exc:
-                raise SystemExit(str(exc))
-            cell_clicks_a = np.array([[cell[1], cell[2]] for cell in args.cell])
-            cell_clicks_b = np.array([[cell[3], cell[4]] for cell in args.cell])
+            cell_labels = [(cell[0], cell[1]) for cell in args.cell]
+            cell_clicks_a = np.array([[cell[2], cell[3]] for cell in args.cell])
+            cell_clicks_b = np.array([[cell[4], cell[5]] for cell in args.cell])
             ref_offsets_px = None
             cell_offsets_px = None
         else:
