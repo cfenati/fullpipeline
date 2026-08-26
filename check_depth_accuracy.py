@@ -471,82 +471,100 @@ def parse_cell(text: str) -> Tuple[float, float, float, float, float]:
     return height, ax, ay, bx, by
 
 
-class LabelingSession:
-    """Drives live labeling via run_interactive's on_point/on_undo hooks.
+class PlaneCollectionSession:
+    """Drives batched multi-point plane collection via run_interactive's
+    on_point/on_undo/on_advance/on_text_submit hooks.
 
-    Counts off the reference corners as they land, fits the datum plane the
-    instant the last one completes, then prompts for each subsequent
-    block's engraved height and grades it immediately against that plane --
-    replacing the old blind, post-hoc, click-order-matched labeling prompt.
-
-    Labels are keyed by click INDEX, not appended positionally: a click
-    whose prompt is aborted (Ctrl-C/Ctrl-D) or never reaches a valid answer
-    simply has no entry, rather than shifting every later label's position
-    and silently mislabeling a subsequent click after an undo.
+    Click freely for a plane's worth of points; press n to close the batch
+    out. The first batch (index 0) is always the reference -- needs >= 3
+    points, no label, fits the datum plane the moment it's closed. Every
+    batch after that is a block, identified by row,col typed through the
+    in-window text-entry mode (never a fixed count, never fewer than 1
+    point); its measured height is the mean of its points' perpendicular
+    distances to the reference plane's ALREADY-established normal, not an
+    independent per-block plane fit -- every block is part of the same
+    rigid printed object as the reference corners, so it shares that one
+    normal exactly. See docs/superpowers/specs/2026-08-25-depth-accuracy-
+    batch-collection-design.md.
     """
 
     def __init__(self, target: DepthGridTarget) -> None:
         self.target = target
-        self.n_ref = target.reference_corner_count
-        self.labels: Dict[int, Tuple[int, int]] = {}
-        self.measured_by_index: Dict[int, float] = {}
         self.plane: Optional[Tuple[np.ndarray, np.ndarray]] = None
+        self.batches: List[Tuple[Optional[Tuple[int, int]], List[int]]] = [(None, [])]
+        self.points_mm: Dict[int, np.ndarray] = {}
 
     def on_point(self, index: int, result: Dict[str, Any]) -> None:
-        if index < self.n_ref - 1:
-            print(f"  reference corner {index + 1}/{self.n_ref} recorded")
-            return
-        if index == self.n_ref - 1:
-            points_mm = np.asarray(result["points_mm"][:self.n_ref], dtype=np.float64)
+        self.points_mm[index] = np.asarray(result["points_mm"][index], dtype=np.float64)
+        label, indices = self.batches[-1]
+        indices.append(index)
+        if label is None:
+            print(f"  reference point {len(indices)} recorded")
+        else:
+            print(f"  point {len(indices)} recorded for block {label}")
+
+    def on_undo(self, new_count: int) -> None:
+        for index in list(self.points_mm):
+            if index >= new_count:
+                del self.points_mm[index]
+        # Drop indices >= new_count from the current batch, back to front; an
+        # emptied batch that isn't the reference (index 0) is discarded
+        # outright, so the "current batch" pointer falls back to whichever
+        # batch actually still owns the removed point (reopening it, even if
+        # it was already finalized -- no relabeling needed, the label is
+        # still recorded).
+        while self.batches:
+            label, indices = self.batches[-1]
+            indices[:] = [i for i in indices if i < new_count]
+            if indices or len(self.batches) == 1:
+                break
+            self.batches.pop()
+        if new_count == 0:
+            self.plane = None
+
+    def on_advance(self) -> Optional[str]:
+        label, indices = self.batches[-1]
+        if label is None:
+            if len(indices) < 3:
+                print(f"  need at least 3 reference points, have {len(indices)}")
+                return None
+            points_mm = np.array([self.points_mm[i] for i in indices])
             centroid, normal, rms_m = fit_plane_3d(points_mm / 1000.0)
             if normal @ (-centroid) < 0.0:
                 normal = -normal
             self.plane = (centroid, normal)
-            print(f"  reference corner {self.n_ref}/{self.n_ref} recorded -- "
-                  f"plane fit rms {rms_m * 1000.0:.4f} mm")
-            return
-
-        centroid, normal = self.plane
-        point_mm = np.asarray(result["points_mm"][index], dtype=np.float64)
-        measured_mm = perpendicular_distance_to_plane(
-            point_mm / 1000.0, centroid, normal,
-        ) * 1000.0
-
-        while True:
-            try:
-                raw = input("  engraved height (mm) on this block > ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print("  no label entered -- this click will be skipped")
-                return
-            try:
-                height = float(raw)
-                label = self.target.cell_at_height(height)
-            except ValueError as exc:
-                print(f"    {exc}")
-                continue
-            break
-
-        self.labels[index] = label
-        self.measured_by_index[index] = measured_mm
-        history = [
-            self.measured_by_index[i] for i, other in self.labels.items() if other == label
-        ]
-        if len(history) == 1:
-            print(f"  {height}mm: measured {measured_mm:.3f}mm "
-                  f"(delta {measured_mm - height:+.3f}mm)")
+            print(f"  reference plane fit from {len(indices)} points -- "
+                  f"rms {rms_m * 1000.0:.4f} mm")
         else:
-            values = np.asarray(history)
-            spread = float(np.sqrt(np.mean((values - values.mean()) ** 2)))
-            print(f"  {height}mm, sample {len(history)}: measured {measured_mm:.3f}mm "
-                  f"(spread so far: {spread:.4f}mm rms)")
+            if len(indices) < 1:
+                print("  click at least one point before pressing n")
+                return None
+            centroid, normal = self.plane
+            values = np.array([
+                perpendicular_distance_to_plane(self.points_mm[i] / 1000.0, centroid, normal)
+                * 1000.0
+                for i in indices
+            ])
+            mean = float(values.mean())
+            if values.size > 1:
+                spread = float(np.sqrt(np.mean((values - mean) ** 2)))
+                print(f"  block {label}: {values.size} points, mean {mean:.3f}mm "
+                      f"(spread {spread:.4f}mm rms)")
+            else:
+                print(f"  block {label}: measured {mean:.3f}mm")
+        return "cell row,col > "
 
-    def on_undo(self, new_count: int) -> None:
-        self.labels = {i: label for i, label in self.labels.items() if i < new_count}
-        self.measured_by_index = {
-            i: value for i, value in self.measured_by_index.items() if i < new_count
-        }
-        if new_count < self.n_ref:
-            self.plane = None
+    def on_text_submit(self, text: str) -> Optional[str]:
+        try:
+            row_text, col_text = text.split(",")
+            row, col = int(row_text), int(col_text)
+            if not (0 <= row < self.target.row_count and 0 <= col < self.target.col_count):
+                raise ValueError
+        except ValueError:
+            return (f"enter as ROW,COL within 0-{self.target.row_count - 1},"
+                    f"0-{self.target.col_count - 1}")
+        self.batches.append(((row, col), []))
+        return None
 
 
 def parse_args() -> argparse.Namespace:
