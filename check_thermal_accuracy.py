@@ -120,3 +120,94 @@ def draw_overlay(
             annotated, line, (8, 20 + index * 20), OVERLAY_FONT, 0.5, TEXT_COLOR, 1, cv2.LINE_AA
         )
     return annotated
+
+
+def write_log_csv(rows: list[dict], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=LOG_CSV_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_checkpoints_csv(checkpoints: list[dict], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CHECKPOINT_CSV_FIELDS)
+        writer.writeheader()
+        writer.writerows(checkpoints)
+
+
+def build_summary_text(checkpoints: list[dict]) -> str:
+    if not checkpoints:
+        return "No gun readings were recorded (press 'r' during the session to record one).\n"
+
+    lines = [f"{len(checkpoints)} checkpoint(s) recorded.", ""]
+    first = checkpoints[0]
+    lines.append(
+        f"First checkpoint: t={first['elapsed_s']:.1f}s  "
+        f"camera={first['camera_mean_c']:.2f}C  gun={first['gun_c']:.2f}C  "
+        f"offset={first['offset_mean_c']:+.2f}C"
+    )
+
+    if len(checkpoints) == 1:
+        lines.append("")
+        lines.append("Only one checkpoint recorded -- accuracy assessed, drift not assessable.")
+        return "\n".join(lines) + "\n"
+
+    last = checkpoints[-1]
+    lines.append(
+        f"Last checkpoint:  t={last['elapsed_s']:.1f}s  "
+        f"camera={last['camera_mean_c']:.2f}C  gun={last['gun_c']:.2f}C  "
+        f"offset={last['offset_mean_c']:+.2f}C"
+    )
+
+    drift_c = last["offset_mean_c"] - first["offset_mean_c"]
+    elapsed_span_s = last["elapsed_s"] - first["elapsed_s"]
+    lines.append("")
+    lines.append(f"Drift (offset_mean_c, last - first): {drift_c:+.2f}C over {elapsed_span_s:.1f}s")
+    if elapsed_span_s > 0:
+        drift_rate_c_per_hour = drift_c / elapsed_span_s * 3600.0
+        lines.append(f"Drift rate: {drift_rate_c_per_hour:+.2f} C/hour")
+
+    return "\n".join(lines) + "\n"
+
+
+def write_summary(checkpoints: list[dict], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(build_summary_text(checkpoints), encoding="utf-8")
+
+
+def write_plot(log_rows: list[dict], checkpoints: list[dict], path: Path) -> None:
+    if not checkpoints:
+        return
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    times = [row["elapsed_s"] for row in log_rows]
+    means = [row["roi_mean_c"] for row in log_rows]
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    ax.plot(times, means, color="tab:orange", label="ROI mean temp (camera)")
+
+    checkpoint_times = [c["elapsed_s"] for c in checkpoints]
+    checkpoint_means = [c["camera_mean_c"] for c in checkpoints]
+    ax.scatter(checkpoint_times, checkpoint_means, color="tab:blue", zorder=3, label="gun checkpoint")
+    for checkpoint in checkpoints:
+        ax.annotate(
+            f"{checkpoint['offset_mean_c']:+.2f}C",
+            (checkpoint["elapsed_s"], checkpoint["camera_mean_c"]),
+            textcoords="offset points",
+            xytext=(6, 6),
+        )
+
+    ax.set_xlabel("Elapsed time (s)")
+    ax.set_ylabel("Temperature (C)")
+    ax.set_title("Thermal camera accuracy / drift check")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
