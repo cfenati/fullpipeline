@@ -1,5 +1,12 @@
 # check_thermal_accuracy.py Implementation Plan
 
+> **Status: implemented in a single session (2026-08-28).** Executed
+> inline task-by-task (not dispatched to fresh subagents) in an isolated
+> worktree; every step below is a record of what was actually run and
+> verified, not a prospective plan. See
+> `docs/superpowers/specs/2026-08-28-check-thermal-accuracy-design.md` for
+> the design rationale.
+>
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add `check_thermal_accuracy.py`, a live diagnostic that compares
@@ -68,7 +75,7 @@ matplotlib plot.
   `colorize_temperature(temperature_c: np.ndarray, scale: int) -> np.ndarray`
   (BGR `uint8`, shape `(H*scale, W*scale, 3)`); `draw_overlay(display: np.ndarray, roi_box_scaled: tuple[int,int,int,int], roi_mean_c: float, roi_max_c: float, elapsed_s: float, last_offset_mean_c: Optional[float]) -> np.ndarray`.
 
-- [ ] **Step 1: Write the file header and pure ROI/offset math**
+- [x] **Step 1: Write the file header and pure ROI/offset math**
 
 ```python
 #!/usr/bin/env python3
@@ -159,7 +166,7 @@ def compute_offsets(camera_mean_c: float, camera_max_c: float, gun_c: float) -> 
     return camera_mean_c - gun_c, camera_max_c - gun_c
 ```
 
-- [ ] **Step 2: Write the colorized display + overlay functions (append to the same file)**
+- [x] **Step 2: Write the colorized display + overlay functions (append to the same file)**
 
 ```python
 def colorize_temperature(temperature_c: np.ndarray, scale: int) -> np.ndarray:
@@ -198,7 +205,7 @@ def draw_overlay(
     return annotated
 ```
 
-- [ ] **Step 3: Verify the pure functions with a throwaway heredoc (no camera, no display needed)**
+- [x] **Step 3: Verify the pure functions with a throwaway heredoc (no camera, no display needed)**
 
 Run:
 ```bash
@@ -244,7 +251,7 @@ EOF
 ```
 Expected: `Task 1 checks passed.` with no assertion errors.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add check_thermal_accuracy.py
@@ -270,7 +277,7 @@ git commit -m "Add ROI math and colorized display helpers for check_thermal_accu
 - Row/checkpoint dicts use exactly the keys in `LOG_CSV_FIELDS` /
   `CHECKPOINT_CSV_FIELDS` — this is what Task 3's main loop must produce.
 
-- [ ] **Step 1: Write the CSV writers**
+- [x] **Step 1: Write the CSV writers**
 
 ```python
 def write_log_csv(rows: list[dict], path: Path) -> None:
@@ -289,7 +296,7 @@ def write_checkpoints_csv(checkpoints: list[dict], path: Path) -> None:
         writer.writerows(checkpoints)
 ```
 
-- [ ] **Step 2: Write the summary text + writer**
+- [x] **Step 2: Write the summary text + writer**
 
 ```python
 def build_summary_text(checkpoints: list[dict]) -> str:
@@ -332,7 +339,7 @@ def write_summary(checkpoints: list[dict], path: Path) -> None:
     path.write_text(build_summary_text(checkpoints), encoding="utf-8")
 ```
 
-- [ ] **Step 3: Write the plot writer**
+- [x] **Step 3: Write the plot writer**
 
 ```python
 def write_plot(log_rows: list[dict], checkpoints: list[dict], path: Path) -> None:
@@ -370,7 +377,7 @@ def write_plot(log_rows: list[dict], checkpoints: list[dict], path: Path) -> Non
     plt.close(fig)
 ```
 
-- [ ] **Step 4: Verify with a throwaway heredoc against synthetic data**
+- [x] **Step 4: Verify with a throwaway heredoc against synthetic data**
 
 Run:
 ```bash
@@ -424,7 +431,7 @@ EOF
 ```
 Expected: `Task 2 checks passed.` with no assertion errors.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add check_thermal_accuracy.py
@@ -452,7 +459,7 @@ git commit -m "Add CSV/summary/plot output writers for check_thermal_accuracy.py
   `run(roi: Optional[tuple[int,int,int,int]], interval: float, duration: Optional[float], scale: int, out_dir: Path) -> int`;
   `parse_args() -> argparse.Namespace`; `main() -> int`.
 
-- [ ] **Step 1: Write camera open + interactive ROI selection**
+- [x] **Step 1: Write camera open + interactive ROI selection**
 
 ```python
 def open_thermal_camera(thermal_config: dict) -> ThermalCamera:
@@ -476,7 +483,7 @@ def select_roi_interactive(camera: ThermalCamera, scale: int) -> tuple[int, int,
     return scale_roi_to_raw(box, scale, raw_width, raw_height)
 ```
 
-- [ ] **Step 2: Write the main loop**
+- [x] **Step 2: Write the main loop**
 
 ```python
 def run(
@@ -592,7 +599,7 @@ def run(
         cv2.destroyAllWindows()
 ```
 
-- [ ] **Step 3: Write the CLI and entry point**
+- [x] **Step 3: Write the CLI and entry point**
 
 ```python
 def parse_args() -> argparse.Namespace:
@@ -638,13 +645,13 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ```
 
-- [ ] **Step 4: Import check**
+- [x] **Step 4: Import check**
 
 Run: `python3 -c "import check_thermal_accuracy"` (from
 `/home/cfenati/projects/MasterThesis/FullPipeline`)
 Expected: no output, exit code 0.
 
-- [ ] **Step 5: Live smoke test against the connected camera (non-interactive path only)**
+- [x] **Step 5: Live smoke test against the connected camera (non-interactive path only)**
 
 The thermal camera is connected right now, so run a short, fully
 non-interactive pass using `--roi` (skipping the interactive drag) and
@@ -678,7 +685,7 @@ than claiming full coverage; a real accuracy/drift session against the
 actual hot plate and gun is the real end-to-end test, and only the user
 can run it.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add check_thermal_accuracy.py
@@ -695,7 +702,7 @@ git commit -m "Add camera loop and CLI for check_thermal_accuracy.py"
 
 **Interfaces:** None (no code).
 
-- [ ] **Step 1: Add the new output directory to `.gitignore`**
+- [x] **Step 1: Add the new output directory to `.gitignore`**
 
 Add a line under the existing generated-data section (near `color_reports/`):
 
@@ -704,7 +711,7 @@ Add a line under the existing generated-data section (near `color_reports/`):
 thermal_reports/
 ```
 
-- [ ] **Step 2: Update the spec's status line**
+- [x] **Step 2: Update the spec's status line**
 
 In `docs/superpowers/specs/2026-08-28-check-thermal-accuracy-design.md`,
 change:
@@ -724,7 +731,7 @@ selection and a real hot-plate/gun session are still untested — see this
 plan's Task 3, Step 5).
 ```
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add .gitignore docs/superpowers/specs/2026-08-28-check-thermal-accuracy-design.md
