@@ -13,3 +13,6 @@ color_reports/
 
 # Registration outputs (keep registration/*.py source)
 registration/results/
+
+# Thermal accuracy/drift check output
+thermal_reports/
