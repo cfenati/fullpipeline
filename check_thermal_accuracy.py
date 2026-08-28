@@ -211,3 +211,180 @@ def write_plot(log_rows: list[dict], checkpoints: list[dict], path: Path) -> Non
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
+
+
+def open_thermal_camera(thermal_config: dict) -> ThermalCamera:
+    camera = ThermalCamera(config_xml=thermal_config["config_xml"])
+    camera.open()
+    return camera
+
+
+def select_roi_interactive(camera: ThermalCamera, scale: int) -> tuple[int, int, int, int]:
+    frame = None
+    while frame is None:
+        frame = camera.grab()
+
+    display = colorize_temperature(frame.temperature_c, scale)
+    box = cv2.selectROI(WINDOW_NAME, display, showCrosshair=True)
+    cv2.destroyWindow(WINDOW_NAME)
+    if box[2] <= 0 or box[3] <= 0:
+        raise RuntimeError("No ROI selected -- drag a box over the hot plate, or pass --roi.")
+
+    raw_height, raw_width = frame.temperature_c.shape
+    return scale_roi_to_raw(box, scale, raw_width, raw_height)
+
+
+def run(
+    roi: Optional[tuple[int, int, int, int]],
+    interval: float,
+    duration: Optional[float],
+    scale: int,
+    out_dir: Path,
+) -> int:
+    thermal_config = load_thermal_config()
+    camera = None
+    try:
+        try:
+            camera = open_thermal_camera(thermal_config)
+        except (RuntimeError, FileNotFoundError) as error:
+            print(f"Could not open thermal camera: {error}")
+            return 1
+
+        warmup_s = float(thermal_config.get("warmup_seconds", 1))
+        warmup_end = time.monotonic() + warmup_s
+        while time.monotonic() < warmup_end:
+            camera.grab()
+
+        if roi is None:
+            roi = select_roi_interactive(camera, scale)
+        print(f"ROI (raw thermal pixels): {roi}")
+        print("Live readout running. Press 'r' to record a gun reading, 'q' to quit.")
+
+        log_rows: list[dict] = []
+        checkpoints: list[dict] = []
+        last_offset_mean_c: Optional[float] = None
+
+        start_time = time.monotonic()
+        last_log_elapsed_s = -interval  # force a sample on the first iteration
+
+        while True:
+            frame = camera.grab()
+            if frame is None:
+                if (cv2.waitKey(1) & 0xFF) == ord("q"):
+                    break
+                continue
+
+            elapsed_s = time.monotonic() - start_time
+            roi_mean_c, roi_max_c = roi_stats(frame.temperature_c, roi)
+
+            if elapsed_s - last_log_elapsed_s >= interval:
+                log_rows.append(
+                    {
+                        "timestamp_iso": datetime.now().isoformat(timespec="seconds"),
+                        "elapsed_s": round(elapsed_s, 3),
+                        "roi_mean_c": round(roi_mean_c, 3),
+                        "roi_max_c": round(roi_max_c, 3),
+                    }
+                )
+                last_log_elapsed_s = elapsed_s
+
+            display = colorize_temperature(frame.temperature_c, scale)
+            display = draw_overlay(
+                display,
+                scale_roi_to_display(roi, scale),
+                roi_mean_c,
+                roi_max_c,
+                elapsed_s,
+                last_offset_mean_c,
+            )
+            cv2.imshow(WINDOW_NAME, display)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                break
+            if key == ord("r"):
+                gun_text = input("Gun reading (C): ").strip()
+                try:
+                    gun_c = float(gun_text)
+                except ValueError:
+                    print(f"Could not parse {gun_text!r} as a number -- reading not recorded.")
+                else:
+                    offset_mean_c, offset_max_c = compute_offsets(roi_mean_c, roi_max_c, gun_c)
+                    checkpoints.append(
+                        {
+                            "timestamp_iso": datetime.now().isoformat(timespec="seconds"),
+                            "elapsed_s": round(elapsed_s, 3),
+                            "camera_mean_c": round(roi_mean_c, 3),
+                            "camera_max_c": round(roi_max_c, 3),
+                            "gun_c": gun_c,
+                            "offset_mean_c": round(offset_mean_c, 3),
+                            "offset_max_c": round(offset_max_c, 3),
+                        }
+                    )
+                    last_offset_mean_c = offset_mean_c
+                    print(
+                        f"[record] t=+{elapsed_s:.1f}s camera={roi_mean_c:.2f}C "
+                        f"gun={gun_c:.2f}C offset={offset_mean_c:+.2f}C"
+                    )
+
+            if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+                break
+            if duration is not None and elapsed_s >= duration:
+                break
+
+        session_dir = out_dir / datetime.now().strftime("%Y%m%d_%H%M%S")
+        write_log_csv(log_rows, session_dir / "log.csv")
+        write_checkpoints_csv(checkpoints, session_dir / "checkpoints.csv")
+        write_summary(checkpoints, session_dir / "summary.txt")
+        write_plot(log_rows, checkpoints, session_dir / "plot.png")
+        print(f"\nWrote session output to {session_dir}")
+        print(build_summary_text(checkpoints))
+
+        return 0
+    finally:
+        if camera is not None:
+            camera.release()
+        cv2.destroyAllWindows()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Compare the thermal camera's reported temperature for a hot plate "
+            "against a handheld temperature gun, logged over time to check drift."
+        ),
+    )
+    parser.add_argument(
+        "--roi",
+        type=str,
+        default=None,
+        help="Fixed ROI as X,Y,W,H in raw thermal-pixel coordinates. Skips interactive selection.",
+    )
+    parser.add_argument(
+        "--interval", type=float, default=DEFAULT_INTERVAL_S,
+        help=f"Seconds between logged samples (default: {DEFAULT_INTERVAL_S}).",
+    )
+    parser.add_argument(
+        "--duration", type=float, default=None,
+        help="Stop automatically after this many seconds (default: run until q/Ctrl+C).",
+    )
+    parser.add_argument(
+        "--scale", type=int, default=DEFAULT_SCALE,
+        help=f"Upscale factor for the live display (default: {DEFAULT_SCALE}).",
+    )
+    parser.add_argument(
+        "--out", type=str, default=str(DEFAULT_OUT_DIR),
+        help="Base output directory (default: thermal_reports/).",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    roi = parse_roi(args.roi) if args.roi else None
+    out_dir = Path(args.out).expanduser().resolve()
+    return run(roi, args.interval, args.duration, args.scale, out_dir)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
