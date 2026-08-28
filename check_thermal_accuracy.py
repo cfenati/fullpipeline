@@ -86,6 +86,78 @@ def compute_offsets(camera_mean_c: float, camera_max_c: float, gun_c: float) -> 
     return camera_mean_c - gun_c, camera_max_c - gun_c
 
 
+def handle_key(
+    state: dict,
+    key: int,
+    roi_mean_c: float,
+    roi_max_c: float,
+    elapsed_s: float,
+) -> Optional[dict]:
+    """Handle one already-`& 0xFF`-masked key code for the live loop's modal
+    gun-reading text entry, mutating `state` in place.
+
+    `roi_mean_c`/`roi_max_c`/`elapsed_s` are this frame's camera reading.
+    The instant 'r' is pressed they're frozen into `state["pending"]` --
+    typing the gun's value can take a few seconds, during which the camera
+    keeps grabbing frames, so the checkpoint must use the reading from the
+    moment the user decided to take it, not whatever the live frame is once
+    they finish typing.
+
+    Returns a checkpoint dict (elapsed_s, camera_mean_c, camera_max_c,
+    gun_c) once Enter submits a parseable number, else None. On an
+    unparseable buffer, stays in text-entry mode (clearing the buffer) so
+    the user can just retype without pressing 'r' again. Sets
+    state["quit"] = True on 'q' outside text-entry mode; 'q' is swallowed
+    (not a quit request) while text-entry mode is active.
+
+    Extracted as a pure function -- no camera, no cv2 window -- so this
+    state machine is testable with synthetic state/key inputs. Mirrors
+    measure_points.py's handle_interactive_key, written after a prior
+    input()-based design froze the cv2 window on real hardware (see
+    measure_points.py:525-529): input() blocks on terminal stdin, which
+    requires the terminal (not the cv2 window) to have OS focus and stops
+    cv2's event loop from being pumped while it waits.
+    """
+    if state["text_mode"]:
+        if key in (13, 10):
+            text = state["text_buffer"]
+            try:
+                gun_c = float(text)
+            except ValueError:
+                print(f"Could not parse {text!r} as a number -- try again.")
+                state["text_buffer"] = ""
+                return None
+            state["text_mode"] = False
+            state["text_buffer"] = ""
+            pending = state["pending"]
+            return {
+                "elapsed_s": pending["elapsed_s"],
+                "camera_mean_c": pending["roi_mean_c"],
+                "camera_max_c": pending["roi_max_c"],
+                "gun_c": gun_c,
+            }
+        if key == 27:
+            state["text_mode"] = False
+            state["text_buffer"] = ""
+        elif key in (8, 127):
+            state["text_buffer"] = state["text_buffer"][:-1]
+        elif 48 <= key <= 57 or key == ord("."):
+            state["text_buffer"] += chr(key)
+        return None
+
+    if key == ord("q"):
+        state["quit"] = True
+    elif key == ord("r"):
+        state["text_mode"] = True
+        state["text_buffer"] = ""
+        state["pending"] = {
+            "elapsed_s": elapsed_s,
+            "roi_mean_c": roi_mean_c,
+            "roi_max_c": roi_max_c,
+        }
+    return None
+
+
 def colorize_temperature(temperature_c: np.ndarray, scale: int) -> np.ndarray:
     t_min = float(temperature_c.min())
     t_max = float(temperature_c.max())
@@ -105,15 +177,17 @@ def draw_overlay(
     roi_max_c: float,
     elapsed_s: float,
     last_offset_mean_c: Optional[float],
+    text_entry: Optional[str] = None,
 ) -> np.ndarray:
     annotated = display.copy()
     x, y, w, h = roi_box_scaled
     cv2.rectangle(annotated, (x, y), (x + w, y + h), ROI_COLOR, 2)
 
     offset_text = "n/a" if last_offset_mean_c is None else f"{last_offset_mean_c:+.2f}C"
+    second_line = text_entry if text_entry is not None else "[r] record gun reading   [q] quit"
     lines = [
         f"t={elapsed_s:6.1f}s  ROI mean={roi_mean_c:5.1f}C max={roi_max_c:5.1f}C  last offset={offset_text}",
-        "[r] record gun reading   [q] quit",
+        second_line,
     ]
     for index, line in enumerate(lines):
         cv2.putText(
@@ -264,6 +338,8 @@ def run(
         checkpoints: list[dict] = []
         last_offset_mean_c: Optional[float] = None
 
+        key_state = {"text_mode": False, "text_buffer": "", "pending": None, "quit": False}
+
         start_time = time.monotonic()
         last_log_elapsed_s = -interval  # force a sample on the first iteration
 
@@ -288,6 +364,13 @@ def run(
                 )
                 last_log_elapsed_s = elapsed_s
 
+            text_entry = None
+            if key_state["text_mode"]:
+                text_entry = (
+                    f"Gun reading (C): {key_state['text_buffer']}_   "
+                    "[Enter=submit, Esc=cancel]"
+                )
+
             display = colorize_temperature(frame.temperature_c, scale)
             display = draw_overlay(
                 display,
@@ -296,37 +379,36 @@ def run(
                 roi_max_c,
                 elapsed_s,
                 last_offset_mean_c,
+                text_entry=text_entry,
             )
             cv2.imshow(WINDOW_NAME, display)
 
             key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
-                break
-            if key == ord("r"):
-                gun_text = input("Gun reading (C): ").strip()
-                try:
-                    gun_c = float(gun_text)
-                except ValueError:
-                    print(f"Could not parse {gun_text!r} as a number -- reading not recorded.")
-                else:
-                    offset_mean_c, offset_max_c = compute_offsets(roi_mean_c, roi_max_c, gun_c)
-                    checkpoints.append(
-                        {
-                            "timestamp_iso": datetime.now().isoformat(timespec="seconds"),
-                            "elapsed_s": round(elapsed_s, 3),
-                            "camera_mean_c": round(roi_mean_c, 3),
-                            "camera_max_c": round(roi_max_c, 3),
-                            "gun_c": gun_c,
-                            "offset_mean_c": round(offset_mean_c, 3),
-                            "offset_max_c": round(offset_max_c, 3),
-                        }
-                    )
-                    last_offset_mean_c = offset_mean_c
-                    print(
-                        f"[record] t=+{elapsed_s:.1f}s camera={roi_mean_c:.2f}C "
-                        f"gun={gun_c:.2f}C offset={offset_mean_c:+.2f}C"
-                    )
+            result = handle_key(key_state, key, roi_mean_c, roi_max_c, elapsed_s)
+            if result is not None:
+                gun_c = result["gun_c"]
+                offset_mean_c, offset_max_c = compute_offsets(
+                    result["camera_mean_c"], result["camera_max_c"], gun_c
+                )
+                checkpoints.append(
+                    {
+                        "timestamp_iso": datetime.now().isoformat(timespec="seconds"),
+                        "elapsed_s": round(result["elapsed_s"], 3),
+                        "camera_mean_c": round(result["camera_mean_c"], 3),
+                        "camera_max_c": round(result["camera_max_c"], 3),
+                        "gun_c": gun_c,
+                        "offset_mean_c": round(offset_mean_c, 3),
+                        "offset_max_c": round(offset_max_c, 3),
+                    }
+                )
+                last_offset_mean_c = offset_mean_c
+                print(
+                    f"[record] t=+{result['elapsed_s']:.1f}s camera={result['camera_mean_c']:.2f}C "
+                    f"gun={gun_c:.2f}C offset={offset_mean_c:+.2f}C"
+                )
 
+            if key_state["quit"]:
+                break
             if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
                 break
             if duration is not None and elapsed_s >= duration:
