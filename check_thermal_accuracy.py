@@ -244,6 +244,15 @@ def build_summary_text(checkpoints: list[dict]) -> str:
         drift_rate_c_per_hour = drift_c / elapsed_span_s * 3600.0
         lines.append(f"Drift rate: {drift_rate_c_per_hour:+.2f} C/hour")
 
+    lines.append("")
+    lines.append("All checkpoints:")
+    for checkpoint in checkpoints:
+        lines.append(
+            f"  t={checkpoint['elapsed_s']:7.1f}s  "
+            f"camera={checkpoint['camera_mean_c']:.2f}C  gun={checkpoint['gun_c']:.2f}C  "
+            f"offset={checkpoint['offset_mean_c']:+.2f}C"
+        )
+
     return "\n".join(lines) + "\n"
 
 
