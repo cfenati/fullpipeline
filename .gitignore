@@ -27,3 +27,6 @@ registration/results/
 # DIYer22/calibrating: cloned third-party reference repo, used only for
 # independent cross-checks (see docs/superpowers/specs/2026-08-18-feature-based-registration-design.md)
 DIYer22/calibrating/
+
+# Thermal accuracy/drift check output
+thermal_reports/
