@@ -86,6 +86,54 @@ def compute_offsets(camera_mean_c: float, camera_max_c: float, gun_c: float) -> 
     return camera_mean_c - gun_c, camera_max_c - gun_c
 
 
+def compute_offset_stats(checkpoints: list[dict], accuracy_abs_c: float, accuracy_pct: float) -> dict:
+    offsets = [c["offset_mean_c"] for c in checkpoints]
+    n = len(offsets)
+    mean_offset_c = sum(offsets) / n
+    std_offset_c = (sum((o - mean_offset_c) ** 2 for o in offsets) / n) ** 0.5
+
+    per_checkpoint = []
+    worst = None
+    for checkpoint in checkpoints:
+        tolerance_c = max(accuracy_abs_c, abs(checkpoint["gun_c"]) * accuracy_pct / 100.0)
+        within_spec = abs(checkpoint["offset_mean_c"]) <= tolerance_c
+        entry = {"checkpoint": checkpoint, "tolerance_c": tolerance_c, "within_spec": within_spec}
+        per_checkpoint.append(entry)
+        if not within_spec and (
+            worst is None or abs(checkpoint["offset_mean_c"]) > abs(worst["checkpoint"]["offset_mean_c"])
+        ):
+            worst = entry
+
+    stats = {
+        "n": n,
+        "mean_offset_c": mean_offset_c,
+        "std_offset_c": std_offset_c,
+        "min_offset_c": min(offsets),
+        "max_offset_c": max(offsets),
+        "max_abs_offset_c": max(abs(o) for o in offsets),
+        "per_checkpoint": per_checkpoint,
+        "all_within_spec": worst is None,
+        "worst": worst,
+    }
+
+    if n >= 2:
+        elapsed = [c["elapsed_s"] for c in checkpoints]
+        slope_c_per_s, _intercept = np.polyfit(elapsed, offsets, 1)
+        slope_c_per_hour = slope_c_per_s * 3600.0
+        session_span_s = elapsed[-1] - elapsed[0]
+        predicted_drift_c = slope_c_per_hour * (session_span_s / 3600.0)
+        stats.update(
+            {
+                "slope_c_per_hour": slope_c_per_hour,
+                "predicted_drift_c": predicted_drift_c,
+                "session_span_s": session_span_s,
+                "drift_within_noise": abs(predicted_drift_c) < std_offset_c,
+            }
+        )
+
+    return stats
+
+
 def colorize_temperature(temperature_c: np.ndarray, scale: int) -> np.ndarray:
     t_min = float(temperature_c.min())
     t_max = float(temperature_c.max())
@@ -138,56 +186,93 @@ def write_checkpoints_csv(checkpoints: list[dict], path: Path) -> None:
         writer.writerows(checkpoints)
 
 
-def build_summary_text(checkpoints: list[dict]) -> str:
+def build_summary_text(checkpoints: list[dict], accuracy_abs_c: float, accuracy_pct: float) -> str:
     if not checkpoints:
         return "No gun readings were recorded (press 'r' during the session to record one).\n"
 
-    lines = [f"{len(checkpoints)} checkpoint(s) recorded.", ""]
-    first = checkpoints[0]
-    lines.append(
-        f"First checkpoint: t={first['elapsed_s']:.1f}s  "
-        f"camera={first['camera_mean_c']:.2f}C  gun={first['gun_c']:.2f}C  "
-        f"offset={first['offset_mean_c']:+.2f}C"
-    )
+    stats = compute_offset_stats(checkpoints, accuracy_abs_c, accuracy_pct)
+    spec_line = f"Spec (Optris datasheet): +/-{accuracy_abs_c:.2f}C or +/-{accuracy_pct:.1f}% of reading"
 
-    if len(checkpoints) == 1:
-        lines.append("")
-        lines.append("Only one checkpoint recorded -- accuracy assessed, drift not assessable.")
+    if stats["n"] == 1:
+        checkpoint = checkpoints[0]
+        entry = stats["per_checkpoint"][0]
+        verdict = "PASS" if entry["within_spec"] else "FAIL"
+        lines = [
+            "1 checkpoint recorded.",
+            "",
+            spec_line,
+            "",
+            f"t={checkpoint['elapsed_s']:.1f}s  camera={checkpoint['camera_mean_c']:.2f}C  "
+            f"gun={checkpoint['gun_c']:.2f}C  offset={checkpoint['offset_mean_c']:+.2f}C  "
+            f"(tolerance +/-{entry['tolerance_c']:.2f}C: {verdict})",
+            "",
+            "Only one checkpoint recorded -- accuracy assessed, drift not assessable.",
+        ]
         return "\n".join(lines) + "\n"
 
-    last = checkpoints[-1]
-    lines.append(
-        f"Last checkpoint:  t={last['elapsed_s']:.1f}s  "
-        f"camera={last['camera_mean_c']:.2f}C  gun={last['gun_c']:.2f}C  "
-        f"offset={last['offset_mean_c']:+.2f}C"
-    )
+    span_s = stats["session_span_s"]
+    span_txt = f"{int(span_s // 60)}m {span_s % 60:.0f}s"
 
-    drift_c = last["offset_mean_c"] - first["offset_mean_c"]
-    elapsed_span_s = last["elapsed_s"] - first["elapsed_s"]
+    lines = [f"Thermal accuracy check -- {stats['n']} checkpoint(s) over {span_txt}", ""]
+    lines.append(spec_line)
     lines.append("")
-    lines.append(f"Drift (offset_mean_c, last - first): {drift_c:+.2f}C over {elapsed_span_s:.1f}s")
-    if elapsed_span_s > 0:
-        drift_rate_c_per_hour = drift_c / elapsed_span_s * 3600.0
-        lines.append(f"Drift rate: {drift_rate_c_per_hour:+.2f} C/hour")
+    lines.append("Offset (camera - gun):")
+    lines.append(f"  mean   {stats['mean_offset_c']:+.2f} C")
+    lines.append(f"  std     {stats['std_offset_c']:.2f} C")
+    lines.append(f"  range  {stats['min_offset_c']:+.2f} C .. {stats['max_offset_c']:+.2f} C")
+    if stats["all_within_spec"]:
+        lines.append(
+            f"  -> PASS: all {stats['n']} checkpoint(s) within spec "
+            f"(worst case {stats['max_abs_offset_c']:.2f}C)"
+        )
+    else:
+        worst_checkpoint = stats["worst"]["checkpoint"]
+        lines.append(
+            f"  -> FAIL: checkpoint at t={worst_checkpoint['elapsed_s']:.1f}s "
+            f"offset={worst_checkpoint['offset_mean_c']:+.2f}C exceeds tolerance "
+            f"+/-{stats['worst']['tolerance_c']:.2f}C"
+        )
+
+    lines.append("")
+    lines.append("Drift (linear fit across all checkpoints):")
+    lines.append(f"  slope  {stats['slope_c_per_hour']:+.2f} C/hour")
+    if stats["drift_within_noise"]:
+        lines.append(
+            f"  -> not distinguishable from noise (predicted drift over session: "
+            f"{stats['predicted_drift_c']:+.2f}C, smaller than offset std {stats['std_offset_c']:.2f}C)"
+        )
+    else:
+        lines.append(
+            f"  -> possible real trend -- treat cautiously, only one session recorded "
+            f"(predicted drift over session: {stats['predicted_drift_c']:+.2f}C)"
+        )
 
     lines.append("")
     lines.append("All checkpoints:")
-    for checkpoint in checkpoints:
+    for entry in stats["per_checkpoint"]:
+        checkpoint = entry["checkpoint"]
+        marker = "" if entry["within_spec"] else "  <-- FAIL"
         lines.append(
             f"  t={checkpoint['elapsed_s']:7.1f}s  "
             f"camera={checkpoint['camera_mean_c']:.2f}C  gun={checkpoint['gun_c']:.2f}C  "
-            f"offset={checkpoint['offset_mean_c']:+.2f}C"
+            f"offset={checkpoint['offset_mean_c']:+.2f}C{marker}"
         )
 
     return "\n".join(lines) + "\n"
 
 
-def write_summary(checkpoints: list[dict], path: Path) -> None:
+def write_summary(checkpoints: list[dict], accuracy_abs_c: float, accuracy_pct: float, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(build_summary_text(checkpoints), encoding="utf-8")
+    path.write_text(build_summary_text(checkpoints, accuracy_abs_c, accuracy_pct), encoding="utf-8")
 
 
-def write_plot(log_rows: list[dict], checkpoints: list[dict], path: Path) -> None:
+def write_plot(
+    log_rows: list[dict],
+    checkpoints: list[dict],
+    accuracy_abs_c: float,
+    accuracy_pct: float,
+    path: Path,
+) -> None:
     if not checkpoints:
         return
 
@@ -199,24 +284,50 @@ def write_plot(log_rows: list[dict], checkpoints: list[dict], path: Path) -> Non
     times = [row["elapsed_s"] for row in log_rows]
     means = [row["roi_mean_c"] for row in log_rows]
 
-    fig, ax = plt.subplots(figsize=(8, 4.5))
-    ax.plot(times, means, color="tab:orange", label="ROI mean temp (camera)")
-
     checkpoint_times = [c["elapsed_s"] for c in checkpoints]
-    checkpoint_means = [c["camera_mean_c"] for c in checkpoints]
-    ax.scatter(checkpoint_times, checkpoint_means, color="tab:blue", zorder=3, label="gun checkpoint")
-    for checkpoint in checkpoints:
-        ax.annotate(
-            f"{checkpoint['offset_mean_c']:+.2f}C",
-            (checkpoint["elapsed_s"], checkpoint["camera_mean_c"]),
-            textcoords="offset points",
-            xytext=(6, 6),
-        )
+    checkpoint_gun = [c["gun_c"] for c in checkpoints]
+    checkpoint_offset = [c["offset_mean_c"] for c in checkpoints]
 
-    ax.set_xlabel("Elapsed time (s)")
-    ax.set_ylabel("Temperature (C)")
-    ax.set_title("Thermal camera accuracy / drift check")
-    ax.legend()
+    fig, (ax_temp, ax_offset) = plt.subplots(
+        2, 1, figsize=(9, 7), sharex=True, gridspec_kw={"height_ratios": [1.4, 1]}
+    )
+
+    ax_temp.plot(times, means, color="tab:orange", label="ROI mean temp (camera)")
+    ax_temp.scatter(checkpoint_times, checkpoint_gun, color="tab:blue", zorder=3, label="gun reading")
+    if len(means) >= 5:
+        low, high = np.percentile(means, [1, 99])
+        margin = max(high - low, 0.2) * 0.25
+        ax_temp.set_ylim(low - margin, high + margin)
+    ax_temp.set_ylabel("Temperature (C)")
+    ax_temp.set_title("Thermal camera accuracy / drift check")
+    ax_temp.legend(loc="best")
+
+    ax_offset.scatter(checkpoint_times, checkpoint_offset, color="tab:blue", zorder=3, label="offset (camera - gun)")
+    ax_offset.axhline(0.0, color="gray", linestyle="--", linewidth=1, label="zero (gun reference)")
+
+    stats = compute_offset_stats(checkpoints, accuracy_abs_c, accuracy_pct)
+    mean_offset_c = stats["mean_offset_c"]
+    std_offset_c = stats["std_offset_c"]
+    ax_offset.axhline(
+        mean_offset_c, color="tab:red", linewidth=1, label=f"mean offset {mean_offset_c:+.2f}C"
+    )
+    ax_offset.axhspan(mean_offset_c - std_offset_c, mean_offset_c + std_offset_c, color="tab:red", alpha=0.12)
+
+    verdict = "PASS" if stats["all_within_spec"] else "FAIL"
+    stats_text = (
+        f"n={stats['n']}  mean={mean_offset_c:+.2f}C  std={std_offset_c:.2f}C\n"
+        f"spec +/-{accuracy_abs_c:.2f}C: {verdict}"
+    )
+    ax_offset.text(
+        0.02, 0.95, stats_text, transform=ax_offset.transAxes,
+        va="top", ha="left", fontsize=9,
+        bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+    )
+
+    ax_offset.set_xlabel("Elapsed time (s)")
+    ax_offset.set_ylabel("Offset (C)")
+    ax_offset.legend(loc="lower right", fontsize=8)
+
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
@@ -251,6 +362,8 @@ def run(
     out_dir: Path,
 ) -> int:
     thermal_config = load_thermal_config()
+    accuracy_abs_c = float(thermal_config["accuracy_abs_c"])
+    accuracy_pct = float(thermal_config["accuracy_pct"])
     camera = None
     try:
         try:
@@ -344,10 +457,10 @@ def run(
         session_dir = out_dir / datetime.now().strftime("%Y%m%d_%H%M%S")
         write_log_csv(log_rows, session_dir / "log.csv")
         write_checkpoints_csv(checkpoints, session_dir / "checkpoints.csv")
-        write_summary(checkpoints, session_dir / "summary.txt")
-        write_plot(log_rows, checkpoints, session_dir / "plot.png")
+        write_summary(checkpoints, accuracy_abs_c, accuracy_pct, session_dir / "summary.txt")
+        write_plot(log_rows, checkpoints, accuracy_abs_c, accuracy_pct, session_dir / "plot.png")
         print(f"\nWrote session output to {session_dir}")
-        print(build_summary_text(checkpoints))
+        print(build_summary_text(checkpoints, accuracy_abs_c, accuracy_pct))
 
         return 0
     finally:

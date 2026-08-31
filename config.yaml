@@ -73,26 +73,18 @@ geometric_calibration:
   # comparing recovered corner-to-corner distances against the board's known
   # square size catches that in a way in-sample reprojection error cannot.
   cross_validation_captures: captures/cross-validation
-  # Independent metric ruler for check_line_accuracy.py. cross_validation_captures
-  # above holds out board *poses* but reuses the same board, with the same nominal
-  # square_size_m that set the fit's scale in the first place - so a mis-measured
-  # square cancels out exactly and reports zero error. It grades repeatability, not
-  # scale. This ladder is a separately fabricated plate whose gaps were measured
-  # with a different instrument, which is the only thing here that can catch a
-  # systematic scale error in every length the rig reports.
-  line_target: calibration/config/line_target.yaml
-  line_target_captures: captures/line_target
 
   # Depth-grid target for check_depth_accuracy.py: validates RELATIVE stereo
-  # depth precision (delta-Z), the axis the line ladder above cannot touch
-  # since it's flat and depth-agnostic by construction.
+  # depth precision (delta-Z). A flat, fronto-parallel target is depth-agnostic
+  # by construction, so this grid of blocks at distinct heights is what
+  # actually exercises that axis.
   depth_grid_target: calibration/config/depth_grid_target.yaml
   depth_grid_target_captures: captures/depth_target
 
   extrinsics_rgb_cam1_rgb_cam2: calibration/results/stereo_rgb_cam1_rgb_cam2/extrinsics.json
 
 registration:
-  # Generate with: python register_board.py / register_features.py --session captures/<session>
+  # Generate with: python register_features.py --session captures/<session>
   output_dir: registration/results
   # Midpoint of the confirmed 0.13-0.19 m subject working range. Used only as
   # stereoRectify's reference_depth (principal-point alignment), never as a
@@ -119,6 +111,8 @@ registration:
 thermal:
   config_xml: OptrixThermalCamera/config/generic.xml
   warmup_seconds: 1
+  accuracy_abs_c: 2.0   # Optris datasheet: +/-2C or +/-2% of reading, whichever is larger
+  accuracy_pct: 2.0
 
 blackfly:
   enabled: true

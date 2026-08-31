@@ -1,7 +1,8 @@
 # Design: check_thermal_accuracy.py — clearer accuracy/drift display
 
 Date: 2026-08-31
-Status: Proposed
+Status: **Implemented** (verified against real session data below; not yet
+exercised through a live camera run, which is unaffected by this change)
 
 ## Purpose
 
@@ -158,19 +159,28 @@ and threads them through). New function: `compute_offset_stats`. No changes
 to `LOG_CSV_FIELDS`, `CHECKPOINT_CSV_FIELDS`, the capture loop, ROI
 selection, or CLI flags — `log.csv`/`checkpoints.csv` schemas are unchanged.
 
-## Verification plan
+## Verified
 
 No hardware needed — `compute_offset_stats`, `build_summary_text`, and
-`write_plot` are pure functions over already-recorded data. Verify by
+`write_plot` are pure functions over already-recorded data. Verified by
 loading the real captured session (`thermal_reports/20260828_160834/`,
 42 checkpoints, genuinely noisy data — not synthetic) via `csv.DictReader`
-and calling the new functions directly, comparing the regenerated
-`summary.txt`/`plot.png` against this session's existing ones and against
-the hand-computed numbers in "Findings" above (mean +0.02C, std 0.21C, all
-within spec, drift within noise). A single-checkpoint and empty-checkpoints
-case should also be exercised directly (small synthetic lists) to confirm
-the existing early-return paths in `build_summary_text`/`write_plot` still
-work with the new parameters.
+and calling the new functions directly:
+
+- Regenerated `summary.txt` matches the hand-computed "Findings" numbers
+  exactly: mean +0.02C, std 0.21C, range −0.34C..+0.46C, all 42 checkpoints
+  PASS against the ±2.00C spec.
+- The linear-fit drift came out **−0.02 C/hour** (predicted drift over the
+  session: −0.03C, within the 0.21C noise floor) — opposite in *sign* from
+  the old first/last two-point estimate (+0.05 C/hour). Both are noise, but
+  the sign flip is direct evidence the old metric wasn't measuring a real
+  trend, confirming the reason for replacing it.
+- `plot.png` regenerated as a two-panel figure: the offset panel visually
+  reads as scatter around zero with the PASS stats box, in contrast to the
+  original single-panel plot's 42 overlapping text labels.
+- Edge cases exercised directly: zero checkpoints (unchanged early-return
+  message) and a single checkpoint (stats/plot render with std=0.00C, no
+  drift section, no crash from the n<2 guard on the regression fields).
 
 ## Out of scope
 
