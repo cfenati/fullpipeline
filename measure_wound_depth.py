@@ -256,3 +256,74 @@ class RimAndWoundSession:
         self.rim_closed = True
         print(f"  rim locked: {len(self.rim_indices)} points")
         return None
+
+
+# --------------------------------------------------------------------------- #
+# Output
+# --------------------------------------------------------------------------- #
+
+COLOR_RIM = (219, 99, 37)
+COLOR_POINT = (40, 220, 255)
+
+
+def annotate(
+    image_a: np.ndarray, image_b: np.ndarray, result: Dict[str, Any],
+    max_window: Tuple[int, int],
+) -> np.ndarray:
+    """Saved picture of exactly what was clicked: rim points in one color,
+    measured points in another, each measured point's depth labeled next to
+    its marker.
+    """
+    panel_size = (max(320, max_window[0] // 2), max(320, max_window[1]))
+    panel_a, panel_b = Panel(image_a, panel_size), Panel(image_b, panel_size)
+    canvas = np.hstack([panel_a.render(), panel_b.render()])
+    split = panel_a.width
+
+    for index, point in enumerate(result["rim_clicks_a"]):
+        draw_marker(canvas, panel_a, point, COLOR_RIM, index)
+    for index, point in enumerate(result["rim_clicks_b"]):
+        draw_marker(canvas, panel_b, point, COLOR_RIM, index, split)
+
+    for measurement, point_a, point_b in zip(
+        result["measurements"], result["point_clicks_a"], result["point_clicks_b"],
+    ):
+        index = measurement["index"]
+        draw_marker(canvas, panel_a, point_a, COLOR_POINT, index)
+        draw_marker(canvas, panel_b, point_b, COLOR_POINT, index, split)
+        label = f"{measurement['depth_mm']:+.2f}mm"
+        x, y = panel_a.to_screen(point_a)
+        cv2.putText(canvas, label, (x + 22, y + 16),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_POINT, 1, cv2.LINE_AA)
+    return canvas
+
+
+def write_report(
+    result: Dict[str, Any], context: Dict[str, Any], path: Path,
+) -> None:
+    rule = "=" * 78
+    thin = "-" * 78
+    lines = [
+        rule,
+        "RELATIVE DEPTH -- point vs. its own local rim neighborhood",
+        rule,
+        f"extrinsics       : {context['extrinsics']}",
+        f"session          : {context['session']}",
+        f"cameras          : {context['camera_a']} (A) / {context['camera_b']} (B)",
+        f"neighbors (k)    : {result['neighbors']}",
+        f"rim points       : {len(result['rim_clicks_a'])}  "
+        f"(max epipolar offset {result['rim_epipolar_offset_max_px']:.2f} px)",
+        "",
+        thin,
+        f"{'pt':>3} {'depth mm':>10} {'plane rms mm':>13} {'neighbors':>9} "
+        f"{'farthest mm':>12} {'click off px':>12}",
+        thin,
+    ]
+    for measurement in result["measurements"]:
+        lines.append(
+            f"{measurement['index']:>3} {measurement['depth_mm']:>+10.3f} "
+            f"{measurement['plane_rms_mm']:>13.4f} {measurement['neighbor_count']:>9} "
+            f"{measurement['farthest_neighbor_mm']:>12.1f} "
+            f"{measurement['epipolar_offset_px']:>12.1f}"
+        )
+    lines.append("")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
