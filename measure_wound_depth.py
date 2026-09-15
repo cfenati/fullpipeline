@@ -327,3 +327,176 @@ def write_report(
         )
     lines.append("")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Measure how far a point sits below (or above) its own local "
+                    "surroundings, from nearby rim clicks -- no assumed global plane.",
+    )
+    parser.add_argument("--session", required=True,
+                        help="Capture folder holding <camera-a>.jpg and <camera-b>.jpg.")
+    parser.add_argument("--camera-a", default="rgb_cam1")
+    parser.add_argument("--camera-b", default="rgb_cam2")
+    parser.add_argument("--extrinsics", default=None,
+                        help="Stereo extrinsics JSON (default: geometric_calibration."
+                             "extrinsics_<a>_<b> in config, else "
+                             "calibration/results/stereo_<a>_<b>/extrinsics.json).")
+    parser.add_argument("--neighbors", type=int, default=DEFAULT_NEIGHBORS,
+                        help="How many nearest rim points fit each measured point's own "
+                             "local plane (default: %(default)s, minimum 3).")
+    parser.add_argument("--rim", type=parse_point, action="append", default=None,
+                        metavar="AX,AY,BX,BY",
+                        help="Non-interactive: one rim click pair, in undistorted "
+                             "full-res pixels. Repeat at least --neighbors times, spread "
+                             "around the area of interest.")
+    parser.add_argument("--wound", type=parse_point, action="append", default=None,
+                        metavar="AX,AY,BX,BY",
+                        help="Non-interactive: one measured-point click pair. Repeat for "
+                             "every point you want depth for.")
+    parser.add_argument("--zoom", type=int, default=DEFAULT_LOUPE_ZOOM,
+                        help="Initial loupe magnification (default: %(default)s).")
+    parser.add_argument("--window", type=int, nargs=2, default=list(DEFAULT_MAX_WINDOW),
+                        metavar=("W", "H"),
+                        help="Window size in pixels (default: %(default)s).")
+    parser.add_argument("--blob-radius", type=int, default=DEFAULT_BLOB_RADIUS_PX,
+                        help="Search radius when snapping a click to a dot's centroid, "
+                             "in full-resolution pixels (default: %(default)s).")
+    parser.add_argument("--blob-snap", action="store_true",
+                        help="Move each click onto the intensity centroid of the marker "
+                             "underneath it. Off by default so a click lands exactly "
+                             "where you put it.")
+    parser.add_argument("--out", "--output", dest="output", default=None,
+                        help="Output directory (default: registration.output_dir in "
+                             f"config) / <session> / {DEFAULT_OUTPUT_SUBDIR}.")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if args.neighbors < 3:
+        raise SystemExit(
+            f"--neighbors must be at least 3 for a plane fit, got {args.neighbors}."
+        )
+    config = load_config()
+    reg_config = config.get("registration", {}) or {}
+    depth_range = reg_config.get("depth_range", [0.11, 0.21])
+    depth_range = (float(depth_range[0]), float(depth_range[1]))
+
+    extrinsics_path = resolve_path(
+        args.extrinsics or default_extrinsics_path(args.camera_a, args.camera_b)
+    )
+    if not extrinsics_path.exists():
+        raise SystemExit(f"No stereo extrinsics at {extrinsics_path}.")
+    extrinsics = StereoExtrinsics.load_json(extrinsics_path)
+
+    if args.rim or args.wound:
+        if not args.rim or len(args.rim) < args.neighbors:
+            raise SystemExit(
+                f"Need at least --neighbors ({args.neighbors}) --rim clicks, got "
+                f"{len(args.rim) if args.rim else 0}."
+            )
+        if not args.wound:
+            raise SystemExit("Need at least 1 --wound click to measure a point's depth.")
+
+    session_dir = resolve_path(args.session)
+    paths = [session_dir / f"{camera}.jpg" for camera in (args.camera_a, args.camera_b)]
+    missing = [path.name for path in paths if not path.exists()]
+    if missing:
+        raise SystemExit(f"{session_dir} is missing {', '.join(missing)}.")
+    raw_a, raw_b = cv2.imread(str(paths[0])), cv2.imread(str(paths[1]))
+    if raw_a is None or raw_b is None:
+        raise SystemExit(f"Failed to decode images in {session_dir}.")
+    image_a, image_b = undistort_pair(raw_a, raw_b, extrinsics)
+
+    output_dir = resolve_path(
+        args.output or reg_config.get("output_dir", "registration/results")
+    ) / session_dir.name / DEFAULT_OUTPUT_SUBDIR
+
+    if args.rim:
+        rim_clicks_a = np.array([[point[0], point[1]] for point in args.rim])
+        rim_clicks_b = np.array([[point[2], point[3]] for point in args.rim])
+        point_clicks_a = np.array([[point[0], point[1]] for point in args.wound])
+        point_clicks_b = np.array([[point[2], point[3]] for point in args.wound])
+        rim_offsets_px = None
+        point_offsets_px = None
+    else:
+        print(f"{session_dir.name}: click points along the rim (at least "
+              f"{args.neighbors}, spread around the area of interest) then press n to "
+              "lock it in. Every click after that is measured immediately against its "
+              "own nearest rim points -- no further n presses needed. Press q or Esc "
+              "(or close the window) to finish and get the report.")
+        session = RimAndWoundSession(args.neighbors)
+        raw_result = run_interactive(
+            image_a, image_b, extrinsics, depth_range,
+            max(2, args.zoom), (int(args.window[0]), int(args.window[1])),
+            max(3, args.blob_radius) if args.blob_snap else 0,
+            float(reg_config.get("default_depth", 0.168)),
+            on_point=session.on_point, on_undo=session.on_undo,
+            on_advance=session.on_advance,
+        )
+        if len(session.rim_indices) < args.neighbors or not session.point_indices:
+            print(f"{session_dir.name}: no points measured (need the rim locked with "
+                  f"at least {args.neighbors} points, and at least 1 point clicked "
+                  "after that).")
+            return 0
+        rim_clicks_a = np.array([raw_result["clicks_a"][i] for i in session.rim_indices])
+        rim_clicks_b = np.array(
+            [raw_result["clicks_b_snapped"][i] for i in session.rim_indices]
+        )
+        rim_offsets_px = np.array(
+            [raw_result["epipolar_offset_px"][i] for i in session.rim_indices]
+        )
+        point_clicks_a = np.array(
+            [raw_result["clicks_a"][i] for i in session.point_indices]
+        )
+        point_clicks_b = np.array(
+            [raw_result["clicks_b_snapped"][i] for i in session.point_indices]
+        )
+        point_offsets_px = np.array(
+            [raw_result["epipolar_offset_px"][i] for i in session.point_indices]
+        )
+
+    result = measure_wound_session(
+        rim_clicks_a, rim_clicks_b, point_clicks_a, point_clicks_b,
+        extrinsics, args.neighbors,
+        rim_offsets_px=rim_offsets_px, point_offsets_px=point_offsets_px,
+    )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    context = {
+        "extrinsics": str(extrinsics_path), "session": str(session_dir),
+        "camera_a": args.camera_a, "camera_b": args.camera_b,
+    }
+    write_report(result, context, output_dir / "report.txt")
+    cv2.imwrite(
+        str(output_dir / "annotated.jpg"),
+        annotate(image_a, image_b, result, (int(args.window[0]), int(args.window[1]))),
+    )
+    payload = {
+        "extrinsics": str(extrinsics_path),
+        "session": str(session_dir),
+        "neighbors": result["neighbors"],
+        "rim_points_mm": result["rim_points_mm"].tolist(),
+        "rim_epipolar_offset_max_px": result["rim_epipolar_offset_max_px"],
+        "points_mm": result["points_mm"].tolist(),
+        "measurements": result["measurements"],
+    }
+    with (output_dir / "result.json").open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+
+    print()
+    for measurement in result["measurements"]:
+        print(f"point {measurement['index']}: depth {measurement['depth_mm']:+.3f} mm  "
+              f"(plane rms {measurement['plane_rms_mm']:.4f} mm)")
+    print(f"Saved report.txt / result.json / annotated.jpg to {output_dir}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
