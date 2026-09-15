@@ -184,3 +184,75 @@ def measure_wound_session(
         "points_mm": points_mm,
         "measurements": measurements,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Interactive session
+# --------------------------------------------------------------------------- #
+
+class RimAndWoundSession:
+    """Drives the two-phase rim-then-point collection via run_interactive's
+    on_point/on_undo/on_advance hooks.
+
+    Click rim points freely; press n once to lock the rim (needs >=
+    ``neighbors`` points). Every click after that is a measured point,
+    reported immediately using nearest_rim_plane against whatever rim points
+    currently exist -- a live, convenient estimate only. The authoritative
+    numbers always come from measure_wound_session, called once at the end
+    of the session (see main()) against the FINAL rim_indices/point_indices
+    after any undos.
+
+    Undo never "refuses" to reach into an already-locked rim: by the time
+    on_undo runs, run_interactive has already popped the click from its own
+    state (see measure_points.py's `u` handler) -- there is nothing left
+    here to protect. Reaching back into the rim just shrinks rim_indices;
+    rim_closed stays True (the next click is still treated as a measured
+    point, not a new rim point), and it's simply what the final
+    recomputation in main() uses. This is why every printed number during
+    the session is explicitly a "live estimate."
+    """
+
+    def __init__(self, neighbors: int) -> None:
+        self.neighbors = neighbors
+        self.rim_closed = False
+        self.rim_indices: List[int] = []
+        self.point_indices: List[int] = []
+        self.points_mm: Dict[int, np.ndarray] = {}
+
+    def on_point(self, index: int, result: Dict[str, Any]) -> None:
+        self.points_mm[index] = np.asarray(result["points_mm"][index], dtype=np.float64)
+        if not self.rim_closed:
+            self.rim_indices.append(index)
+            print(f"  rim point {len(self.rim_indices)} recorded")
+            return
+        self.point_indices.append(index)
+        rim_points_mm = np.array([self.points_mm[i] for i in self.rim_indices])
+        try:
+            live = nearest_rim_plane(self.points_mm[index], rim_points_mm, self.neighbors)
+        except ValueError as exc:
+            print(f"  wound point {len(self.point_indices) - 1}: {exc}")
+            return
+        print(f"  wound point {len(self.point_indices) - 1}: depth {live['depth_mm']:.3f} mm "
+              f"(local plane rms {live['plane_rms_mm']:.4f} mm from {live['neighbor_count']} "
+              f"rim points, farthest {live['farthest_neighbor_mm']:.1f} mm) [live estimate]")
+
+    def on_undo(self, new_count: int) -> None:
+        for index in list(self.points_mm):
+            if index >= new_count:
+                del self.points_mm[index]
+        self.rim_indices = [i for i in self.rim_indices if i < new_count]
+        self.point_indices = [i for i in self.point_indices if i < new_count]
+        if new_count == 0:
+            self.rim_closed = False
+
+    def on_advance(self) -> Optional[str]:
+        if self.rim_closed:
+            print("  rim already locked -- every click is measured immediately, "
+                  "no need to press n again")
+            return None
+        if len(self.rim_indices) < self.neighbors:
+            print(f"  need at least {self.neighbors} rim points, have {len(self.rim_indices)}")
+            return None
+        self.rim_closed = True
+        print(f"  rim locked: {len(self.rim_indices)} points")
+        return None
