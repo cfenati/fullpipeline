@@ -261,9 +261,10 @@ rim_points_mm = np.array(patch_a + patch_b)
 
 # A point 4.0mm INTO the surface (toward camera A, i.e. protruding) at each
 # patch's own centre and tilt -- protrusion means a NEGATIVE depth_mm under
-# this script's flipped convention.
-point_near_a = centre_a - normal_a * 4.0
-point_near_b = centre_b - normal_b * 4.0
+# this script's flipped convention. Protrusion = moving TOWARD the camera =
+# SMALLER Z = adding the (already camera-oriented) normal, not subtracting it.
+point_near_a = centre_a + normal_a * 4.0
+point_near_b = centre_b + normal_b * 4.0
 
 result_a = nearest_rim_plane(point_near_a, rim_points_mm, neighbors=4)
 result_b = nearest_rim_plane(point_near_b, rim_points_mm, neighbors=4)
@@ -337,8 +338,10 @@ for p in rim_points_m:
 
 # One measured point recessed 3.0mm (a "wound") -- away from the camera, so
 # depth_mm must read POSITIVE (opposite sign from a check_depth_accuracy.py
-# block, which would read negative for the same physical direction).
-wound_m = on_plane(0.0, 0.0) + normal * 0.0030
+# block, which would read negative for the same physical direction). Recession
+# = moving AWAY from the camera = LARGER Z = subtracting the (already
+# camera-oriented) normal, not adding it.
+wound_m = on_plane(0.0, 0.0) - normal * 0.0030
 point_clicks_a, point_clicks_b = [project_pair(wound_m)[0]], [project_pair(wound_m)[1]]
 
 result = measure_wound_session(
@@ -1006,7 +1009,7 @@ rim_points_m = [
     on_plane(dx, dy) for dx, dy in
     [(-0.02, -0.02), (0.02, -0.02), (-0.02, 0.02), (0.02, 0.02), (0.0, 0.0)]
 ]
-wound_m = on_plane(0.0, 0.0) + normal * 0.0030  # recessed 3.0mm
+wound_m = on_plane(0.0, 0.0) - normal * 0.0030  # recessed 3.0mm (subtract: away from camera)
 
 with tempfile.TemporaryDirectory() as tmp:
     tmp = Path(tmp)
@@ -1034,14 +1037,17 @@ with tempfile.TemporaryDirectory() as tmp:
     print(proc.stderr, file=sys.stderr)
     assert proc.returncode == 0, f"exit code {proc.returncode}"
 
-    report = (out_dir / "wound_depth" / "report.txt").read_text()
+    # --out is a BASE directory, same convention as measure_points.py's own
+    # main() -- session_dir.name and wound_depth are still appended.
+    result_dir = out_dir / session_dir.name / "wound_depth"
+    report = (result_dir / "report.txt").read_text()
     assert "RELATIVE DEPTH" in report
     assert "neighbors (k)    : 5" in report
 
-    result = json.loads((out_dir / "wound_depth" / "result.json").read_text())
+    result = json.loads((result_dir / "result.json").read_text())
     assert len(result["measurements"]) == 1
     assert abs(result["measurements"][0]["depth_mm"] - 3.0) < 0.05
-    assert (out_dir / "wound_depth" / "annotated.jpg").exists()
+    assert (result_dir / "annotated.jpg").exists()
 
     # Argument validation: too few --rim clicks must exit non-zero, before
     # ever touching the images.
