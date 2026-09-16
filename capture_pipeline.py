@@ -352,6 +352,47 @@ def save_capture(
     return session_dir
 
 
+def capture_gain_sweep(
+    blackfly: BlackflyCamera,
+    output_dir: Path,
+    timestamp: str,
+    gain_values: list[float],
+) -> Path:
+    session_dir = output_dir / timestamp
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    files: list[dict] = []
+    for requested_gain in gain_values:
+        applied_gain = blackfly.set_gain(requested_gain)
+        blackfly.grab()  # discard one frame so the new gain settles before the saved frame
+        frame = blackfly.grab(full_resolution=True)
+        if frame is None:
+            print(f"  gain {requested_gain:.1f} dB: grab failed, skipped")
+            continue
+
+        filename = f"flir_gain_{int(round(applied_gain))}.jpg"
+        cv2.imwrite(str(session_dir / filename), frame, JPEG_PARAMS)
+        files.append(
+            {
+                "file": filename,
+                "requested_gain_db": requested_gain,
+                "applied_gain_db": applied_gain,
+            }
+        )
+        print(f"  gain {applied_gain:.1f} dB -> {filename}")
+
+    metadata = {
+        "timestamp": timestamp,
+        "capture_time_iso": datetime.now(timezone.utc).isoformat(),
+        "blackfly": blackfly.info(),
+        "files": files,
+    }
+    with (session_dir / "metadata.json").open("w", encoding="utf-8") as metadata_file:
+        json.dump(metadata, metadata_file, indent=2)
+
+    return session_dir
+
+
 def grab_all(
     cam1: RGBCamera,
     cam2: RGBCamera,
