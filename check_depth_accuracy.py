@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Check this rig's RELATIVE stereo depth (Z-axis) precision.
 
-``check_line_accuracy.py`` validates lateral (X-Y) triangulation accuracy using
-a flat line-ladder plate -- but a flat, fronto-parallel target has ~zero depth
-variation across it by construction, so it can never touch the depth axis,
-which is driven by different error sources entirely (stereo disparity
-precision, baseline, convergence) than in-plane accuracy.
+A flat line-ladder plate validates lateral (X-Y) triangulation accuracy well --
+but a flat, fronto-parallel target has ~zero depth variation across it by
+construction, so it can never touch the depth axis, which is driven by
+different error sources entirely (stereo disparity precision, baseline,
+convergence) than in-plane accuracy.
 
 This script does the depth-axis equivalent, using ``calibration/
 depth_grid_target.py``'s grid of blocks at known, distinct heights. Method,
@@ -79,7 +79,6 @@ from calibration.depth_grid_target import (  # noqa: E402
     DepthGridTarget,
 )
 from calibration.stereo import StereoExtrinsics, collect_session_pairs  # noqa: E402
-from check_line_accuracy import fit_scale  # noqa: E402
 from measure_points import (  # noqa: E402
     DEFAULT_BLOB_RADIUS_PX,
     DEFAULT_LOUPE_ZOOM,
@@ -96,16 +95,16 @@ DEFAULT_OUTPUT_SUBDIR = "depth_accuracy"
 
 
 # --------------------------------------------------------------------------- #
-# Geometry: one dimension up from check_line_accuracy's line fit
+# Geometry: one dimension up from a 3D line fit
 # --------------------------------------------------------------------------- #
 
 def fit_plane_3d(points: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
     """PCA plane fit. Returns centroid, unit normal, and RMS distance to plane.
 
-    One dimension up from check_line_accuracy.fit_line_3d: there the fitted
-    direction is the LARGEST singular vector (a line's tangent). Here the
-    normal is the SMALLEST singular vector -- the direction of least
-    variance across points that are meant to be coplanar.
+    One dimension up from a PCA line fit: there the fitted direction is the
+    LARGEST singular vector (a line's tangent). Here the normal is the
+    SMALLEST singular vector -- the direction of least variance across
+    points that are meant to be coplanar.
     """
     points = np.asarray(points, dtype=np.float64)
     if len(points) < 3:
@@ -124,6 +123,39 @@ def perpendicular_distance_to_plane(
     """Signed perpendicular distance from a point to a fitted plane."""
     offset = np.asarray(point, dtype=np.float64) - np.asarray(plane_centroid, dtype=np.float64)
     return float(offset @ plane_normal)
+
+
+# --------------------------------------------------------------------------- #
+# Scale fit
+# --------------------------------------------------------------------------- #
+
+def fit_scale(truth_mm: np.ndarray, measured_mm: np.ndarray) -> Dict[str, Any]:
+    """Fit measured = a*true (and measured = a*true + b) across every distance.
+
+    ``a`` is the answer to "am I within 1 %": it is the systematic scale error of
+    the whole rig, which a mean absolute error cannot separate from random scatter.
+    A significant intercept ``b`` points at a line-localisation bias instead --
+    a fixed offset on every length rather than a proportional one.
+    """
+    truth = np.asarray(truth_mm, dtype=np.float64)
+    measured = np.asarray(measured_mm, dtype=np.float64)
+
+    scale = float(truth @ measured / (truth @ truth))
+    residual = measured - scale * truth
+
+    design = np.column_stack([truth, np.ones(len(truth))])
+    (slope, intercept), *_ = np.linalg.lstsq(design, measured, rcond=None)
+    affine_residual = measured - (slope * truth + intercept)
+
+    return {
+        "scale": scale,
+        "scale_error_pct": (scale - 1.0) * 100.0,
+        "residual_rms_mm": float(np.sqrt(np.mean(residual ** 2))),
+        "affine_slope": float(slope),
+        "affine_slope_error_pct": float((slope - 1.0) * 100.0),
+        "affine_intercept_mm": float(intercept),
+        "affine_residual_rms_mm": float(np.sqrt(np.mean(affine_residual ** 2))),
+    }
 
 
 # --------------------------------------------------------------------------- #

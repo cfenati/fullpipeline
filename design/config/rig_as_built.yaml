@@ -6,14 +6,14 @@
 #     python design_rig.py --rig design/config/rig_as_built.yaml info
 #
 # Source: auto-updated by stereo_calibrate.py (rgb_cam1/rgb_cam2)
-#   views used              209
-#   stereo RMS              2.074 px
-#   epipolar RMS            1.530 px
-#   baseline                49.98 mm
-#   optical axis angle      17.68 deg
+#   views used              54
+#   stereo RMS              1.853 px
+#   epipolar RMS            0.912 px
+#   baseline                110.04 mm
+#   optical axis angle      44.30 deg
 #
-#   rgb_cam2 is 132.0 mm from its designed position;
-#   baseline is 50.0 mm rather than 118.5 mm.
+#   rgb_cam2 is 173.4 mm from its designed position;
+#   baseline is 110.0 mm rather than 118.5 mm.
 #
 # rgb_cam1 is the world-frame anchor (its pose restates the design
 # intent). Cameras without a measured pair keep their design poses via extends.
@@ -40,16 +40,16 @@ cameras:
 - name: rgb_cam2
   pose:
     position:
-    - -0.038832
-    - -0.049591
-    - 0.188505
+    - -0.029171
+    - -0.104596
+    - 0.162195
     R:
-    - - 0.0543635
-      - -0.983053025
-      - 0.1750753
-    - - -0.953035315
-      - 0.001233289
-      - 0.302856679
-    - - -0.297940093
-      - -0.183317293
-      - -0.936817203
+    - - 0.141080883
+      - -0.980062381
+      - 0.139906804
+    - - -0.715781848
+      - -0.003350795
+      - 0.698315916
+    - - -0.68392436
+      - -0.198661777
+      - -0.701983595

@@ -273,11 +273,24 @@ def draw_marker(canvas: np.ndarray, panel: "Panel", point: Sequence[float],
 
 def link_view(panel_a: "Panel", panel_b: "Panel",
               extrinsics: StereoExtrinsics, depth_m: float) -> None:
-    """Point camera B's view at whatever camera A is looking at.
+    """Point camera B's view at whatever camera A is looking at, at B's own zoom.
 
-    Zooming into A alone would leave B showing the whole frame, so the feature you
-    are about to click in B is a few pixels wide and unclickable. This walks A's
-    view centre out along its ray to a nominal depth and projects it into B.
+    A ONE-TIME snap, called only at session start and when `l` toggles link
+    ON -- NOT on every zoom/pan of A. Panel_a and panel_b are otherwise fully
+    independent: zooming or panning one never moves or rescales the other.
+    That was tried (auto-following on every zoom, and separately also
+    matching B's scale to A's) and reverted both times: recentring accuracy
+    is bounded by how close `depth_m` is to the TRUE depth of whatever A is
+    looking at, and a depth error produces a roughly CONSTANT pixel shift in
+    B regardless of zoom (on this rig's geometry, ~14 px per mm of depth
+    error at the image centre) -- so a view that keeps re-deriving itself
+    from a stale depth guess on every zoom/pan just looks like unwanted
+    coupling, and forcing B's zoom to follow made it worse (B's shrinking
+    field of view eventually can't contain that fixed error at all). This is
+    especially visible on this specific target (adjacent blocks span a real
+    height range), where depth_hint is routinely stale-by-tens-of-mm for
+    whatever the user has just panned to. Panel B's zoom is always left
+    untouched here regardless -- only the one-time offset is set.
 
     That depth is a VIEW aid only -- it moves the window, never a measurement.
     Every reported length still comes from triangulating two real clicks, so a
@@ -293,15 +306,16 @@ def link_view(panel_a: "Panel", panel_b: "Panel",
     projected = extrinsics.camera_matrix_b @ in_b
     centre_b = projected[:2] / projected[2]
 
-    focal_ratio = (extrinsics.camera_matrix_b[0, 0] / extrinsics.camera_matrix_a[0, 0])
-    panel_b.scale = panel_a.scale * focal_ratio
     panel_b.offset = centre_b - np.array(
         [panel_b.width, panel_b.height], dtype=np.float64) / (2.0 * panel_b.scale)
 
 
-def centre_on_ray(panel_a: "Panel", panel_b: "Panel", point_a: np.ndarray,
+def centre_on_ray(panel_b: "Panel", point_a: np.ndarray,
                   extrinsics: StereoExtrinsics, depth_m: float) -> None:
-    """Aim camera B's view at where a specific point of A is expected to appear."""
+    """Aim camera B's view at where a specific point of A is expected to appear.
+
+    Recentres only -- panel_b keeps its own zoom, independent of panel_a's.
+    """
     ray = np.linalg.inv(extrinsics.camera_matrix_a) @ np.array(
         [point_a[0], point_a[1], 1.0])
     in_b = extrinsics.R @ (ray * depth_m) + np.asarray(extrinsics.T).reshape(3)
@@ -309,8 +323,6 @@ def centre_on_ray(panel_a: "Panel", panel_b: "Panel", point_a: np.ndarray,
         return
     projected = extrinsics.camera_matrix_b @ in_b
     centre = projected[:2] / projected[2]
-    panel_b.scale = panel_a.scale * (
-        extrinsics.camera_matrix_b[0, 0] / extrinsics.camera_matrix_a[0, 0])
     panel_b.offset = centre - np.array(
         [panel_b.width, panel_b.height], dtype=np.float64) / (2.0 * panel_b.scale)
 
@@ -378,6 +390,9 @@ def render(state: Dict[str, Any]) -> np.ndarray:
     view_a, view_b = panel_a.render(), panel_b.render()
     canvas = np.hstack([view_a, view_b])
     split = panel_a.width
+    # A and B are two independently-zoomed/panned views abutted in one window;
+    # without a visible seam the boundary between them is easy to miss.
+    cv2.line(canvas, (split, 0), (split, canvas.shape[0]), (140, 140, 140), 1, cv2.LINE_AA)
 
     consecutive = state["consecutive"]
     if len(state["clicks_a"]) >= 2:
@@ -552,10 +567,11 @@ def run_interactive(image_a: np.ndarray, image_b: np.ndarray,
         local = (x - (split if on_b else 0), y)
 
         if event == cv2.EVENT_MOUSEWHEEL:
+            # Zooming one panel must never move the other -- panel_a and
+            # panel_b are fully independent here, on purpose (this was tried
+            # both ways: auto-following on zoom/pan looked like coupling and
+            # broke down badly at high zoom, see link_view's docstring).
             panel.zoom_at(local, 1.25 if flags > 0 else 0.8)
-            if not on_b and state["linked"]:
-                link_view(state["panel_a"], state["panel_b"], extrinsics,
-                          state["depth_hint"])
             return
         if event == cv2.EVENT_RBUTTONDOWN or event == cv2.EVENT_MBUTTONDOWN:
             state["drag"] = (x, y, panel)
@@ -567,9 +583,6 @@ def run_interactive(image_a: np.ndarray, image_b: np.ndarray,
             px, py, target = state["drag"]
             target.pan((x - px, y - py))
             state["drag"] = (x, y, target)
-            if target is state["panel_a"] and state["linked"]:
-                link_view(state["panel_a"], state["panel_b"], extrinsics,
-                          state["depth_hint"])
             return
         if event != cv2.EVENT_LBUTTONDOWN or y >= panel.height:
             return
@@ -582,7 +595,7 @@ def run_interactive(image_a: np.ndarray, image_b: np.ndarray,
                 state["pending_line"] = epipolar_lines(snapped[None, :], fundamental)[0]
                 if state["linked"]:
                     # Put the match on screen in B before it is asked for.
-                    centre_on_ray(state["panel_a"], state["panel_b"], snapped,
+                    centre_on_ray(state["panel_b"], snapped,
                                   extrinsics, state["depth_hint"])
         elif on_b:
             # Centroid first (the dot's true centre), then the epipolar line
@@ -633,15 +646,22 @@ def run_interactive(image_a: np.ndarray, image_b: np.ndarray,
             state["status"] = [
                 head,
                 f"measurements: {recent}" if recent else "measurements: (need two points)",
-                ("wheel = zoom (camera A drags B along)   right-drag = pan   "
-                 f"0 = fit   l = link {'ON' if state['linked'] else 'OFF'}"),
+                ("wheel = zoom (fully independent)   right-drag = pan (fully independent)   "
+                 f"0 = fit both   l = aim B at each new A-click "
+                 f"{'ON' if state['linked'] else 'OFF'}"),
                 "u undo | r reset | n advance/label | q or Esc = finish and print the report",
             ]
         cv2.imshow(window, render(state))
         key = cv2.waitKey(20)
         # Closing the window with its X button must end the session too, or the
-        # loop would spin forever on an invisible window.
-        if cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
+        # loop would spin forever on an invisible window. Some OpenCV/Qt builds
+        # raise "NULL guiReceiver" here instead of returning <1 once the window
+        # is gone -- both mean the same thing: stop.
+        try:
+            still_open = cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) >= 1
+        except cv2.error:
+            still_open = False
+        if not still_open:
             break
         if key == -1:
             continue

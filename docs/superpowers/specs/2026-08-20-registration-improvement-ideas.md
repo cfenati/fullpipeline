@@ -157,6 +157,56 @@ needed to score that.
    target with real depth variation near the frame edge -- not just another
    flat board capture.
 
+9. **Depth-aware triangle rejection, status: implemented and threshold-tuned
+   2026-08-26 on one real capture, not yet cross-checked on others.**
+   Implemented as `depth_discontinuous_triangle_mask` /
+   `--no-reject-depth-discontinuous-triangles` (default: on, threshold
+   `--max-triangle-depth-range`, default 3mm). Motivated by the user
+   observing non-straight edges in registered output on scenes with large
+   height/depth variation: the existing `degenerate_triangle_mask` only looks
+   at the *projected* 2-D triangle in camera-A pixel space (area,
+   slenderness), so a triangle can be an ordinary size/shape there while
+   still bridging a real depth discontinuity, if matches land densely on
+   both sides of it -- linear interpolation across that Z jump is what bends
+   a physically straight edge. This new check reuses the Z already
+   triangulated per-match (no extra compute) and rejects a triangle directly
+   when its 3 vertices span more than the threshold in real depth,
+   independent of the shape check.
+
+   Threshold was NOT left at the initial guess: a first default of 20mm
+   (20% of the config `depth_range` window) turned out to be a no-op on
+   `captures/20260818_152114_103039` (real hand capture) -- that scene's
+   whole triangulated Z only spans ~30mm end to end, so no triangle ever
+   reached 20mm (0/5535 rejected). A sweep on that capture, checked visually
+   via `preview_features.jpg` at each point: 10mm->4 rejected, 5mm->43,
+   3mm->85 (new gaps land at finger-valley creases -- real discontinuities
+   -- with no visible damage to smooth finger surface), 2mm->258 (starts
+   speckling flat non-edge finger surface -- triangulation noise, not a real
+   discontinuity), 1mm->1588 (28.7% of all triangles, visibly shreds the
+   surface). Shipped default: 3mm, the last clean point before the knee.
+
+   Caveat: only validated on that one capture, and not run through
+   `check_registration_error.py`'s ChArUco set -- that board is flat, so it
+   can never exercise this check at all (same blind spot already on record
+   for border-anchor/feathering in the Context section above). Revisit the
+   3mm default if a differently-shaped scene (larger real depth range, or a
+   much flatter one) suggests a different number.
+
+10. **Idea, not implemented, deferred by user 2026-08-26: edge maps as a
+    keypoint-placement signal, not a correspondence source.** Distinct from
+    the LoFTR-seeding idea in #3 -- rather than adding another matcher's
+    correspondences near edges, use classical edge detection (e.g. Canny) on
+    camera A as a *prior* that biases where DISK (or a SuperPoint-style
+    detector) places/keeps keypoints, so the mesh gets denser vertices
+    flanking a depth discontinuity without trusting the edge pixels
+    themselves as matches (an edge pixel's appearance differs between the
+    two cameras' viewpoints, so directly matching a synthetic edge point
+    would be unreliable -- the edge map would only *guide sampling*, the
+    correspondence would still come from real DISK/LightGlue matches just
+    outside it). Complements idea #9: denser vertices near the discontinuity
+    shrinks how far any surviving triangle has to bridge across it, on top
+    of rejecting the ones that still do.
+
 ## Explicitly not pursued now
 
 - Finishing a real `register_foundationstereo.py` inference run (dense DL,

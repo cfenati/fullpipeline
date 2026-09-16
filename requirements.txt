@@ -13,3 +13,4 @@ torch>=2.0            # CPU-only build recommended on disk-constrained machines:
                        #   pip install torch --index-url https://download.pytorch.org/whl/cpu
 kornia>=0.8            # provides the DISK extractor, LightGlueMatcher, and LoFTR
 torchvision>=0.15      # provides the RAFT optical flow model (--matcher raft)
+scipy>=1.10             # NearestNDInterpolator, depth extrapolation past the match hull

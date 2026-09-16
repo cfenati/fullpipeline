@@ -128,6 +128,33 @@ def triangulate_points(
     return homogeneous[:3].T
 
 
+def reproject_via_depth(
+    pixels_a: np.ndarray, depth: np.ndarray,
+    camera_matrix_a: np.ndarray, camera_matrix_b: np.ndarray,
+    R: np.ndarray, T: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Camera-A pixels + an assumed Z (metres) -> where that 3D point projects in camera B.
+
+    Inverse of triangulation: instead of two observations giving one 3D
+    point, one observation plus a known/estimated depth gives the same
+    thing. Unproject with K_a (``X = (u-cx)/fx * Z``, same for Y), move to
+    camera B's frame with ``X_b = R X_a + T``, project with K_b. Returns
+    (pixels_b, Z_b) so the caller can chirality-check ``Z_b > 0`` -- a wrong
+    or extrapolated depth can put the point behind camera B.
+    """
+    pixels = np.asarray(pixels_a, dtype=np.float64).reshape(-1, 2)
+    z = np.asarray(depth, dtype=np.float64).reshape(-1)
+    fx, fy = camera_matrix_a[0, 0], camera_matrix_a[1, 1]
+    cx, cy = camera_matrix_a[0, 2], camera_matrix_a[1, 2]
+    x = (pixels[:, 0] - cx) / fx * z
+    y = (pixels[:, 1] - cy) / fy * z
+    points_a = np.column_stack([x, y, z])
+    points_b = points_a @ np.asarray(R, dtype=np.float64).T + np.asarray(T, dtype=np.float64).reshape(1, 3)
+    projected = points_b @ np.asarray(camera_matrix_b, dtype=np.float64).T
+    pixels_b = projected[:, :2] / projected[:, 2:3]
+    return pixels_b, points_b[:, 2]
+
+
 def fundamental_for_undistorted(
     camera_matrix_a: np.ndarray, camera_matrix_b: np.ndarray, essential: np.ndarray,
 ) -> np.ndarray:

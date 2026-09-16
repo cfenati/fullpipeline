@@ -353,9 +353,7 @@ def parse_args() -> argparse.Namespace:
         "--alpha", type=float,
         default=reg_config.get("rectification_alpha", 1.0),
         help="stereoRectify alpha for the report's rectified.jpg/row-misalignment "
-             "check: 0 crops to valid pixels, 1 keeps all. Matches what "
-             "register_pipeline.py actually uses by default, so the preview reflects "
-             "real registration output instead of a stricter, more-cropped view "
+             "check: 0 crops to valid pixels, 1 keeps all "
              "(default: registration.rectification_alpha in config, else %(default)s).",
     )
     parser.add_argument("--no-figures", action="store_true",

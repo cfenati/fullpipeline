@@ -27,6 +27,7 @@ WINDOW_NAME = "Thermal accuracy check (r = record gun reading, q = quit)"
 DEFAULT_SCALE = 4
 DEFAULT_INTERVAL_S = 10.0
 DEFAULT_OUT_DIR = PROJECT_ROOT / "thermal_reports"
+PLOT_SMOOTHING_SPAN_S = 60.0
 OVERLAY_FONT = cv2.FONT_HERSHEY_SIMPLEX
 TEXT_COLOR = (0, 255, 0)
 ROI_COLOR = (0, 255, 0)
@@ -84,6 +85,18 @@ def roi_stats(temperature_c: np.ndarray, roi: tuple[int, int, int, int]) -> tupl
 
 def compute_offsets(camera_mean_c: float, camera_max_c: float, gun_c: float) -> tuple[float, float]:
     return camera_mean_c - gun_c, camera_max_c - gun_c
+
+
+def smooth_series(values: list[float], window_samples: int) -> list[float]:
+    if window_samples <= 1 or len(values) < 2:
+        return list(values)
+    half = window_samples // 2
+    n = len(values)
+    smoothed = []
+    for i in range(n):
+        lo, hi = max(0, i - half), min(n, i + half + 1)
+        smoothed.append(sum(values[lo:hi]) / (hi - lo))
+    return smoothed
 
 
 def compute_offset_stats(checkpoints: list[dict], accuracy_abs_c: float, accuracy_pct: float) -> dict:
@@ -292,7 +305,19 @@ def write_plot(
         2, 1, figsize=(9, 7), sharex=True, gridspec_kw={"height_ratios": [1.4, 1]}
     )
 
-    ax_temp.plot(times, means, color="tab:orange", label="ROI mean temp (camera)")
+    if len(times) >= 2:
+        gaps = [b - a for a, b in zip(times, times[1:]) if b > a]
+        median_dt_s = sorted(gaps)[len(gaps) // 2] if gaps else DEFAULT_INTERVAL_S
+    else:
+        median_dt_s = DEFAULT_INTERVAL_S
+    window_samples = max(1, round(PLOT_SMOOTHING_SPAN_S / median_dt_s))
+    smoothed_means = smooth_series(means, window_samples)
+
+    ax_temp.plot(times, means, color="tab:orange", alpha=0.25, linewidth=0.8, label="ROI mean temp (raw)")
+    ax_temp.plot(
+        times, smoothed_means, color="tab:orange", linewidth=1.8,
+        label=f"ROI mean temp ({int(PLOT_SMOOTHING_SPAN_S)}s smoothed)",
+    )
     ax_temp.scatter(checkpoint_times, checkpoint_gun, color="tab:blue", zorder=3, label="gun reading")
     if len(means) >= 5:
         low, high = np.percentile(means, [1, 99])
@@ -449,7 +474,13 @@ def run(
                         f"gun={gun_c:.2f}C offset={offset_mean_c:+.2f}C"
                     )
 
-            if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+            # Some OpenCV/Qt builds raise "NULL guiReceiver" here instead of
+            # returning <1 once the window is closed -- both mean: stop.
+            try:
+                still_open = cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) >= 1
+            except cv2.error:
+                still_open = False
+            if not still_open:
                 break
             if duration is not None and elapsed_s >= duration:
                 break

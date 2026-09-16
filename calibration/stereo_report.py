@@ -149,9 +149,9 @@ def format_report(report: StereoReport) -> str:
     add(f"  baseline vs A's axis        {extrinsics.baseline_axis_angle_deg:9.3f} deg"
         "   (90 = side by side)")
     add("")
-    add("  Lengths are metric only through the printed square size "
-        f"({float(board.get('square_size_m', 0)) * 1000:.2f} mm): a 1 % error there is a 1 %")
-    add("  error in the baseline and in every distance triangulated from it.")
+    add(f"  Metric scale rests entirely on the printed square size "
+        f"({float(board.get('square_size_m', 0)) * 1000:.2f} mm); a 1 % error")
+    add("  there is a 1 % error in every distance below.")
     add("")
 
     add("FIT QUALITY")
@@ -168,18 +168,15 @@ def format_report(report: StereoReport) -> str:
     add(f"  reconstruction scale        {closure['scale_mean']:8.5f} "
         f"+/- {closure['scale_std']:.5f}   (1.0 = consistent)")
     add("")
-    add("  The epipolar residual is the one to quote. It is free of the board poses and of")
-    add("  the fixed intrinsics' own error, so it isolates the pair, and it applies to any")
-    add("  later image pair rather than only to this board.")
+    add("  Quote the epipolar residual: it excludes board-pose and intrinsics error, so it")
+    add("  isolates the pair and applies beyond this one board.")
     add("")
     floor = extrinsics.intrinsic_rms_px
     if floor is not None:
-        add(f"  For reference, the stereo fit's own residual is "
-            f"{extrinsics.reprojection_error_px:.3f} px against the")
-        add(f"  {floor:.3f} px these fixed intrinsics already carried on their own set, i.e. "
-            f"{extrinsics.reprojection_error_px / floor:.1f}x it.")
-        add("  Only that ratio means anything: the fit reprojects through camera matrices it")
-        add("  may not touch, so it inherits their error and cannot go below it.")
+        add(f"  For reference: the fit's own residual is {extrinsics.reprojection_error_px:.3f} px, "
+            f"{extrinsics.reprojection_error_px / floor:.1f}x the {floor:.3f} px floor already")
+        add("  in these fixed intrinsics. Only that ratio matters -- the fit inherits the")
+        add("  intrinsics' error and cannot beat it.")
         add("")
 
     if report.scatter:
@@ -195,8 +192,8 @@ def format_report(report: StereoReport) -> str:
         add(f"  board distance              {scatter['depth_min_m']:.3f} / "
             f"{scatter['depth_mean_m']:.3f} / {scatter['depth_max_m']:.3f} m (min/mean/max)")
         add("")
-        add("  A rigid pair gives the same baseline in every view. Scatter here is the")
-        add("  repeatability of the measurement, and the only way a bumped camera shows up.")
+        add("  A rigid pair gives the same baseline every view; scatter here is measurement")
+        add("  repeatability, and the only sign of a bumped camera.")
         add("")
 
     if report.blocks:
@@ -215,9 +212,8 @@ def format_report(report: StereoReport) -> str:
             add("")
             add(f"  across sittings: baseline {min(baselines):.2f} to {max(baselines):.2f} mm, "
                 f"convergence {min(convergences):.2f} to {max(convergences):.2f} deg.")
-            add("  A rigid mount keeps those numbers; disagreement means the relative pose")
-            add("  changed between sittings. Fit one sitting with --block N, or recapture in")
-            add("  one continuous session.")
+            add("  A rigid mount keeps these numbers steady; disagreement means the pose shifted")
+            add("  between sittings. Fit one with --block N, or recapture in one session.")
         add("")
 
     add(f"COVERAGE OVERLAP   on planes fronto-parallel to {extrinsics.name_a}")
@@ -232,9 +228,8 @@ def format_report(report: StereoReport) -> str:
             + _cell(sweep.shared_area_cm2[i], 8, 1) + "cm2"
             + _cell(sweep.area_a_cm2[i], 10, 1) + "cm2")
     best = sweep.best_overlap_depth()
-    add(f"  the pair shares most of its view at {best:.3f} m. Overlap is a working-distance")
-    add("  choice, not a property of the rig: a fixed pose sees the same scene from both")
-    add("  cameras further away, and diverging views closer in.")
+    add(f"  Overlap peaks at {best:.3f} m. That's a working-distance choice, not a rig")
+    add("  property -- a fixed pose overlaps more far away and less up close.")
     if sweep.unbounded_depths:
         add(f"  ({extrinsics.name_b}'s field does not close on the planes at or below "
             f"{max(sweep.unbounded_depths):.3f} m, so its area and the IoU are left blank)")
@@ -255,10 +250,9 @@ def format_report(report: StereoReport) -> str:
             + _cell(sweep.depth_sigma_mm["axis"][i], 11, 3) + "mm"
             + _cell(sweep.disparity_px[i], 11, 0))
     add("")
-    add(f"  sigma_z = {sweep.disparity_noise_px:.2f} px of matching error, propagated as")
-    add("  noise * distance_from_B / (f_B * sin(triangulation angle)). For a rectified pair")
-    add("  that is the familiar z^2 * noise / (f * baseline), but it stays valid when the")
-    add("  cameras converge.")
+    add(f"  sigma_z assumes {sweep.disparity_noise_px:.2f} px of matching noise, propagated as")
+    add("  noise * distance / (f * sin(angle)) -- the familiar z^2 * noise / (f * baseline)")
+    add("  for a rectified pair, but valid for converging cameras too.")
     add("")
 
     registration = report.registration
@@ -279,17 +273,16 @@ def format_report(report: StereoReport) -> str:
     reference = registration.reference_depth_m
     near, far = registration.depth_for_error(REGISTRATION_TOLERANCE_PX)
     if np.isfinite(near) and np.isfinite(far):
-        add(f"  under {REGISTRATION_TOLERANCE_PX:.0f} px only between {near:.4f} and {far:.4f} m:"
-            f" -{(reference - near) * 1000:.1f} / +{(far - reference) * 1000:.1f} mm about the")
-        add(f"  reference plane. Anything thicker than that {(far - near) * 1000:.1f} mm slab "
-            "needs a per-pixel depth, not a fixed mapping.")
+        add(f"  Stays under {REGISTRATION_TOLERANCE_PX:.0f} px only within {near:.4f}-{far:.4f} m "
+            f"(-{(reference - near) * 1000:.1f}/+{(far - reference) * 1000:.1f} mm of reference).")
+        add(f"  Anything thicker than {(far - near) * 1000:.1f} mm needs a per-pixel depth map.")
     elif np.isfinite(near):
         add(f"  under {REGISTRATION_TOLERANCE_PX:.0f} px for everything beyond {near:.3f} m")
     if report.uncertainty is not None:
         floor = report.uncertainty.at(reference)
-        add(f"  noise floor from the extrinsics alone: {floor['rms_px']:.2f} px "
-            f"({floor['rms_mm']:.3f} mm) at the reference plane. A depth map removes the")
-        add("  parallax term above; it does not remove this one.")
+        add(f"  Extrinsics-only noise floor: {floor['rms_px']:.2f} px "
+            f"({floor['rms_mm']:.3f} mm) at the reference plane -- a depth map removes")
+        add("  the parallax error above but not this floor.")
     add("")
 
     rectification = report.rectification
@@ -305,23 +298,22 @@ def format_report(report: StereoReport) -> str:
         f"({rectified['depth_min_m']:.3f} to {rectified['depth_max_m']:.3f} m)")
     add("")
     if rectification.rotated:
-        add("  The frame is the original turned on its side: rectification always puts the search")
-        add("  direction along the image rows, and this baseline is vertical.")
+        add("  Frame is rotated 90 deg: rectification aligns rows to the baseline, which is")
+        add("  vertical here.")
     if rectification.degenerate:
-        add("  OpenCV's alpha scaling degenerated here (no common rectangle survives), so the")
-        add("  focal length above is a plain average of the two cameras and both frames were")
-        add(f"  aimed at the centre of the {reference:.3f} m plane instead. The rotations, and with")
-        add("  them the row alignment, are OpenCV's own and unaffected; the wasted frame is real.")
-    add("  Those depths are along the rectified axis, which rectification swings off")
-    add(f"  {extrinsics.name_a}'s optical axis, so they need not match the board distances above.")
+        add("  Alpha scaling degenerated (no common rectangle survives): focal length above is")
+        add(f"  a plain average of both cameras, and both frames center on the {reference:.3f} m")
+        add("  plane instead. Row alignment is unaffected; the wasted frame area is real.")
+    add(f"  These depths follow the rectified axis, tilted off {extrinsics.name_a}'s optical")
+    add("  axis -- they need not match the board distances above.")
     if rectification.disparity_at_infinity_px:
-        add(f"  Zero disparity is the {reference:.3f} m plane here, not infinity, which sits at"
-            f" {rectification.disparity_at_infinity_px:.1f} px, so")
-        add("  convert with Q or depth_from_disparity rather than f*B/d.")
+        add(f"  Zero disparity is the {reference:.3f} m plane, not infinity (infinity sits at "
+            f"{rectification.disparity_at_infinity_px:.1f} px) --")
+        add("  convert with Q or depth_from_disparity, not f*B/d.")
     if rectified["disparity_reversed"]:
-        add(f"  Disparity decreases with range, i.e. {extrinsics.name_a} is the second camera along")
-        add("  the rectified axis. Swap --camera-a and --camera-b for the conventional ordering if")
-        add("  you intend to feed a block matcher that expects positive disparity.")
+        add(f"  Disparity decreases with range: {extrinsics.name_a} is the second camera along the")
+        add("  rectified axis. Swap --camera-a/--camera-b if a block matcher expects positive")
+        add("  disparity.")
     add("")
 
     if report.warnings:
@@ -334,9 +326,9 @@ def format_report(report: StereoReport) -> str:
     if report.suspect:
         add("Views that disagree with the set")
         add(rule)
-        add("  Kept in the fit so the numbers stay reproducible from the captures alone.")
-        add("  Re-run with --exclude <session> ..., or delete those session folders by hand,")
-        add("  then run stereo_calibrate.py again.")
+        add("  Kept in the fit for reproducibility from the captures alone. Remove with")
+        add("  --exclude <session> ..., or delete the session folder and re-run")
+        add("  stereo_calibrate.py.")
         add("")
         for label in sorted(report.suspect, key=report.epipolar_rms, reverse=True):
             add(f"  {label}")

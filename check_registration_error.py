@@ -1,40 +1,15 @@
 #!/usr/bin/env python3
 """Score register_features.py's warp against real, precisely-known points.
 
-Every comparison of register_features.py's output so far has been eyeballing
-a checkerboard/blend overlay of an uncontrolled hand capture -- useful for
-spotting gross defects, but it cannot say "the warp is off by N px here" or
-let two configurations (e.g. --no-border-anchors vs. default) be ranked by a
-number instead of a vibe.
-
-This script reuses the same held-out ChArUco board set cross_validate_stereo.py
-already validates calibration against (default captures/cross-validation,
-geometric_calibration.cross_validation_captures): board corners are detected
-independently in both cameras, so a corner's position in camera B is known
-ground truth, not something inferred from the warp being scored. For each
-session:
-    1. Build the exact same piecewise-affine mesh register_features.py's
-       main() would (LightGlue match -> confidence filter -> triangulate ->
-       border anchors -> build_mesh_interpolators), reusing its functions
-       directly rather than re-deriving the geometry.
-    2. Undistort the board corners detected in camera A and B (detection runs
-       on the raw distorted JPEG, register_features.py's mesh lives in the
-       undistorted+downscaled frame) via cv2.undistortPoints, then scale by
-       --downscale to land in that same working-resolution frame.
-    3. Evaluate the mesh at each camera-A corner to predict where it should
-       land in camera B (falling back to the same calibrated plane
-       register_features.py itself falls back to, outside the mesh), and
-       compare against the corner's own independently-detected position in B.
-
-Caveat: a flat ChArUco board at calibration distance is not the same subject
-as a close-range hand spanning several centimetres of depth -- this measures
-warp accuracy on a different (single-plane-friendly) scene, not hand-specific
-performance. It is still the only number here that isn't eyeballed.
+Board corners are detected independently in both cameras, so a corner's
+position in camera B is known ground truth. For each session the same
+piecewise-affine mesh register_features.py builds (match -> triangulate ->
+Delaunay) is evaluated at those corners. Corners outside the match hull
+are not scored -- they have no triangulated Z.
 
 Usage:
     python check_registration_error.py
     python check_registration_error.py --session captures/cross-validation/<one>
-    python check_registration_error.py --no-border-anchors
 """
 
 from __future__ import annotations
@@ -63,7 +38,7 @@ from calibration.stereo import (  # noqa: E402
     detect_stereo_observations,
 )
 from calibration.target_board import TargetBoard  # noqa: E402
-from register_pipeline import (  # noqa: E402
+from registration_io import (  # noqa: E402
     DEFAULT_DEPTH_MAX,
     DEFAULT_DEPTH_MIN,
     DEFAULT_REGISTRATION_OUTPUT_DIR,
@@ -76,9 +51,7 @@ from register_features import (  # noqa: E402
     DEFAULT_DOWNSCALE,
     DEFAULT_MAX_KEYPOINTS,
     DEFAULT_MIN_CONFIDENCE,
-    border_anchor_points,
     build_mesh_interpolators,
-    BORDER_ANCHOR_SPACING_PX,
     extract_features,
     extract_features_tiled,
     geometric_consistency_mask,
@@ -91,7 +64,6 @@ from register_features import (  # noqa: E402
     match_features,
     match_loftr,
     match_raft,
-    project_via_plane,
     RAFT_FB_CONSISTENCY_THRESHOLD_PX,
     RAFT_GRID_STEP_PX,
     triangulate_matches,
@@ -136,7 +108,6 @@ def parse_args() -> argparse.Namespace:
                         help="Must match the register_features.py run being scored "
                              "(default: %(default)s).")
     parser.add_argument("--min-confidence", type=float, default=DEFAULT_MIN_CONFIDENCE)
-    parser.add_argument("--no-border-anchors", action="store_true")
     parser.add_argument("--no-reject-degenerate-triangles", action="store_true")
     parser.add_argument("--no-geometric-consistency-filter", action="store_true")
     parser.add_argument("--tiled-keypoints", action="store_true",
@@ -170,7 +141,7 @@ def evaluate_observation(
     disk, lg_matcher, loftr, raft_model, matcher_choice: List[str], device: torch.device,
     downscale: float, min_confidence: float,
     depth_min: float, depth_max: float,
-    use_border_anchors: bool, reject_degenerate: bool, use_tiled_keypoints: bool,
+    reject_degenerate: bool, use_tiled_keypoints: bool,
     use_geometric_filter: bool,
 ) -> dict:
     """Build register_features.py's mesh for this session and evaluate it at
@@ -182,7 +153,6 @@ def evaluate_observation(
         undistorted_a, undistorted_b, extrinsics.camera_matrix_a, extrinsics.camera_matrix_b, downscale,
     )
     size_a = (color_a.shape[1], color_a.shape[0])
-    size_b = (color_b.shape[1], color_b.shape[0])
 
     pts_a_parts, pts_b_parts, scores_parts = [], [], []
     if "disk" in matcher_choice:
@@ -228,20 +198,11 @@ def evaluate_observation(
     if n_inliers < MIN_MESH_POINTS:
         return {"label": observation.label, "skipped": f"only {n_inliers} triangulated matches"}
 
-    fill_depth = float(np.median(depths[inliers]))
     mesh_pts_a, mesh_pts_b = pts_a[inliers], pts_b[inliers]
-    if use_border_anchors:
-        candidate_anchors_a = border_anchor_points(size_a, BORDER_ANCHOR_SPACING_PX)
-        anchors_b, anchors_valid = project_via_plane(
-            candidate_anchors_a, camera_matrix_a, camera_matrix_b,
-            extrinsics.R, extrinsics.T, fill_depth, size_b,
-        )
-        mesh_pts_a = np.concatenate([mesh_pts_a, candidate_anchors_a[anchors_valid]])
-        mesh_pts_b = np.concatenate([mesh_pts_b, anchors_b[anchors_valid]])
-
-    interpolate_x, interpolate_y, n_rejected, n_triangles = build_mesh_interpolators(
+    interpolate_x, interpolate_y, n_rejected_shape, n_rejected_depth, n_triangles = build_mesh_interpolators(
         mesh_pts_a, mesh_pts_b, reject_degenerate,
     )
+    n_rejected = n_rejected_shape + n_rejected_depth  # depths=None above -> n_rejected_depth is always 0
 
     corner_a = undistort_points(observation.left_points, extrinsics.camera_matrix_a, extrinsics.distortion_a) * downscale
     corner_b_truth = undistort_points(observation.right_points, extrinsics.camera_matrix_b, extrinsics.distortion_b) * downscale
@@ -249,14 +210,10 @@ def evaluate_observation(
     predicted_x = interpolate_x(corner_a[:, 0], corner_a[:, 1])
     predicted_y = interpolate_y(corner_a[:, 0], corner_a[:, 1])
     mesh_covered = ~np.ma.getmaskarray(predicted_x)
-    predicted_mesh = np.ma.filled(np.stack([predicted_x, predicted_y], axis=1), np.nan)
-
-    predicted_plane, plane_valid = project_via_plane(
-        corner_a, camera_matrix_a, camera_matrix_b, extrinsics.R, extrinsics.T, fill_depth, size_b,
-    )
-
-    predicted = np.where(mesh_covered[:, None], predicted_mesh, predicted_plane)
-    valid = mesh_covered | plane_valid
+    predicted = np.ma.filled(np.stack([predicted_x, predicted_y], axis=1), np.nan)
+    valid = mesh_covered
+    if not valid.any():
+        return {"label": observation.label, "skipped": "no board corners inside the match hull"}
     errors_px = np.linalg.norm(predicted[valid] - corner_b_truth[valid], axis=1)
 
     return {
@@ -311,7 +268,6 @@ def main() -> int:
         raise SystemExit("No usable session had the board visible in both cameras.")
 
     reject_degenerate = not args.no_reject_degenerate_triangles
-    use_border_anchors = not args.no_border_anchors
     use_tiled_keypoints = args.tiled_keypoints
     use_geometric_filter = not args.no_geometric_consistency_filter
     device = torch.device("cpu")
@@ -330,7 +286,7 @@ def main() -> int:
         result = evaluate_observation(
             observation, session_dir, args.camera_a, args.camera_b, extrinsics,
             disk, lg_matcher, loftr, raft_model, args.matcher, device, args.downscale, args.min_confidence,
-            depth_min, depth_max, use_border_anchors, reject_degenerate, use_tiled_keypoints,
+            depth_min, depth_max, reject_degenerate, use_tiled_keypoints,
             use_geometric_filter,
         )
         if "skipped" in result:
@@ -360,13 +316,11 @@ def main() -> int:
         f"  extrinsics:       {extrinsics_path}",
         f"  downscale:        {args.downscale}",
         f"  matcher:          {' '.join(args.matcher)}",
-        f"  border anchors:   {'on' if use_border_anchors else 'off (--no-border-anchors)'}",
         f"  degenerate reject: {'on' if reject_degenerate else 'off (--no-reject-degenerate-triangles)'}",
         f"  tiled keypoints:  {'on (--tiled-keypoints)' if use_tiled_keypoints else 'off'}",
         f"  geometric filter: {'on' if use_geometric_filter else 'off (--no-geometric-consistency-filter)'}",
         f"  sessions scored:  {len(scored)}/{len(results)}",
-        f"  corners scored:   {len(all_errors)} ({n_mesh_total} via mesh, "
-        f"{len(all_errors) - n_mesh_total} via fallback plane)",
+        f"  corners scored:   {len(all_errors)} (inside triangulated match hull only)",
         "",
         "ERROR (working-resolution px, camera B)",
         "-" * 66,
@@ -394,7 +348,6 @@ def main() -> int:
 
     summary = {
         "downscale": args.downscale,
-        "use_border_anchors": use_border_anchors,
         "reject_degenerate_triangles": reject_degenerate,
         "use_tiled_keypoints": use_tiled_keypoints,
         "use_geometric_filter": use_geometric_filter,

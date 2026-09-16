@@ -164,6 +164,53 @@ def collect_session_pairs(
     return [pairs[label] for label in sorted(pairs)], notes
 
 
+def pair_observations_from_boards(
+    label: str,
+    left: Optional[BoardObservation],
+    right: Optional[BoardObservation],
+    all_object_points: np.ndarray,
+    min_shared_corners: int = DEFAULT_MIN_SHARED_CORNERS,
+) -> Tuple[Optional[StereoObservation], Optional[str]]:
+    """Intersect two per-camera board detections into one stereo observation.
+
+    Only corners identified in *both* images can constrain the relative pose.
+    Takes already-detected :class:`BoardObservation`s (not file paths), so it
+    drives both the offline per-session loop below and a live, in-memory gate
+    check equally. Returns ``(None, reason)`` when the pair isn't usable.
+    """
+    if left is None or right is None:
+        missing = []
+        if left is None:
+            missing.append("A: not detected")
+        if right is None:
+            missing.append("B: not detected")
+        return None, "; ".join(missing)
+
+    shared = np.intersect1d(left.corner_ids, right.corner_ids)
+    if len(shared) < min_shared_corners:
+        return None, (
+            f"only {len(shared)} corners seen by both cameras "
+            f"(min {min_shared_corners}); "
+            f"A saw {left.corner_count}, B saw {right.corner_count}"
+        )
+
+    index_a = {int(cid): i for i, cid in enumerate(left.corner_ids)}
+    index_b = {int(cid): i for i, cid in enumerate(right.corner_ids)}
+    rows_a = [index_a[int(cid)] for cid in shared]
+    rows_b = [index_b[int(cid)] for cid in shared]
+
+    observation = StereoObservation(
+        label=label,
+        left=left,
+        right=right,
+        corner_ids=shared.astype(np.int32),
+        object_points=all_object_points[shared].reshape(-1, 1, 3).astype(np.float32),
+        left_points=left.image_points.reshape(-1, 2)[rows_a].reshape(-1, 1, 2).astype(np.float32),
+        right_points=right.image_points.reshape(-1, 2)[rows_b].reshape(-1, 1, 2).astype(np.float32),
+    )
+    return observation, None
+
+
 def detect_stereo_observations(
     session_pairs: Sequence[Tuple[str, Path, Path]],
     board: TargetBoard,
@@ -218,38 +265,14 @@ def detect_stereo_observations(
             skipped.append((label, "; ".join(missing)))
             continue
 
-        shared = np.intersect1d(left.corner_ids, right.corner_ids)
-        if len(shared) < min_shared_corners:
-            skipped.append(
-                (
-                    label,
-                    f"only {len(shared)} corners seen by both cameras "
-                    f"(min {min_shared_corners}); "
-                    f"A saw {left.corner_count}, B saw {right.corner_count}",
-                )
-            )
+        observation, reason = pair_observations_from_boards(
+            label, left, right, all_object_points, min_shared_corners
+        )
+        if observation is None:
+            skipped.append((label, reason))
             continue
 
-        index_a = {int(cid): i for i, cid in enumerate(left.corner_ids)}
-        index_b = {int(cid): i for i, cid in enumerate(right.corner_ids)}
-        rows_a = [index_a[int(cid)] for cid in shared]
-        rows_b = [index_b[int(cid)] for cid in shared]
-
-        stereo.append(
-            StereoObservation(
-                label=label,
-                left=left,
-                right=right,
-                corner_ids=shared.astype(np.int32),
-                object_points=all_object_points[shared].reshape(-1, 1, 3).astype(np.float32),
-                left_points=left.image_points.reshape(-1, 2)[rows_a]
-                .reshape(-1, 1, 2)
-                .astype(np.float32),
-                right_points=right.image_points.reshape(-1, 2)[rows_b]
-                .reshape(-1, 1, 2)
-                .astype(np.float32),
-            )
-        )
+        stereo.append(observation)
 
     return stereo, size_a, size_b, skipped
 
@@ -1667,12 +1690,11 @@ def stereo_quality_warnings(
 
     if rectification is not None and rectification.degenerate:
         warnings.append(
-            f"The pair does not rectify: the baseline is only "
-            f"{extrinsics.baseline_axis_angle_deg:.0f} deg from {extrinsics.name_a}'s optical "
-            f"axis (90 deg would be side by side) and the cameras toe in by "
-            f"{extrinsics.optical_axis_angle_deg:.0f} deg, so aligning the rows throws most of "
-            "both frames away. Triangulate matched points directly instead of running a "
-            "rectified block matcher."
+            f"Pair doesn't rectify well: baseline is {extrinsics.baseline_axis_angle_deg:.0f} deg "
+            f"from {extrinsics.name_a}'s axis (90 deg = side by side), cameras toe in "
+            f"{extrinsics.optical_axis_angle_deg:.0f} deg, so row alignment discards most of "
+            "both frames. Triangulate matched points directly instead of block-matching on "
+            "rectified images."
         )
 
     floor = extrinsics.intrinsic_rms_px
@@ -1680,29 +1702,28 @@ def stereo_quality_warnings(
         if extrinsics.reprojection_error_px > STEREO_RMS_FLOOR_RATIO * floor:
             warnings.append(
                 f"Stereo RMS is {extrinsics.reprojection_error_px:.2f} px, "
-                f"{extrinsics.reprojection_error_px / floor:.1f}x the {floor:.2f} px these "
-                "intrinsics already carried on their own calibration set. Only the excess is "
-                "about the pair, and it says the fixed intrinsics do not describe the part of "
-                "the frame these views land in - recalibrate each camera over the region the "
-                "stereo captures actually use."
+                f"{extrinsics.reprojection_error_px / floor:.1f}x the {floor:.2f} px floor "
+                "already in these intrinsics. The excess is what's attributable to the pair; "
+                "it means the fixed intrinsics don't fit this part of the frame - recalibrate "
+                "each camera over the region the stereo captures actually use."
             )
     else:
         stereo_limit = scaled_px(GOOD_STEREO_RMS_PX, extrinsics.image_size_a)
         if extrinsics.reprojection_error_px > stereo_limit:
             warnings.append(
-                f"Stereo RMS is {extrinsics.reprojection_error_px:.2f} px (expected below "
+                f"Stereo RMS is {extrinsics.reprojection_error_px:.2f} px (expected under "
                 f"{stereo_limit:.1f} px at {extrinsics.image_size_a[0]}x"
-                f"{extrinsics.image_size_a[1]}). Either the corner detections are soft or the "
-                "intrinsics do not fit these images; re-check the per-camera calibration first."
+                f"{extrinsics.image_size_a[1]}) - soft corner detection or mismatched "
+                "intrinsics; recheck the per-camera calibration first."
             )
 
     if epipolar:
         epi_limit = scaled_px(GOOD_EPIPOLAR_RMS_PX, extrinsics.image_size_a)
         if epipolar["rms_px"] > epi_limit:
             warnings.append(
-                f"Epipolar RMS is {epipolar['rms_px']:.2f} px (expected below "
-                f"{epi_limit:.1f} px at this resolution), so a matcher searching one "
-                "row along the epipolar line will miss correspondences."
+                f"Epipolar RMS is {epipolar['rms_px']:.2f} px (expected under "
+                f"{epi_limit:.1f} px at this resolution) - a matcher searching one row "
+                "along the epipolar line will miss correspondences."
             )
 
     n_input = extrinsics.views_used + len(extrinsics.rejected_views)
@@ -1711,24 +1732,23 @@ def stereo_quality_warnings(
         if fraction >= MAX_REJECT_FRACTION * 0.8:
             warnings.append(
                 f"Rejected {len(extrinsics.rejected_views)} of {n_input} views "
-                f"({fraction * 100:.0f} %). That much disagreement usually means the capture "
-                "spans more than one relative pose of the pair; check the capture-block "
-                "table and fit one sitting with --block N."
+                f"({fraction * 100:.0f} %) - likely spans more than one relative pose of the "
+                "pair; check the capture-block table and fit one sitting with --block N."
             )
 
     if extrinsics.views_used < 10:
         warnings.append(
-            f"Only {extrinsics.views_used} stereo views were used; 15+ views spread over "
-            "depth and across both frames make the pose far more stable."
+            f"Only {extrinsics.views_used} stereo views used; 15+ spread over depth and "
+            "across the frame gives a far more stable pose."
         )
 
     spread = scatter.get("baseline_spread")
     if spread is not None and spread > RIGID_BASELINE_TOLERANCE:
         warnings.append(
-            f"The single-view baseline varies by {spread * 100:.1f} % "
-            f"({scatter['baseline_std_mm']:.1f} mm about {scatter['baseline_mean_mm']:.1f} mm). "
-            "A rigid pair should agree to well under 1 %, so either a camera moved during "
-            "the capture or the views are too weak to constrain the pose."
+            f"Single-view baseline varies {spread * 100:.1f} % "
+            f"({scatter['baseline_std_mm']:.1f} mm about {scatter['baseline_mean_mm']:.1f} mm) - "
+            "a rigid pair should agree within 1 %; either a camera moved or the views too "
+            "weakly constrain the pose."
         )
 
     rotation_deviation = scatter.get("rotation_deviation_max_deg")
@@ -1742,9 +1762,9 @@ def stereo_quality_warnings(
     depth_max = scatter.get("depth_max_m")
     if depth_min and depth_max and depth_max / max(depth_min, 1e-9) < 1.3:
         warnings.append(
-            f"The board only ever sat between {depth_min:.3f} and {depth_max:.3f} m. "
-            "Extrinsics fitted at a single distance extrapolate poorly; vary the working "
-            "distance by at least a factor of two."
+            f"Board only sat between {depth_min:.3f} and {depth_max:.3f} m - extrinsics "
+            "fitted at one distance extrapolate poorly; vary the working distance by at "
+            "least 2x."
         )
 
     if blocks and len(blocks) >= 2:
@@ -1758,18 +1778,17 @@ def stereo_quality_warnings(
         ):
             warnings.append(
                 f"The {len(blocks)} capture sittings disagree: baseline spans "
-                f"{baseline_span:.2f} mm and convergence spans {convergence_span:.2f} deg. "
-                "A rigid mount should not move that much between sittings; the pooled fit "
-                "is a compromise. Prefer --block N on the cleanest sitting, or recapture "
-                "the pair in one continuous session."
+                f"{baseline_span:.2f} mm, convergence spans {convergence_span:.2f} deg - more "
+                "than a rigid mount should move. The pooled fit is a compromise; prefer "
+                "--block N on the cleanest sitting, or recapture in one session."
             )
 
     if sweep is not None and getattr(sweep, "unbounded_depths", None):
         depths = sweep.unbounded_depths
         warnings.append(
-            f"At {len(depths)} of the evaluated distances (from {min(depths):.3f} m) part of "
-            f"{extrinsics.name_b}'s field never reaches the plane, so its area and the IoU "
-            "are undefined there. The share of camera A's own view is still exact."
+            f"At {len(depths)} distances (from {min(depths):.3f} m), part of "
+            f"{extrinsics.name_b}'s field never reaches the plane - its area and IoU are "
+            "undefined there, though A's own share stays exact."
         )
 
     if sweep is not None:
@@ -1778,18 +1797,18 @@ def stereo_quality_warnings(
             widest = float(np.nanmax(angles))
             if widest > 45.0:
                 warnings.append(
-                    f"The triangulation angle reaches {widest:.0f} deg over the evaluated "
-                    "range. Beyond roughly 30 deg the two views of a surface stop looking "
-                    "alike, so dense matching fails long before the geometry does."
+                    f"Triangulation angle reaches {widest:.0f} deg - beyond roughly 30 deg "
+                    "the two views stop looking alike, so dense matching fails before the "
+                    "geometry does."
                 )
 
     if closure and np.isfinite(closure.get("scale_mean", float("nan"))):
         offset = abs(closure["scale_mean"] - 1.0)
         if offset > 0.02:
             warnings.append(
-                f"Triangulating the board reproduces it {offset * 100:.1f} % off scale, "
-                "which should not happen when the same board set the baseline. Suspect "
-                "mixed-up cameras or a board config that does not match the print."
+                f"Board reprojects {offset * 100:.1f} % off scale - shouldn't happen since "
+                "the same board set the baseline. Suspect swapped cameras or a board config "
+                "that doesn't match the print."
             )
 
     return warnings

@@ -1,0 +1,28 @@
+# Hand-built symmetric candidate: mountable with a fixed 10 deg inward tilt on
+# each camera and zero roll, rather than the optimizer's raw look-at solve
+# (which inherited the as-built pair's asymmetric azimuth/roll and isn't
+# something you can actually dial in on a mount).
+#
+# Baseline 92mm (46mm each side of centre), split along X to match rig.yaml's
+# original design axis. Height kept at the current ~188mm mount distance -
+# this rig cannot be moved closer to the target.
+#
+# 10 deg inward tilt undershoots exact convergence on the target centre
+# (that would need ~14 deg at this baseline/height) by about 4 deg - well
+# inside FOV margin, see design_rig.py info coverage check below.
+
+extends: rig_as_built.yaml
+name: rgb2_thermal1_baseline_widened
+cameras:
+- name: rgb_cam1
+  pose:
+    position: [-0.046, 0.0, 0.188]
+    azimuth_deg: 0.0
+    elevation_deg: -80.0
+    roll_deg: 0.0
+- name: rgb_cam2
+  pose:
+    position: [0.046, 0.0, 0.188]
+    azimuth_deg: 180.0
+    elevation_deg: -80.0
+    roll_deg: 0.0

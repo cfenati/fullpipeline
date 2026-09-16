@@ -13,11 +13,17 @@ cv2.aruco needs).
 Usage:
     python3 DIYer22/calibrate_rig.py
     python3 DIYer22/calibrate_rig.py --captures captures/stereo --camera-a rgb_cam1 --camera-b rgb_cam2
+
+Pass --fixed-intrinsics to pin K/D to stereo_calibrate.py's own intrinsics
+(calibration/results/<camera>/intrinsics.json) instead of calibrating.Cam's
+from-scratch fit on this stereo-only set, isolating whether cv2.stereoCalibrate's
+R/t solve agrees once both sides use identical intrinsics.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from glob import glob
 from pathlib import Path
@@ -72,7 +78,33 @@ def parse_args() -> argparse.Namespace:
              "cv2.stereoCalibrate's internal per-view PnP needs at least 4; "
              "calibrating.Stereo does not filter for this itself.",
     )
+    parser.add_argument(
+        "--fixed-intrinsics", action="store_true",
+        help="Pin K/D to stereo_calibrate.py's own intrinsics instead of "
+             "calibrating.Cam's from-scratch fit on this stereo-only capture set. "
+             "The default (free-fit) mode conflates any R/t disagreement with "
+             "stereo_calibrate.py with a disagreement in the intrinsics "
+             "themselves; this isolates the former.",
+    )
+    parser.add_argument(
+        "--intrinsics-dir", default=str(PROJECT_ROOT / "calibration" / "results"),
+        help="Where --fixed-intrinsics looks for <camera>/intrinsics.json "
+             "(default: %(default)s).",
+    )
     return parser.parse_args()
+
+
+def load_fixed_intrinsics(intrinsics_dir: str, camera: str) -> tuple[np.ndarray, np.ndarray]:
+    path = Path(intrinsics_dir) / camera / "intrinsics.json"
+    if not path.exists():
+        raise SystemExit(
+            f"--fixed-intrinsics: no intrinsics.json for {camera} at {path}.\n"
+            f"Run:  python calibrate_cameras.py --camera {camera}"
+        )
+    data = json.loads(path.read_text())
+    K = np.array(data["camera_matrix"], dtype=np.float64)
+    D = np.array(data["distortion"], dtype=np.float64).reshape(1, -1)
+    return K, D
 
 
 def drop_weak_views(caml, camr, min_shared_corners: int) -> None:
@@ -101,6 +133,11 @@ def main() -> int:
     camr = calibrating.Cam(paths_b, board, name=args.camera_b, save_feature_vis=False)
     print(caml)
     print(camr)
+
+    if args.fixed_intrinsics:
+        caml.K, caml.D = load_fixed_intrinsics(args.intrinsics_dir, args.camera_a)
+        camr.K, camr.D = load_fixed_intrinsics(args.intrinsics_dir, args.camera_b)
+        print(f"\nPinned K/D to {args.intrinsics_dir}/{{{args.camera_a},{args.camera_b}}}/intrinsics.json")
 
     drop_weak_views(caml, camr, args.min_shared_corners)
 

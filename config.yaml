@@ -27,12 +27,12 @@ rgb:
       exposure_dynamic_framerate: 0
 
   color_correction:
-    enabled: true
+    enabled: false
     blur_sigma_fraction: 0.08
     border_fraction: 0.12
     strength: 1.0
     max_gain: 1.6
-    min_gain: 0.85
+    min_gain: 0.85  
     preview_corrected: true
     on_the_fly_fallback: true
     # Generate with: python check_color.py --image <white_ref.jpg> --save-flat-field

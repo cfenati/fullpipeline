@@ -1,8 +1,8 @@
 """Depth-grid target: an independent relative-depth ruler for this rig.
 
-``check_line_accuracy.py``'s line ladder validates lateral (X-Y) triangulation
-accuracy -- but a flat, fronto-parallel plate has ~zero depth variation across
-it by construction, so it can never touch the Z-axis (depth). This target does
+A flat line-ladder plate validates lateral (X-Y) triangulation accuracy well --
+but a flat, fronto-parallel plate has ~zero depth variation across it by
+construction, so it can never touch the Z-axis (depth). This target does
 the depth-axis equivalent: a flat baseplate carries a grid of blocks, each a
 different, independently-measured height, plus a handful of flush (zero-
 standoff) corner fiducials used only to fit the plane that stands in for the

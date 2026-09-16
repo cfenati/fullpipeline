@@ -8,7 +8,7 @@ procedure. Read it before making changes; don't duplicate its content here.
 ## Running things
 
 Most entry-point scripts (`capture_pipeline.py`, `check_cameras.py`,
-`calibrate_cameras.py`, `stereo_calibrate.py`) talk to physical cameras via
+`calibrate_cameras.py`, `stereo_calibrate.py`, `calibrate_live.py`) talk to physical cameras via
 `v4l2-ctl` / vendor SDKs and **will not run without the hardware attached**.
 Don't assume a script failure means broken code — check whether it's a missing-device
 error first. Geometry-only work (`design_rig.py`, `design/`) has no hardware

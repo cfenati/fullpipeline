@@ -14,9 +14,9 @@ flags override them. Run `python <script>.py --help` for full options.
 | Prune bad views     | `prune_calibration.py` | deletes worst capture sessions                                |
 | Extrinsics          | `stereo_calibrate.py`  | `calibration/results/stereo_<a>_<b>/` (+ `rig_as_built.yaml`) |
 | Cross-validation    | `cross_validate_stereo.py` | `calibration/results/stereo_<a>_<b>/cross_validation/` |
+| Depth accuracy      | `check_depth_accuracy.py` | `calibration/results/depth_accuracy/` (relative depth error vs. a measured depth-grid target) |
 | Rig eval / optimize | `design_rig.py`        | coverage studies on measured geometry                         |
-| Registration        | `register_pipeline.py` | depth-aware warp between cameras                              |
-| Registration (sparse)| `register_features.py` | LightGlue matches → piecewise-affine warp                    |
+| Registration (sparse)| `register_features.py` | matches → DLT triangulation → piecewise-affine warp |
 
 
 
@@ -43,7 +43,7 @@ python calibrate_cameras.py --camera rgb_cam1           # re-fit
 python calibrate_cameras.py --camera rgb_cam2
 python stereo_calibrate.py --camera-a rgb_cam1 --camera-b rgb_cam2
 python design_rig.py --rig design/config/rig_as_built.yaml report
-python register_pipeline.py --session captures/<session>
+python register_features.py --session captures/<session>
 ```
 
 Calibrate at the same resolution you capture. Prefer
@@ -185,6 +185,31 @@ point. Software attempts to force those ratios to 1.0 were tried and removed —
 they look artificial and, because they are keyed to a centre patch, they get
 worse whenever the target moves. The real fix is a high-CRI (≥90) light source.
 
+## Guided live capture (recommended)
+
+```bash
+python calibrate_live.py --camera-a rgb_cam1 --camera-b rgb_cam2
+```
+
+Auto-captures every `--interval` seconds (default 3s) whenever the ChArUco
+board is visible with enough shared corners in both cameras, and re-fits
+cam1/cam2 intrinsics *and* stereo extrinsics live after every capture, so you
+see RMS, views used, coverage and a ready/not-ready card for each of the
+three fits as you go, plus a live count of views auto-excluded for having no
+board or a high residual. Nothing auto-stops — keep capturing until every
+card reads READY, then press `f` (Finish & Fit) to run `calibrate_cameras.py`
+and `stereo_calibrate.py` for you.
+
+Results land in a fresh `calibration/results/live_<timestamp>/` folder, not
+the canonical `calibration/results/` or `design/config/rig_as_built.yaml` —
+nothing existing is overwritten. Once you're happy with a result, promote it
+by re-running the offline commands below with their default output. Sessions
+are captured under the same `captures/stereo` the manual workflow uses
+(`geometric_calibration.intrinsics_captures`/`stereo_captures` in
+`config.yaml`), so switching between the two, or pruning afterward, needs no
+migration step. `python calibrate_live.py --no-preview` runs headless
+(`f`/`q` in the terminal).
+
 ## Calibration
 
 Board: `calibration/config/charuco_11x8.yaml` (printable PDF next to it).
@@ -214,6 +239,34 @@ that in-sample reprojection/epipolar error can't see, since that error is
 graded on the very poses that set the scale. Read-only: never rewrites
 `extrinsics.json`; results land in a separate `cross_validation/` subfolder.
 
+```bash
+python check_depth_accuracy.py --session captures/depth_target/<timestamp> \
+    --ref AX,AY,BX,BY ... --cell ROW,COL,AX,AY,BX,BY ...
+```
+
+A flat, fronto-parallel plate has ~zero depth variation across it by
+construction, so it cannot validate the Z-axis at all. `check_depth_accuracy.py`
+targets that axis instead, using a
+[depth-grid target](calibration/config/depth_grid_target.yaml) — a 5×5 grid of
+blocks at known, distinct heights (0.6–30 mm) on one baseplate, plus 4 flush
+corner fiducials.
+
+It clicks (or is given, non-interactively) the corner fiducials and fits the
+plane through them — never assuming the plate sits perpendicular to the
+camera — then triangulates every visible grid cell and takes its **signed
+perpendicular distance to that plane**. Only relative depth is graded:
+cell-to-cell separations against their known differences (the headline scale
+fit) and each cell's plane-to-cell distance against its own known height (a
+direct check that isolates plane-fit bias). Some cells may be self-occluded
+from one or both cameras in a given capture — that's expected, not a failure;
+correspondence is by `(row, col)` label, not click order or count.
+
+See
+[docs/superpowers/specs/2026-08-24-check-depth-accuracy-design.md](docs/superpowers/specs/2026-08-24-check-depth-accuracy-design.md)
+for the full method, the FOV/occlusion constraints that shaped the physical
+grid's layout, and synthetic verification against this rig's real calibrated
+geometry (the physical target is not yet fabricated).
+
 ## Rig design
 
 ```bash
@@ -227,51 +280,27 @@ Subcommands: `info`, `optics`, `view`, `plot`, `report`, `optimize`, `sweep`.
 
 ## Registration
 
-Warps `rgb_cam2` onto `rgb_cam1` with a plane-sweep depth-aware warp: candidate
-depths are swept across the confirmed working range, each scored per-pixel by
-ZNCC, and the best-scoring depth per pixel is kept (no rectification, no SGBM —
-at this rig's baseline/convergence, rectifying for dense stereo throws away most
-of the frame and a single fixed-plane homography is only accurate within
-±0.1 mm of the reference depth). RGB↔RGB only; thermal registration is not
-handled by this script.
-
-```bash
-python register_pipeline.py --session captures/hand
-python register_pipeline.py --session captures/hand --depth-min 0.12 --depth-max 0.20
-```
-
-Outputs under `registration/results/<session>/`: `warped.jpg`, `depth_m.npy`/`.png`,
-`confidence.npy`, `filled_mask.npy`/`.png` (True where a low-confidence pixel fell
-back to the reference-plane depth), `preview.jpg`, `report.txt`.
-
-### Sparse alternative: `register_features.py`
-
-When plane-sweep's dense correlation degenerates, `register_features.py`
-matches sparse features with LightGlue and warps camera B onto camera A
-with a piecewise-affine field from those matches (Delaunay interpolation,
-exact at every correspondence). A single homography cannot register a
-close-range hand: the matches are real but they span several centimetres
-of depth, so they do not lie on one plane. Check `overlay_checker.jpg` and
-the right panel of `preview_features.jpg` -- skin creases should continue
-across square boundaries inside the bright (matched) region. Needs
-`torch`/`kornia` (see `requirements.txt`); CPU-only, no GPU required.
-
-The mesh is extended with synthetic anchor points at the frame border and
-filtered to drop degenerate (huge-area or thin-sliver) triangles, and the
-match-hull/fallback-plane boundary is feathered rather than a hard switch --
-each of these is independently toggleable (`--no-border-anchors`,
-`--no-reject-degenerate-triangles`, `--no-feather-blend`; see `--help`).
-`check_registration_error.py` scores the resulting warp against held-out
-ChArUco board corners for a quantitative (not eyeballed) accuracy number.
+Z is never assumed. A pixel is a ray; two corresponding pixels plus `K`/`R`/`T`
+intersect in one 3-D point. That intersection is `triangulate.py` (DLT written
+out). Overlay scripts warp only where a correspondence exists; everything else
+stays unfilled.
 
 ```bash
 python register_features.py --session captures/hand
+```
+
+`register_features.py` matches sparse features (LightGlue by default) and
+triangulates those matches the same way. Warp is piecewise-affine over the
+match hull. Needs `torch`/`kornia`; CPU-only.
+
+`check_registration_error.py` scores the feature-mesh warp against held-out
+board corners that land inside the match hull.
+
+```bash
 python register_features.py --session captures/hand --downscale 0.5
 ```
 
-Outputs under `registration/results/<session>/`: `warped_features.jpg`,
-`overlay_checker.jpg`, `overlay_blend.jpg`, `matches.jpg`,
-`preview_features.jpg`, `report_features.txt`, `fit_result.json`.
+Outputs under `registration/results/<session>/`.
 
 ## Config highlights
 
@@ -293,8 +322,8 @@ Outputs under `registration/results/<session>/`: `warped_features.jpg`,
 cameras/  capture_pipeline.py  gui.py     drivers + capture
 calibration/  calibrate_*.py  stereo_*.py  prune_*.py
 design/  design_rig.py                     geometry / coverage
-register_pipeline.py                       plane-sweep depth-aware warp
-register_features.py                       LightGlue matches → piecewise-affine warp
+triangulate.py                             DLT: pixel pair + K,R,T → (X,Y,Z)
+register_features.py                       matches → triangulate → piecewise-affine warp
 color_correction.py  check_color.py        flat-field
 captures/  calibration/results/            data (mostly git-ignored)
 ```

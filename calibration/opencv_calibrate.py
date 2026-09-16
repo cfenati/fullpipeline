@@ -32,6 +32,16 @@ REFERENCE_IMAGE_WIDTH = 1280.0
 # almost always a fitting artefact rather than a real lens decentring.
 PRINCIPAL_POINT_TOLERANCE = 0.1
 
+# A well-corrected lens rarely needs |k1|, |k2| or |k3| above ~1-2 to fit real
+# data. Coefficients past this are the signature of an under-constrained
+# polynomial extrapolating outside the region the board actually covered -
+# usually the same missing-edge-coverage problem the coverage-margin check
+# below is meant to catch, except that check is a hard threshold on the
+# sampled region and can pass while the fitted coefficients still run away
+# (observed directly: a fit whose margin cleared 12% by a hair still produced
+# k3 > 30 and a visibly wrong undistort preview).
+MAX_DISTORTION_COEFF = 5.0
+
 
 def scaled_px(budget_px: float, image_size: Tuple[int, int]) -> float:
     """Scale a pixel-error budget with image width relative to HD."""
@@ -213,6 +223,102 @@ def _retry_without_duplicate_markers(
     return result[0], result[1]
 
 
+@dataclass(frozen=True)
+class _RawBoardDetection:
+    """Result of detecting the board in one already-loaded frame.
+
+    Carries the raw ArUco/ChArUco detection output (``raw_*``) even on
+    failure, so callers that draw diagnostic overlays (``on_skip``) keep
+    seeing whatever partial detection was found, exactly as before this was
+    split out of :func:`detect_observations`.
+    """
+
+    ok: bool
+    reason: Optional[str]
+    corner_ids: Optional[np.ndarray]
+    image_points: Optional[np.ndarray]
+    object_points: Optional[np.ndarray]
+    marker_count: int
+    sharpness: float
+    raw_corners: Optional[np.ndarray]
+    raw_corner_ids: Optional[np.ndarray]
+    raw_marker_corners: Optional[Any]
+
+
+def detect_board_in_frame(
+    image: np.ndarray,
+    detector: Any,
+    all_object_points: np.ndarray,
+    min_corners: int = DEFAULT_MIN_CORNERS,
+    min_spread: float = DEFAULT_MIN_SPREAD,
+) -> _RawBoardDetection:
+    """Detect ChArUco corners in one already-loaded (BGR) frame.
+
+    Shared by the file-based batch path (:func:`detect_observations`) and any
+    live, in-memory per-frame gate check — no disk access here.
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    corners, corner_ids, marker_corners, marker_ids = detector.detectBoard(gray)
+
+    if corner_ids is None or len(corner_ids) == 0:
+        corners, corner_ids = _retry_without_duplicate_markers(
+            detector, gray, marker_corners, marker_ids
+        )
+
+    marker_count = 0 if marker_ids is None else int(len(marker_ids))
+    sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+    if corner_ids is None or len(corner_ids) < min_corners:
+        found = 0 if corner_ids is None else len(corner_ids)
+        total_corners = int(all_object_points.shape[0])
+        reason = (
+            f"only {found} of {total_corners} corners (min {min_corners}); "
+            f"{marker_count} markers seen; sharpness {sharpness:.0f}"
+        )
+        return _RawBoardDetection(
+            ok=False,
+            reason=reason,
+            corner_ids=None,
+            image_points=None,
+            object_points=None,
+            marker_count=marker_count,
+            sharpness=sharpness,
+            raw_corners=corners,
+            raw_corner_ids=corner_ids,
+            raw_marker_corners=marker_corners,
+        )
+
+    image_size = (image.shape[1], image.shape[0])
+    spread = _corner_spread(corners, image_size)
+    if spread < min_spread:
+        return _RawBoardDetection(
+            ok=False,
+            reason=f"corners cover {spread * 100:.1f}% of frame",
+            corner_ids=None,
+            image_points=None,
+            object_points=None,
+            marker_count=marker_count,
+            sharpness=sharpness,
+            raw_corners=corners,
+            raw_corner_ids=corner_ids,
+            raw_marker_corners=marker_corners,
+        )
+
+    flat_ids = np.asarray(corner_ids, dtype=np.int32).reshape(-1)
+    return _RawBoardDetection(
+        ok=True,
+        reason=None,
+        corner_ids=flat_ids,
+        image_points=np.asarray(corners, dtype=np.float32).reshape(-1, 1, 2),
+        object_points=all_object_points[flat_ids].reshape(-1, 1, 3),
+        marker_count=marker_count,
+        sharpness=sharpness,
+        raw_corners=corners,
+        raw_corner_ids=corner_ids,
+        raw_marker_corners=marker_corners,
+    )
+
+
 def detect_observations(
     image_paths: Sequence[Path],
     board: TargetBoard,
@@ -246,44 +352,21 @@ def detect_observations(
             skipped.append((image_path, f"resolution {width}x{height} != {image_size[0]}x{image_size[1]}"))
             continue
 
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        corners, corner_ids, marker_corners, marker_ids = detector.detectBoard(gray)
+        raw = detect_board_in_frame(image, detector, all_object_points, min_corners, min_spread)
 
-        if corner_ids is None or len(corner_ids) == 0:
-            corners, corner_ids = _retry_without_duplicate_markers(
-                detector, gray, marker_corners, marker_ids
-            )
-
-        if corner_ids is None or len(corner_ids) < min_corners:
-            found = 0 if corner_ids is None else len(corner_ids)
-            markers = 0 if marker_ids is None else len(marker_ids)
-            sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-            skipped.append(
-                (
-                    image_path,
-                    f"only {found} of {board.total_corners} corners (min {min_corners}); "
-                    f"{markers} markers seen; sharpness {sharpness:.0f}",
-                )
-            )
+        if not raw.ok:
+            skipped.append((image_path, raw.reason))
             if on_skip is not None:
-                on_skip(image, image_path, corners, corner_ids, marker_corners)
+                on_skip(image, image_path, raw.raw_corners, raw.raw_corner_ids, raw.raw_marker_corners)
             continue
 
-        spread = _corner_spread(corners, image_size)
-        if spread < min_spread:
-            skipped.append((image_path, f"corners cover {spread * 100:.1f}% of frame"))
-            if on_skip is not None:
-                on_skip(image, image_path, corners, corner_ids, marker_corners)
-            continue
-
-        flat_ids = np.asarray(corner_ids, dtype=np.int32).reshape(-1)
         observation = BoardObservation(
             image_path=image_path,
-            corner_ids=flat_ids,
-            image_points=np.asarray(corners, dtype=np.float32).reshape(-1, 1, 2),
-            object_points=all_object_points[flat_ids].reshape(-1, 1, 3),
-            marker_count=0 if marker_ids is None else int(len(marker_ids)),
-            sharpness=float(cv2.Laplacian(gray, cv2.CV_64F).var()),
+            corner_ids=raw.corner_ids,
+            image_points=raw.image_points,
+            object_points=raw.object_points,
+            marker_count=raw.marker_count,
+            sharpness=raw.sharpness,
         )
         observations.append(observation)
 
@@ -484,6 +567,22 @@ def quality_warnings(
         warnings.append(
             f"The board never reached the {', '.join(unsampled)} edge(s) of the frame, "
             "so distortion is extrapolated there."
+        )
+
+    coefficients = intrinsics.distortion.reshape(-1)
+    coefficient_names = ["k1", "k2", "p1", "p2", "k3", "k4", "k5", "k6"][: len(coefficients)]
+    extreme = [
+        (name, float(value))
+        for name, value in zip(coefficient_names, coefficients)
+        if abs(value) > MAX_DISTORTION_COEFF
+    ]
+    if extreme:
+        worst = ", ".join(f"{name}={value:.2f}" for name, value in extreme)
+        warnings.append(
+            f"Distortion coefficient(s) {worst} are implausibly large for a real lens "
+            f"(expect roughly |k| < {MAX_DISTORTION_COEFF:.0f}). This calibration is likely "
+            "unusable even though other checks may pass - inspect the undistort preview by "
+            "eye before trusting it, and capture more views reaching every frame edge."
         )
 
     return warnings
