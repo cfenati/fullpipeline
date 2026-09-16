@@ -31,6 +31,10 @@ from sync_metrics import (
 PROJECT_ROOT = Path(__file__).resolve().parent
 JPEG_PARAMS = [cv2.IMWRITE_JPEG_QUALITY, 95]
 MAX_CONSECUTIVE_GRAB_FAILURES = 50
+GAIN_SWEEP_WINDOW_NAME = "FLIR gain sweep preview (s = capture sweep, q = quit)"
+GAIN_SWEEP_SETTLE_FRAMES = 3  # frames discarded after set_gain() before the saved grab; a
+# NewestOnly buffer with free-running acquisition can have a frame already
+# mid-exposure when gain changes, so 1 discard is not enough - measured on real hardware.
 
 
 def load_config(config_path: Path) -> dict:
@@ -162,17 +166,22 @@ def get_blackfly_config(config: dict) -> Optional[dict]:
     return blackfly_config
 
 
-def open_blackfly(config: dict) -> Optional[BlackflyCamera]:
+def open_blackfly(
+    config: dict, force_manual_gain: bool = False
+) -> Optional[BlackflyCamera]:
     blackfly_config = get_blackfly_config(config)
     if blackfly_config is None:
         return None
 
+    gain_auto = (
+        False if force_manual_gain else bool(blackfly_config.get("gain_auto", False))
+    )
     blackfly = BlackflyCamera(
         name=blackfly_config.get("name", "FLIR Blackfly"),
         camera_index=int(blackfly_config.get("camera_index", 0)),
         serial=blackfly_config.get("serial"),
         timeout_ms=int(blackfly_config.get("timeout_ms", 1000)),
-        gain_auto=bool(blackfly_config.get("gain_auto", False)),
+        gain_auto=gain_auto,
         gain=blackfly_config.get("gain"),
         max_fps=blackfly_config.get("max_fps"),
         preview_max_width=blackfly_config.get("preview_max_width", 1280),
@@ -180,6 +189,24 @@ def open_blackfly(config: dict) -> Optional[BlackflyCamera]:
     )
     blackfly.open()
     return blackfly
+
+
+def gain_sweep_values(gain_sweep_config: dict) -> list[float]:
+    """Inclusive start..stop steps (dB) from a blackfly.gain_sweep config block."""
+    start = float(gain_sweep_config.get("start", 20))
+    stop = float(gain_sweep_config.get("stop", 40))
+    step = float(gain_sweep_config.get("step", 5))
+    if step <= 0:
+        raise ValueError("blackfly.gain_sweep.step must be > 0")
+    if start > stop:
+        raise ValueError("blackfly.gain_sweep.start must be <= stop")
+
+    values = []
+    value = start
+    while value <= stop + 1e-9:
+        values.append(round(value, 2))
+        value += step
+    return values
 
 
 def get_stability_config(config: dict) -> dict:
@@ -328,6 +355,48 @@ def save_capture(
         json.dump(metadata, metadata_file, indent=2)
 
     print(f"Saved capture to {session_dir}")
+    return session_dir
+
+
+def capture_gain_sweep(
+    blackfly: BlackflyCamera,
+    output_dir: Path,
+    timestamp: str,
+    gain_values: list[float],
+) -> Path:
+    session_dir = output_dir / timestamp
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    files: list[dict] = []
+    for requested_gain in gain_values:
+        applied_gain = blackfly.set_gain(requested_gain)
+        for _ in range(GAIN_SWEEP_SETTLE_FRAMES):
+            blackfly.grab()  # discard frames so the new gain settles before the saved frame
+        frame = blackfly.grab(full_resolution=True)
+        if frame is None:
+            print(f"  gain {requested_gain:.1f} dB: grab failed, skipped")
+            continue
+
+        filename = f"flir_gain_{applied_gain:04.1f}.jpg"
+        cv2.imwrite(str(session_dir / filename), frame, JPEG_PARAMS)
+        files.append(
+            {
+                "file": filename,
+                "requested_gain_db": requested_gain,
+                "applied_gain_db": applied_gain,
+            }
+        )
+        print(f"  gain {applied_gain:.1f} dB -> {filename}")
+
+    metadata = {
+        "timestamp": timestamp,
+        "capture_time_iso": datetime.now(timezone.utc).isoformat(),
+        "blackfly": blackfly.info(),
+        "files": files,
+    }
+    with (session_dir / "metadata.json").open("w", encoding="utf-8") as metadata_file:
+        json.dump(metadata, metadata_file, indent=2)
+
     return session_dir
 
 
@@ -660,6 +729,95 @@ def run_pipeline(
             blackfly.release()
 
 
+def flir_gain_sweep_mode(
+    config_path: Path,
+    show_preview: bool = True,
+    output: Optional[str] = None,
+) -> int:
+    config = load_config(config_path)
+    if get_blackfly_config(config) is None:
+        print("FLIR gain sweep requires blackfly.enabled: true in config.yaml")
+        return 1
+
+    output_dir = resolve_capture_output_dir(
+        config["output_dir"], output or "flir_gain_sweep"
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"FLIR gain sweep output: {output_dir}")
+
+    blackfly: Optional[BlackflyCamera] = None
+    terminal_input: Optional[TerminalInput] = None
+    try:
+        gain_values = gain_sweep_values(config["blackfly"].get("gain_sweep", {}))
+        print(f"Gain steps (dB): {gain_values}")
+
+        blackfly = open_blackfly(config, force_manual_gain=True)
+        if gain_values:
+            blackfly.set_gain(gain_values[0])
+
+        if show_preview:
+            cv2.namedWindow(GAIN_SWEEP_WINDOW_NAME)
+        if sys.stdin.isatty():
+            terminal_input = TerminalInput()
+            terminal_input.__enter__()
+
+        print("Ready — s = capture sweep | q = quit")
+
+        while True:
+            frame = blackfly.grab()
+            should_capture = False
+            should_quit = False
+
+            if show_preview:
+                if frame is not None:
+                    cv2.imshow(GAIN_SWEEP_WINDOW_NAME, frame)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("s"):
+                    should_capture = True
+                if key == ord("q"):
+                    should_quit = True
+                try:
+                    still_open = (
+                        cv2.getWindowProperty(
+                            GAIN_SWEEP_WINDOW_NAME, cv2.WND_PROP_VISIBLE
+                        )
+                        >= 1
+                    )
+                except cv2.error:
+                    still_open = False
+                if not still_open:
+                    should_quit = True
+
+            if terminal_input is not None:
+                key = terminal_input.poll_key()
+                if key == ord("s"):
+                    should_capture = True
+                if key == ord("q"):
+                    should_quit = True
+
+            if should_capture:
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                session_dir = capture_gain_sweep(
+                    blackfly, output_dir, timestamp, gain_values
+                )
+                print(f"Saved gain sweep to {session_dir}")
+
+            if should_quit:
+                break
+
+        return 0
+    except Exception as error:
+        print(f"FLIR gain sweep failed: {error}")
+        return 1
+    finally:
+        if terminal_input is not None:
+            terminal_input.__exit__(None, None, None)
+        if blackfly is not None:
+            blackfly.release()
+        if show_preview:
+            cv2.destroyAllWindows()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -677,6 +835,15 @@ def parse_args() -> argparse.Namespace:
         "--smoke-test",
         action="store_true",
         help="Open all cameras, grab one frame, and exit",
+    )
+    parser.add_argument(
+        "--flir-gain-sweep",
+        action="store_true",
+        help=(
+            "Save a folder of FLIR Blackfly frames swept across "
+            "blackfly.gain_sweep in config.yaml, instead of running the "
+            "normal capture pipeline"
+        ),
     )
     parser.add_argument(
         "--no-preview",
@@ -727,6 +894,13 @@ def main() -> int:
 
     if args.smoke_test:
         return smoke_test(args.config)
+
+    if args.flir_gain_sweep:
+        return flir_gain_sweep_mode(
+            config_path=args.config,
+            show_preview=not args.no_preview,
+            output=args.output,
+        )
 
     if args.sync_test:
         return sync_test(

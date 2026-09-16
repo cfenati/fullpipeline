@@ -247,6 +247,31 @@ class BlackflyCamera:
         finally:
             img_ptr.Release()
 
+    def set_gain(self, gain: float) -> float:
+        """Set Gain (dB) on an already-open camera, disabling GainAuto first.
+        Returns the value actually applied, clamped to the node's min/max."""
+        if not self.is_open():
+            raise RuntimeError(f"{self.name} is not open")
+
+        pyspin = _require_pyspin()
+
+        try:
+            if self._cam.GainAuto.GetAccessMode() == pyspin.RW:
+                self._cam.GainAuto.SetValue(pyspin.GainAuto_Off)
+        except Exception:
+            pass
+
+        nodemap = self._cam.GetNodeMap()
+        gain_node = pyspin.CFloatPtr(nodemap.GetNode("Gain"))
+        if not (pyspin.IsAvailable(gain_node) and pyspin.IsWritable(gain_node)):
+            raise RuntimeError(f"{self.name}: Gain node is not writable")
+
+        clamped = max(gain_node.GetMin(), min(float(gain), gain_node.GetMax()))
+        gain_node.SetValue(clamped)
+        self.gain_auto = False
+        self.gain = clamped
+        return clamped
+
     def release(self) -> None:
         if self._cam is not None:
             try:
