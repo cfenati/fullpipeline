@@ -527,15 +527,15 @@ class PlaneCollectionSession:
         self.plane: Optional[Tuple[np.ndarray, np.ndarray]] = None
         self.batches: List[Tuple[Optional[Tuple[int, int]], List[int]]] = [(None, [])]
         self.points_mm: Dict[int, np.ndarray] = {}
+        # Most recently completed step's one-line summary (reference-plane
+        # fit, or a finished block), shown by status_lines() -- overwritten
+        # each time on_advance succeeds, never accumulated.
+        self._last_result: str = ""
 
     def on_point(self, index: int, result: Dict[str, Any]) -> None:
         self.points_mm[index] = np.asarray(result["points_mm"][index], dtype=np.float64)
         label, indices = self.batches[-1]
         indices.append(index)
-        if label is None:
-            print(f"  reference point {len(indices)} recorded")
-        else:
-            print(f"  point {len(indices)} recorded for block {label}")
 
     def on_undo(self, new_count: int) -> None:
         for index in list(self.points_mm):
@@ -567,8 +567,9 @@ class PlaneCollectionSession:
             if normal @ (-centroid) < 0.0:
                 normal = -normal
             self.plane = (centroid, normal)
-            print(f"  reference plane fit from {len(indices)} points -- "
-                  f"rms {rms_m * 1000.0:.4f} mm")
+            self._last_result = (
+                f"reference plane fit, rms {rms_m * 1000.0:.4f}mm from {len(indices)} points"
+            )
         else:
             if len(indices) < 1:
                 print("  click at least one point before pressing n")
@@ -580,12 +581,18 @@ class PlaneCollectionSession:
                 for i in indices
             ])
             mean = float(values.mean())
+            truth = self.target.height_at(*label)
             if values.size > 1:
                 spread = float(np.sqrt(np.mean((values - mean) ** 2)))
-                print(f"  block {label}: {values.size} points, mean {mean:.3f}mm "
-                      f"(spread {spread:.4f}mm rms)")
+                self._last_result = (
+                    f"block {label}: truth {truth:.3f}mm, measured {mean:.3f}mm "
+                    f"(delta {mean - truth:+.3f}mm, {values.size} pts, spread {spread:.4f}mm rms)"
+                )
             else:
-                print(f"  block {label}: measured {mean:.3f}mm")
+                self._last_result = (
+                    f"block {label}: truth {truth:.3f}mm, measured {mean:.3f}mm "
+                    f"(delta {mean - truth:+.3f}mm)"
+                )
         return "cell row,col > "
 
     def on_text_submit(self, text: str) -> Optional[str]:
@@ -599,6 +606,29 @@ class PlaneCollectionSession:
                     f"0-{self.target.col_count - 1}")
         self.batches.append(((row, col), []))
         return None
+
+    def status_lines(self) -> List[str]:
+        """The window's whole status strip while this session drives it --
+        see docs/superpowers/specs/2026-09-16-depth-accuracy-status-
+        simplification-design.md. Always exactly 3 lines, so the keys line
+        never shifts position: current task (with the block's ground truth
+        height, visible the instant its row,col batch becomes current -- no
+        separate print needed), the most recently completed step's result
+        (empty until the first one finishes), then the key hints.
+        """
+        label, indices = self.batches[-1]
+        if label is None:
+            head = (f"REFERENCE PLANE -- {len(indices)} point(s) clicked (need >= 3), "
+                    "press n when done")
+        else:
+            truth = self.target.height_at(*label)
+            head = (f"BLOCK {label} -- ground truth {truth:.3f}mm -- "
+                    f"{len(indices)} point(s) clicked, press n to finish")
+        return [
+            head,
+            f"last: {self._last_result}" if self._last_result else "",
+            "u undo | n finish batch | q/Esc quit",
+        ]
 
 
 def parse_args() -> argparse.Namespace:
@@ -745,10 +775,12 @@ def main() -> int:
             cell_offsets_px = None
         else:
             print(f"{label}: click reference points on the flat baseplate (at least 3, "
-                  "spread out) then press n -- the plane fits and its rms prints "
-                  "immediately, and you'll be prompted for a block's row,col right away. "
-                  "Type it, Enter, then click that block's points (as many as you like, "
-                  "even just one) and press n: it finalizes that block and immediately "
+                  "spread out) then press n -- the plane fit and its rms appear in the "
+                  "window's status bar, and you'll be prompted for a block's row,col "
+                  "right away. Type it, Enter, and its ground truth height appears on "
+                  "screen immediately -- double check it before clicking. Click that "
+                  "block's points (as many as you like, even just one) and press n: the "
+                  "measured-vs-truth result appears in the status bar and it immediately "
                   "prompts for the next block's row,col. Repeat for every block you can "
                   "see. Press q/Esc to finish.")
             session = PlaneCollectionSession(target)
@@ -759,6 +791,7 @@ def main() -> int:
                 float(reg_config.get("default_depth", 0.168)),
                 on_point=session.on_point, on_undo=session.on_undo,
                 on_advance=session.on_advance, on_text_submit=session.on_text_submit,
+                on_status=session.status_lines,
             )
             if not raw_result.get("clicks_a", []):
                 results.append({"label": label, "skipped": "no points clicked"})
