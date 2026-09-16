@@ -162,17 +162,22 @@ def get_blackfly_config(config: dict) -> Optional[dict]:
     return blackfly_config
 
 
-def open_blackfly(config: dict) -> Optional[BlackflyCamera]:
+def open_blackfly(
+    config: dict, force_manual_gain: bool = False
+) -> Optional[BlackflyCamera]:
     blackfly_config = get_blackfly_config(config)
     if blackfly_config is None:
         return None
 
+    gain_auto = (
+        False if force_manual_gain else bool(blackfly_config.get("gain_auto", False))
+    )
     blackfly = BlackflyCamera(
         name=blackfly_config.get("name", "FLIR Blackfly"),
         camera_index=int(blackfly_config.get("camera_index", 0)),
         serial=blackfly_config.get("serial"),
         timeout_ms=int(blackfly_config.get("timeout_ms", 1000)),
-        gain_auto=bool(blackfly_config.get("gain_auto", False)),
+        gain_auto=gain_auto,
         gain=blackfly_config.get("gain"),
         max_fps=blackfly_config.get("max_fps"),
         preview_max_width=blackfly_config.get("preview_max_width", 1280),
@@ -180,6 +185,22 @@ def open_blackfly(config: dict) -> Optional[BlackflyCamera]:
     )
     blackfly.open()
     return blackfly
+
+
+def gain_sweep_values(gain_sweep_config: dict) -> list[float]:
+    """Inclusive start..stop steps (dB) from a blackfly.gain_sweep config block."""
+    start = float(gain_sweep_config.get("start", 20))
+    stop = float(gain_sweep_config.get("stop", 40))
+    step = float(gain_sweep_config.get("step", 5))
+    if step <= 0:
+        raise ValueError("blackfly.gain_sweep.step must be > 0")
+
+    values = []
+    value = start
+    while value <= stop + 1e-9:
+        values.append(round(value, 2))
+        value += step
+    return values
 
 
 def get_stability_config(config: dict) -> dict:
