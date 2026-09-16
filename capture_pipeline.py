@@ -31,6 +31,7 @@ from sync_metrics import (
 PROJECT_ROOT = Path(__file__).resolve().parent
 JPEG_PARAMS = [cv2.IMWRITE_JPEG_QUALITY, 95]
 MAX_CONSECUTIVE_GRAB_FAILURES = 50
+GAIN_SWEEP_WINDOW_NAME = "FLIR gain sweep preview (s = capture sweep, q = quit)"
 
 
 def load_config(config_path: Path) -> dict:
@@ -722,6 +723,92 @@ def run_pipeline(
             blackfly.release()
 
 
+def flir_gain_sweep_mode(
+    config_path: Path,
+    show_preview: bool = True,
+    output: Optional[str] = None,
+) -> int:
+    config = load_config(config_path)
+    if get_blackfly_config(config) is None:
+        print("FLIR gain sweep requires blackfly.enabled: true in config.yaml")
+        return 1
+
+    output_dir = resolve_capture_output_dir(
+        config["output_dir"], output or "flir_gain_sweep"
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    gain_values = gain_sweep_values(config["blackfly"].get("gain_sweep", {}))
+    print(f"FLIR gain sweep output: {output_dir}")
+    print(f"Gain steps (dB): {gain_values}")
+
+    blackfly: Optional[BlackflyCamera] = None
+    terminal_input: Optional[TerminalInput] = None
+    try:
+        blackfly = open_blackfly(config, force_manual_gain=True)
+
+        if show_preview:
+            cv2.namedWindow(GAIN_SWEEP_WINDOW_NAME)
+        if sys.stdin.isatty():
+            terminal_input = TerminalInput()
+            terminal_input.__enter__()
+
+        print("Ready — s = capture sweep | q = quit")
+
+        while True:
+            frame = blackfly.grab()
+            should_capture = False
+            should_quit = False
+
+            if show_preview:
+                if frame is not None:
+                    cv2.imshow(GAIN_SWEEP_WINDOW_NAME, frame)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("s"):
+                    should_capture = True
+                if key == ord("q"):
+                    should_quit = True
+                try:
+                    still_open = (
+                        cv2.getWindowProperty(
+                            GAIN_SWEEP_WINDOW_NAME, cv2.WND_PROP_VISIBLE
+                        )
+                        >= 1
+                    )
+                except cv2.error:
+                    still_open = False
+                if not still_open:
+                    should_quit = True
+
+            if terminal_input is not None:
+                key = terminal_input.poll_key()
+                if key == ord("s"):
+                    should_capture = True
+                if key == ord("q"):
+                    should_quit = True
+
+            if should_capture:
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                session_dir = capture_gain_sweep(
+                    blackfly, output_dir, timestamp, gain_values
+                )
+                print(f"Saved gain sweep to {session_dir}")
+
+            if should_quit:
+                break
+
+        return 0
+    except Exception as error:
+        print(f"FLIR gain sweep failed: {error}")
+        return 1
+    finally:
+        if terminal_input is not None:
+            terminal_input.__exit__(None, None, None)
+        if blackfly is not None:
+            blackfly.release()
+        if show_preview:
+            cv2.destroyAllWindows()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -739,6 +826,15 @@ def parse_args() -> argparse.Namespace:
         "--smoke-test",
         action="store_true",
         help="Open all cameras, grab one frame, and exit",
+    )
+    parser.add_argument(
+        "--flir-gain-sweep",
+        action="store_true",
+        help=(
+            "Save a folder of FLIR Blackfly frames swept across "
+            "blackfly.gain_sweep in config.yaml, instead of running the "
+            "normal capture pipeline"
+        ),
     )
     parser.add_argument(
         "--no-preview",
@@ -789,6 +885,13 @@ def main() -> int:
 
     if args.smoke_test:
         return smoke_test(args.config)
+
+    if args.flir_gain_sweep:
+        return flir_gain_sweep_mode(
+            config_path=args.config,
+            show_preview=not args.no_preview,
+            output=args.output,
+        )
 
     if args.sync_test:
         return sync_test(
