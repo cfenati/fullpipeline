@@ -126,6 +126,14 @@ blackfly:
   stream_newest_only: true
   gain_auto: true
   gain: null
+  # Used only by `capture_pipeline.py --flir-gain-sweep`, which always runs
+  # in manual gain regardless of gain_auto above. Range is dB (Spinnaker's
+  # Gain node); on this rig's BFS-U3-32S4M it spans 0-48 dB, so 20-40 leaves
+  # headroom on both ends while the right operating gain is still unknown.
+  gain_sweep:
+    start: 20
+    stop: 40
+    step: 5
 
 stability:
   preview_interval_ms: 33
