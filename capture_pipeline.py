@@ -32,6 +32,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 JPEG_PARAMS = [cv2.IMWRITE_JPEG_QUALITY, 95]
 MAX_CONSECUTIVE_GRAB_FAILURES = 50
 GAIN_SWEEP_WINDOW_NAME = "FLIR gain sweep preview (s = capture sweep, q = quit)"
+GAIN_SWEEP_SETTLE_FRAMES = 3  # frames discarded after set_gain() before the saved grab; a
+# NewestOnly buffer with free-running acquisition can have a frame already
+# mid-exposure when gain changes, so 1 discard is not enough - measured on real hardware.
 
 
 def load_config(config_path: Path) -> dict:
@@ -195,6 +198,8 @@ def gain_sweep_values(gain_sweep_config: dict) -> list[float]:
     step = float(gain_sweep_config.get("step", 5))
     if step <= 0:
         raise ValueError("blackfly.gain_sweep.step must be > 0")
+    if start > stop:
+        raise ValueError("blackfly.gain_sweep.start must be <= stop")
 
     values = []
     value = start
@@ -365,13 +370,14 @@ def capture_gain_sweep(
     files: list[dict] = []
     for requested_gain in gain_values:
         applied_gain = blackfly.set_gain(requested_gain)
-        blackfly.grab()  # discard one frame so the new gain settles before the saved frame
+        for _ in range(GAIN_SWEEP_SETTLE_FRAMES):
+            blackfly.grab()  # discard frames so the new gain settles before the saved frame
         frame = blackfly.grab(full_resolution=True)
         if frame is None:
             print(f"  gain {requested_gain:.1f} dB: grab failed, skipped")
             continue
 
-        filename = f"flir_gain_{int(round(applied_gain))}.jpg"
+        filename = f"flir_gain_{applied_gain:04.1f}.jpg"
         cv2.imwrite(str(session_dir / filename), frame, JPEG_PARAMS)
         files.append(
             {
@@ -737,14 +743,17 @@ def flir_gain_sweep_mode(
         config["output_dir"], output or "flir_gain_sweep"
     )
     output_dir.mkdir(parents=True, exist_ok=True)
-    gain_values = gain_sweep_values(config["blackfly"].get("gain_sweep", {}))
     print(f"FLIR gain sweep output: {output_dir}")
-    print(f"Gain steps (dB): {gain_values}")
 
     blackfly: Optional[BlackflyCamera] = None
     terminal_input: Optional[TerminalInput] = None
     try:
+        gain_values = gain_sweep_values(config["blackfly"].get("gain_sweep", {}))
+        print(f"Gain steps (dB): {gain_values}")
+
         blackfly = open_blackfly(config, force_manual_gain=True)
+        if gain_values:
+            blackfly.set_gain(gain_values[0])
 
         if show_preview:
             cv2.namedWindow(GAIN_SWEEP_WINDOW_NAME)

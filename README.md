@@ -57,11 +57,17 @@ python capture_pipeline.py                         # GUI; S / Ctrl+S save, Q qui
 python capture_pipeline.py --output calib_rgb1     # -> captures/calib_rgb1/<ts>/
 python capture_pipeline.py --smoke-test            # open, grab once, exit
 python capture_pipeline.py --no-preview            # headless; type s / q
+python capture_pipeline.py --flir-gain-sweep       # sweep FLIR gain, save one frame per step
 ```
 
 Each trigger writes one folder with `rgb_cam1.jpg`, `rgb_cam2.jpg`, thermal
 palette/temperature, optional Blackfly, and `metadata.json`. The same sessions
 serve both intrinsics and stereo.
+
+`--flir-gain-sweep` is FLIR-only: instead of one Blackfly frame at a fixed
+gain, it saves one frame per gain step (range set by `blackfly.gain_sweep` in
+config.yaml) into `captures/flir_gain_sweep/<ts>/`, for picking an operating
+gain before committing to `blackfly.gain`.
 
 ## Color correction
 
@@ -283,6 +289,7 @@ Outputs under `registration/results/<session>/`: `warped_features.jpg`,
 | `rgb.color_correction`    | Flat-field enable + map paths           |
 | `geometric_calibration.*` | Board, results dir, stereo + cross-validation capture dirs |
 | `thermal` / `blackfly`    | Device enablement and settings          |
+| `blackfly.gain_sweep`     | dB range/step (`start`/`stop`/`step`) for `--flir-gain-sweep` |
 
 
 
