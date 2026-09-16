@@ -428,6 +428,45 @@ def render(state: Dict[str, Any]) -> np.ndarray:
 # Interactive session
 # --------------------------------------------------------------------------- #
 
+def build_status_lines(
+    state: Dict[str, Any], on_status: Optional[Callable[[], List[str]]],
+) -> List[str]:
+    """Build the window's bottom status-strip lines for one frame.
+
+    Extracted from run_interactive's main loop so it's testable with a
+    synthetic state dict, without a real window -- same reasoning as
+    handle_interactive_key. Text-entry mode always shows the same 2-line
+    prompt/buffer display regardless of on_status: that's generic
+    input-mechanism chrome a caller's on_status has no reason to reimplement.
+    Outside text-entry mode, on_status (when supplied) replaces the default
+    4-line generic display wholesale -- a caller with its own session
+    semantics (e.g. check_depth_accuracy.py's PlaneCollectionSession) owns
+    the whole status strip instead of measure_points.py's own point-by-point
+    narration, which is meaningless once clicks no longer describe a single
+    running length measurement.
+    """
+    if state["text_mode"]:
+        return [
+            f"{state['text_prompt']}{state['text_buffer']}_",
+            "type digits and , then Enter to confirm, Esc to cancel",
+        ]
+    if on_status is not None:
+        return on_status()
+    placed = len(state["clicks_a"])
+    head = (f"point {placed}: click the SAME feature in camera B, near the blue line"
+            if state["pending_a"] is not None
+            else f"point {placed}: click a feature in camera A")
+    recent = "   ".join(f"{i}->{i+1}: {d:.3f}mm"
+                        for i, d in enumerate(state["consecutive"]))[-140:]
+    return [
+        head,
+        f"measurements: {recent}" if recent else "measurements: (need two points)",
+        ("wheel = zoom (fully independent)   right-drag = pan (fully independent)   "
+         f"0 = fit both   l = aim B at each new A-click "
+         f"{'ON' if state['linked'] else 'OFF'}"),
+        "u undo | r reset | n advance/label | q or Esc = finish and print the report",
+    ]
+
 def handle_interactive_key(
     state: Dict[str, Any], key: int, extrinsics: StereoExtrinsics,
     on_undo: Optional[Callable[[int], None]],
@@ -509,6 +548,7 @@ def run_interactive(image_a: np.ndarray, image_b: np.ndarray,
                     on_undo: Optional[Callable[[int], None]] = None,
                     on_advance: Optional[Callable[[], Optional[str]]] = None,
                     on_text_submit: Optional[Callable[[str], Optional[str]]] = None,
+                    on_status: Optional[Callable[[], List[str]]] = None,
                     ) -> Dict[str, Any]:
     fundamental = fundamental_for_undistorted(
         extrinsics.camera_matrix_a, extrinsics.camera_matrix_b, extrinsics.essential,
@@ -612,7 +652,7 @@ def run_interactive(image_a: np.ndarray, image_b: np.ndarray,
             state["pending_a"] = None
             recompute()
             state["depth_hint"] = float(state["result"]["depth_mm"][-1]) / 1000.0
-            if state["consecutive"]:
+            if state["consecutive"] and on_status is None:
                 index = len(state["clicks_a"]) - 1
                 print(f"  point {index - 1} -> {index} : "
                       f"{state['consecutive'][-1]:.3f} mm    "
@@ -631,26 +671,7 @@ def run_interactive(image_a: np.ndarray, image_b: np.ndarray,
     cv2.setMouseCallback(window, on_mouse)
 
     while True:
-        placed = len(state["clicks_a"])
-        if state["text_mode"]:
-            state["status"] = [
-                f"{state['text_prompt']}{state['text_buffer']}_",
-                "type digits and , then Enter to confirm, Esc to cancel",
-            ]
-        else:
-            head = (f"point {placed}: click the SAME feature in camera B, near the blue line"
-                    if state["pending_a"] is not None
-                    else f"point {placed}: click a feature in camera A")
-            recent = "   ".join(f"{i}->{i+1}: {d:.3f}mm"
-                                for i, d in enumerate(state["consecutive"]))[-140:]
-            state["status"] = [
-                head,
-                f"measurements: {recent}" if recent else "measurements: (need two points)",
-                ("wheel = zoom (fully independent)   right-drag = pan (fully independent)   "
-                 f"0 = fit both   l = aim B at each new A-click "
-                 f"{'ON' if state['linked'] else 'OFF'}"),
-                "u undo | r reset | n advance/label | q or Esc = finish and print the report",
-            ]
+        state["status"] = build_status_lines(state, on_status)
         cv2.imshow(window, render(state))
         key = cv2.waitKey(20)
         # Closing the window with its X button must end the session too, or the
