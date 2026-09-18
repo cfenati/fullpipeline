@@ -1,7 +1,7 @@
 # Design: fix check_depth_accuracy.py's interactive labeling and diagnostics
 
 Date: 2026-08-25
-Status: Proposed
+Status: **Implemented, then superseded in part** by `2026-08-25-depth-accuracy-batch-collection-design.md`: `LabelingSession` (`9c7830f`, `1a1bbfa`) was replaced by `PlaneCollectionSession` (`cf3b3b6`) on 2026-08-26
 
 Companion to `docs/superpowers/specs/2026-08-24-check-depth-accuracy-design.md`,
 which this document assumes as background and does not repeat (the depth-grid

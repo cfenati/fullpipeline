@@ -1,7 +1,7 @@
 # Design: fix check_depth_accuracy.py's GUI freeze, switch to batched multi-point plane collection
 
 Date: 2026-08-25
-Status: Proposed
+Status: **Implemented** (2026-08-26: in-window text entry `3a95e39`, batched `PlaneCollectionSession` `cf3b3b6`/`8c6bef8`)
 
 Companion to `docs/superpowers/specs/2026-08-25-depth-accuracy-interactive-fix-design.md`
 (the prior redesign this one supersedes in part) and

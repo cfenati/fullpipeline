@@ -1,5 +1,7 @@
 # check_line_accuracy.py Implementation Plan
 
+> **Retired and stale.** `check_line_accuracy.py` was deleted in `ff8c992`. Independently of that, this plan's Hough-based detection (Canny -> `HoughLinesP` -> cluster) was abandoned during implementation in favour of projection-based detection; the rewritten spec (`docs/superpowers/specs/2026-08-19-check-line-accuracy-design.md`) is the accurate record. Do not execute this plan.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add `check_line_accuracy.py`, a new diagnostic script that measures how accurately this rig's RGB stereo pair recovers real-world distance, by triangulating a known printed line-ladder target and comparing measured gaps to their ground-truth mm values.

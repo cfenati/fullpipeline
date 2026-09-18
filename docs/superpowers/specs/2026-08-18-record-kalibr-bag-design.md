@@ -1,7 +1,9 @@
 # Design: `record_kalibr_bag.py`
 
+> **Retired.** `record_kalibr_bag.py` was deleted in `ff8c992` ("retire line-accuracy/Kalibr tooling"); the script no longer exists. Kept as a design record only.
+
 **Date:** 2026-08-18
-**Status:** Approved
+**Status:** Approved, then retired (see note above)
 
 ## Purpose
 

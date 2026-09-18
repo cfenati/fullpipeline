@@ -1,7 +1,9 @@
 # Design: check_line_accuracy.py
 
+> **Retired.** `check_line_accuracy.py` and `calibration/line_target.py` were deleted in `ff8c992`. Relative accuracy is now checked by `check_depth_accuracy.py` (see `2026-08-24-check-depth-accuracy-design.md`, which still refers to this tool's method). Kept as a design record only.
+
 Date: 2026-08-19 (drafted), 2026-08-21 (rewritten to match the implementation)
-Status: **Implemented**
+Status: **Implemented, then retired** (see note above)
 
 Supersedes the 2026-08-19 draft of this file. The accompanying plan,
 `docs/superpowers/plans/2026-08-19-check-line-accuracy.md`, was **not** followed:

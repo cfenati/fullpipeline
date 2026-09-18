@@ -1,5 +1,7 @@
 # Feature-Based Registration (`register_features.py`) Implementation Plan
 
+> **Superseded.** This documents the plane-fit design: a single fitted plane depth, reusing `register_pipeline.py`'s `plane_homography`, `candidate_depths` and `singular_depth`. `register_pipeline.py` was deleted in `ff8c992`, and `register_features.py` now triangulates every match with no assumed plane depth (`triangulate.py`; see the `register_features.py` docstring and the README "Registration" section). Kept as a design record only.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add `register_features.py`, a sibling to `register_pipeline.py` that

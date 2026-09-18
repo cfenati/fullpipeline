@@ -1,5 +1,7 @@
 # record_kalibr_bag.py Implementation Plan
 
+> **Retired.** `record_kalibr_bag.py` was deleted in `ff8c992` ("retire line-accuracy/Kalibr tooling"); the script no longer exists. Kept as a design record only.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add `record_kalibr_bag.py`, a new entry-point script that records a ROS1 `.bag` file with one image topic per RGB camera, formatted for the Kalibr calibration toolbox.

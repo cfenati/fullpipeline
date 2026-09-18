@@ -1,7 +1,7 @@
 # Design: measure_wound_depth.py -- relative depth of a real specimen (wound) against its own local surroundings
 
 Date: 2026-09-15
-Status: Proposed
+Status: **Implemented** (2026-09-15, `ab1d534`..`7199e3b`)
 
 ## Purpose
 

@@ -1,7 +1,7 @@
 # Design: unified on-screen status for check_depth_accuracy.py's interactive session
 
 Date: 2026-09-16
-Status: Proposed
+Status: **Implemented** (2026-09-16, `2a00925`, `6bb5f5d`)
 
 Builds on `docs/superpowers/specs/2026-08-25-depth-accuracy-batch-collection-design.md`
 (the batched multi-point `PlaneCollectionSession` this doc modifies) and the
