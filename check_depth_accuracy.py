@@ -88,7 +88,13 @@ from measure_points import (  # noqa: E402
     parse_point,
     run_interactive,
 )
-from registration_io import default_extrinsics_path, undistort_pair  # noqa: E402
+from registration_io import (  # noqa: E402
+    DEFAULT_DEPTH_MAX,
+    DEFAULT_DEPTH_MIN,
+    DEFAULT_REFERENCE_DEPTH,
+    default_extrinsics_path,
+    undistort_pair,
+)
 
 DEFAULT_DEPTH_TARGET_CAPTURES = "captures/depth_target"
 DEFAULT_OUTPUT_SUBDIR = "depth_accuracy"
@@ -690,7 +696,7 @@ def main() -> int:
     args = parse_args()
     geo_config = load_config().get("geometric_calibration", {}) or {}
     reg_config = load_config().get("registration", {}) or {}
-    depth_range = reg_config.get("depth_range", [0.11, 0.21])
+    depth_range = reg_config.get("depth_range", [DEFAULT_DEPTH_MIN, DEFAULT_DEPTH_MAX])
     depth_range = (float(depth_range[0]), float(depth_range[1]))
 
     extrinsics_path = resolve_path(
@@ -788,7 +794,7 @@ def main() -> int:
                 image_a, image_b, extrinsics, depth_range,
                 max(2, args.zoom), (int(args.window[0]), int(args.window[1])),
                 max(3, args.blob_radius) if args.blob_snap else 0,
-                float(reg_config.get("default_depth", 0.168)),
+                float(reg_config.get("default_depth", DEFAULT_REFERENCE_DEPTH)),
                 on_point=session.on_point, on_undo=session.on_undo,
                 on_advance=session.on_advance, on_text_submit=session.on_text_submit,
                 on_status=session.status_lines,

@@ -193,15 +193,6 @@ class RigScene:
                                 name=self._name(f"{cam.name}_axis{i}"),
                                 pickable=False)
 
-    def refresh_all(self) -> None:
-        for cam in self.rig.cameras:
-            self.update_camera(cam)
-        self._add_labels()
-        if self._coverage_visible:
-            self.update_coverage(True)
-        if self._hull_visible:
-            self.update_intersection(True)
-
     # -- coverage cloud ---------------------------------------------------- #
     def update_coverage(self, visible: bool, pitch: Optional[float] = None,
                         min_views: Optional[int] = None) -> None:
@@ -521,7 +512,9 @@ class RigViewer:
                                     QHBoxLayout, QLabel, QMainWindow,
                                     QPushButton, QScrollArea, QSizePolicy,
                                     QVBoxLayout, QWidget)
-        from pyvista.plotting.render_window_interactor import RenderWindowInteractor
+        # Imported only for its side effects: without it, constructing RigViewer segfaults
+        # (observed with pyvista 0.46.5 / VTK Qt). The name itself is unused here.
+        from pyvista.plotting.render_window_interactor import RenderWindowInteractor  # noqa: F401
         from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
 
         self.rig = rig

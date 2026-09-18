@@ -52,6 +52,7 @@ from calibration.stereo import (  # noqa: E402
     DEFAULT_MIN_SHARED_CORNERS,
     StereoExtrinsics,
     adjacent_corner_distance_errors,
+    board_from_extrinsics,
     collect_session_pairs,
     detect_stereo_observations,
     epipolar_residuals,
@@ -136,15 +137,6 @@ def load_extrinsics(path: Path) -> StereoExtrinsics:
             "it does not create one."
         )
     return StereoExtrinsics.load_json(path)
-
-
-def board_from_extrinsics(extrinsics: StereoExtrinsics, extrinsics_path: Path) -> TargetBoard:
-    if not extrinsics.board:
-        raise SystemExit(
-            f"{extrinsics_path} carries no board info; re-run stereo_calibrate.py "
-            "(current version always records it) before cross-validating."
-        )
-    return TargetBoard.from_dict(extrinsics.board)
 
 
 def write_report(
@@ -297,7 +289,7 @@ def main() -> int:
     if not np.any(extrinsics.essential):
         extrinsics.essential = _essential_from_pose(extrinsics.R, extrinsics.T)
 
-    board = board_from_extrinsics(extrinsics, extrinsics_path)
+    board = board_from_extrinsics(extrinsics, extrinsics_path, "cross-validating")
 
     capture_values = (
         args.captures

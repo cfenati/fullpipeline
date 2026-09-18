@@ -15,7 +15,6 @@ import cv2
 import yaml
 
 from cameras.blackfly_camera import BlackflyCamera
-from cameras.rgb_camera import RGBCamera
 from cameras.thermal_camera import ThermalCamera
 
 

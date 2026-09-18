@@ -2,7 +2,7 @@
 """Register camera B onto camera A using Fast-FoundationStereo depth.
 
 Rectify, run the network, lift disparity to Z in camera A (Q triangulation,
-same formula as triangulate.z_from_disparity), warp B onto A. Invalid
+Z = Q[2,3] / (Q[3,2]*d + Q[3,3])), warp B onto A. Invalid
 disparity stays NaN -- no constant-depth fill.
 
 Example (run inside the `ffs` conda env, which has the CUDA build of torch):
@@ -34,6 +34,7 @@ from calibration.stereo import StereoExtrinsics, rectify, rectify_maps  # noqa: 
 from registration_io import (  # noqa: E402
     DEFAULT_DEPTH_MAX,
     DEFAULT_DEPTH_MIN,
+    DEFAULT_REFERENCE_DEPTH,
     DEFAULT_REGISTRATION_OUTPUT_DIR,
     default_extrinsics_path,
     load_session_images,
@@ -51,7 +52,6 @@ DEFAULT_VALID_ITERS = 8
 
 
 def parse_args() -> argparse.Namespace:
-    reg_config = load_config().get("registration", {}) or {}
     parser = argparse.ArgumentParser(
         description="Register camera B onto camera A with Fast-FoundationStereo.",
     )
@@ -236,7 +236,7 @@ def lift_disparity_to_undistorted_a(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Lift scaled rectified disparity onto undistorted camera-A Z.
 
-    ``cv2.reprojectImageTo3D`` is the dense form of triangulate.z_from_disparity.
+    ``cv2.reprojectImageTo3D`` is the dense form of Z = Q[2,3] / (Q[3,2]*d + Q[3,3]).
     Pixels without a valid disparity stay NaN.
     """
     Q_scaled = scale_Q(Q, scale)
@@ -414,7 +414,7 @@ def main() -> int:
         raise SystemExit(f"--scale must be in (0, 1], got {args.scale}")
 
     reg_config = load_config().get("registration", {}) or {}
-    working_depth = float(reg_config.get("default_depth", 0.168))
+    working_depth = float(reg_config.get("default_depth", DEFAULT_REFERENCE_DEPTH))
     depth_range = reg_config.get("depth_range", [DEFAULT_DEPTH_MIN, DEFAULT_DEPTH_MAX])
     depth_min, depth_max = float(depth_range[0]), float(depth_range[1])
     alpha = float(reg_config.get("rectification_alpha", 1.0))

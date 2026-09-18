@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Tuple
 
 import cv2
-import matplotlib.tri as mtri
 import numpy as np
 
 from calibrate_cameras import DEFAULT_OUTPUT_DIR, load_config
@@ -16,6 +15,9 @@ DEFAULT_REGISTRATION_OUTPUT_DIR = "registration/results"
 PREVIEW_PANEL_WIDTH = 1000
 DEFAULT_DEPTH_MIN = 0.11  # chirality / plausibility filter on triangulated Z, not a plane
 DEFAULT_DEPTH_MAX = 0.21
+# Midpoint of the working range; stereoRectify's reference_depth, never a per-pixel Z.
+# Mirrors registration.default_depth in config.yaml (the fallback when the key is absent).
+DEFAULT_REFERENCE_DEPTH = 0.168
 
 
 def default_extrinsics_path(camera_a: str, camera_b: str) -> str:
@@ -92,34 +94,6 @@ def downscale_pair(
         scale_camera_matrix(camera_matrix_a, scale),
         scale_camera_matrix(camera_matrix_b, scale),
     )
-
-
-def warp_from_correspondences(
-    pts_a: np.ndarray, pts_b: np.ndarray, image_b: np.ndarray, size_a: Tuple[int, int],
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Piecewise-affine warp of B onto A, exact at every correspondence.
-
-    No plane, no assumed depth: barycentric interpolation of the matched
-    pixel pairs (the 2-D shadow of the triangulated mesh). Pixels outside
-    the match hull are not filled. Returns (warped, covered).
-    """
-    if len(pts_a) < 3:
-        raise SystemExit("Need at least 3 correspondences to build a triangulation.")
-    width_a, height_a = size_a
-    triangulation = mtri.Triangulation(pts_a[:, 0], pts_a[:, 1])
-    interpolate_x = mtri.LinearTriInterpolator(triangulation, pts_b[:, 0].astype(np.float64))
-    interpolate_y = mtri.LinearTriInterpolator(triangulation, pts_b[:, 1].astype(np.float64))
-    grid_x, grid_y = np.meshgrid(np.arange(width_a), np.arange(height_a))
-    sampled_x = interpolate_x(grid_x, grid_y)
-    sampled_y = interpolate_y(grid_x, grid_y)
-    covered = ~np.ma.getmaskarray(sampled_x)
-    map_x = np.ma.filled(sampled_x, -1.0).astype(np.float32)
-    map_y = np.ma.filled(sampled_y, -1.0).astype(np.float32)
-    warped = cv2.remap(
-        image_b, map_x, map_y, interpolation=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0),
-    )
-    return warped, covered
 
 
 def warp_using_z(

@@ -49,7 +49,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from calibrate_cameras import load_config, resolve_path  # noqa: E402
 from calibration.stereo import StereoExtrinsics  # noqa: E402
-from registration_io import default_extrinsics_path, undistort_pair  # noqa: E402
+from registration_io import (  # noqa: E402
+    DEFAULT_DEPTH_MAX,
+    DEFAULT_DEPTH_MIN,
+    DEFAULT_REFERENCE_DEPTH,
+    default_extrinsics_path,
+    undistort_pair,
+)
 from triangulate import (  # noqa: E402
     distance_to_line,
     epipolar_lines,
@@ -800,7 +806,7 @@ def main() -> int:
     args = parse_args()
     config = load_config()
     reg_config = config.get("registration", {}) or {}
-    depth_range = reg_config.get("depth_range", [0.11, 0.21])
+    depth_range = reg_config.get("depth_range", [DEFAULT_DEPTH_MIN, DEFAULT_DEPTH_MAX])
     depth_range = (float(depth_range[0]), float(depth_range[1]))
 
     extrinsics_path = resolve_path(
@@ -844,7 +850,7 @@ def main() -> int:
         image_a, image_b, extrinsics, depth_range, max(2, args.zoom),
         (int(args.window[0]), int(args.window[1])),
         max(3, args.blob_radius) if args.blob_snap else 0,
-        float(reg_config.get("default_depth", 0.168)),
+        float(reg_config.get("default_depth", DEFAULT_REFERENCE_DEPTH)),
     )
     if not result:
         print("Nothing measured.")
