@@ -23,6 +23,7 @@ from calibration.stereo import (
     StereoExtrinsics,
     StereoObservation,
     CaptureBlockSummary,
+    WEAK_TRIANGULATION_DEG,
     rectify_maps,
 )
 from calibration.stereo_metrics import (
@@ -436,7 +437,8 @@ def figure_metrics(report: StereoReport, path: Path) -> Path:
                       color=COLOR_SHARED, alpha=0.22, label="over the overlap")
     axis.plot(depths, sweep.triangulation_deg["axis"], color=COLOR_SHARED, lw=2.0,
               label="on the optical axis")
-    axis.axhline(5.0, color=COLOR_WARN, ls="--", lw=1.2, label="5 deg, weak depth")
+    axis.axhline(WEAK_TRIANGULATION_DEG, color=COLOR_WARN, ls="--", lw=1.2,
+                 label=f"{WEAK_TRIANGULATION_DEG:g} deg, weak depth")
     _mark_depths(axis, report)
     axis.set_ylabel("triangulation angle [deg]")
     axis.set_title("Triangulation geometry")

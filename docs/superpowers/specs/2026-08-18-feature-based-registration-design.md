@@ -1,7 +1,9 @@
 # Design: `register_features.py`
 
+> **Superseded.** This documents the plane-fit design: a single fitted plane depth, reusing `register_pipeline.py`'s `plane_homography`, `candidate_depths` and `singular_depth`. `register_pipeline.py` was deleted in `ff8c992`, and `register_features.py` now triangulates every match with no assumed plane depth (`triangulate.py`; see the `register_features.py` docstring and the README "Registration" section). Kept as a design record only.
+
 **Date:** 2026-08-18
-**Status:** Approved
+**Status:** Approved, then superseded (see note above)
 
 ## Purpose
 

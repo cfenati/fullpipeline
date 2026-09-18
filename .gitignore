@@ -30,3 +30,12 @@ DIYer22/calibrating/
 
 # Thermal accuracy/drift check output
 thermal_reports/
+
+# Optris SDK sample: CMake build tree and frames written by direct_binding_usb_show.py
+OptrixThermalCamera/oop/build/
+OptrixThermalCamera/python/thermal_frame_*
+OptrixThermalCamera/python/image_screenshot_*
+
+# Fast-FoundationStereo: cloned third-party repo (has its own .git, ~290 MB), used only
+# by register_foundationstereo.py
+Fast-FoundationStereo/

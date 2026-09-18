@@ -397,7 +397,7 @@ def cmd_optimize(args) -> int:
     for cam in best_rig.cameras:
         az, el, roll = cam.azimuth_elevation_roll
         print(f"  - name: {cam.name}")
-        print(f"    pose:")
+        print("    pose:")
         print(f"      position: [{cam.t[0]:.4f}, {cam.t[1]:.4f}, {cam.t[2]:.4f}]")
         if args.aim == "hold":
             print("      # rotation held from the loaded file")

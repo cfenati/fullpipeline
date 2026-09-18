@@ -18,9 +18,8 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import List
 
-import cv2
 import numpy as np
 import torch
 
@@ -34,10 +33,10 @@ from calibration.stereo import (  # noqa: E402
     DEFAULT_MIN_SHARED_CORNERS,
     StereoExtrinsics,
     StereoObservation,
+    board_from_extrinsics,
     collect_session_pairs,
     detect_stereo_observations,
 )
-from calibration.target_board import TargetBoard  # noqa: E402
 from registration_io import (  # noqa: E402
     DEFAULT_DEPTH_MAX,
     DEFAULT_DEPTH_MIN,
@@ -68,18 +67,10 @@ from register_features import (  # noqa: E402
     RAFT_GRID_STEP_PX,
     triangulate_matches,
 )
+from triangulate import undistort_points  # noqa: E402
 
 DEFAULT_CROSS_VALIDATION_CAPTURES = "captures/cross-validation"
 MIN_MESH_POINTS = 4  # fewer real matches than this can't even define a Delaunay mesh
-
-
-def board_from_extrinsics(extrinsics: StereoExtrinsics, extrinsics_path: Path) -> TargetBoard:
-    if not extrinsics.board:
-        raise SystemExit(
-            f"{extrinsics_path} carries no board info; re-run stereo_calibrate.py "
-            "(current version always records it) before scoring against it."
-        )
-    return TargetBoard.from_dict(extrinsics.board)
 
 
 def parse_args() -> argparse.Namespace:
@@ -123,16 +114,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def undistort_points(points: np.ndarray, camera_matrix: np.ndarray, distortion: np.ndarray) -> np.ndarray:
-    """cv2.undistortPoints with P=camera_matrix, matching undistort_pair's
-    cv2.undistort(img, K, dist) convention (no newCameraMatrix -> same K applies
-    to the undistorted frame)."""
-    undistorted = cv2.undistortPoints(
-        points.reshape(-1, 1, 2).astype(np.float64), camera_matrix, distortion, P=camera_matrix,
-    )
-    return undistorted.reshape(-1, 2)
-
-
 def evaluate_observation(
     observation: StereoObservation,
     session_dir: Path,
@@ -152,7 +133,6 @@ def evaluate_observation(
     color_a, color_b, camera_matrix_a, camera_matrix_b = downscale_pair(
         undistorted_a, undistorted_b, extrinsics.camera_matrix_a, extrinsics.camera_matrix_b, downscale,
     )
-    size_a = (color_a.shape[1], color_a.shape[0])
 
     pts_a_parts, pts_b_parts, scores_parts = [], [], []
     if "disk" in matcher_choice:
@@ -241,7 +221,7 @@ def main() -> int:
     if not extrinsics_path.exists():
         raise SystemExit(f"No stereo extrinsics at {extrinsics_path}.")
     extrinsics = StereoExtrinsics.load_json(extrinsics_path)
-    board = board_from_extrinsics(extrinsics, extrinsics_path)
+    board = board_from_extrinsics(extrinsics, extrinsics_path, "scoring against it")
 
     if args.session:
         session_dir = resolve_path(args.session)

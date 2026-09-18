@@ -202,14 +202,3 @@ def snap_to_line(points: np.ndarray, lines: np.ndarray) -> np.ndarray:
     lines = np.asarray(lines, dtype=np.float64).reshape(-1, 3)
     offset = distance_to_line(points, lines)
     return points - offset[:, None] * lines[:, :2]
-
-
-def z_from_disparity(disparity_px, Q: np.ndarray) -> np.ndarray:
-    """Rectified triangulation: Z in metres from horizontal disparity and Q.
-
-    ``Q`` is ``cv2.stereoRectify``'s 4×4; this is the same 3D point as
-    ``triangulate_points`` once the pair has been row-aligned.
-    """
-    disparity = np.asarray(disparity_px, dtype=np.float64)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        return Q[2, 3] / (Q[3, 2] * disparity + Q[3, 3])

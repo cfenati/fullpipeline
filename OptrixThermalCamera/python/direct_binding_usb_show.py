@@ -26,7 +26,7 @@ if os.name == 'nt':
         pathXml = b'.\generic.xml'
 else:
         #linux:
-        libir = ct.cdll.LoadLibrary(ct.util.find_library("irdirectsdk"))
+        libir = ct.cdll.LoadLibrary(find_library("irdirectsdk"))
         pathXml = b'/home/cfenati/projects/MasterThesis/libirimager/examples/config/generic.xml'
 
 # init vars

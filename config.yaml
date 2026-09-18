@@ -62,7 +62,8 @@ geometric_calibration:
   # epipolar RMS and empty dense stereo. This range is close-range/wide-baseline:
   # see design/config/rig_next_candidate.yaml for the baseline/lens rework needed
   # for dense stereo to work here at all (triangulation angle > 30 deg at the
-  # as-built 85.6 mm baseline breaks SGBM correspondence outright).
+  # as-built 85.6 mm baseline breaks SGBM correspondence outright). Measured with the
+  # SGBM dense-stereo path, since retired in favour of sparse-match triangulation.
   # Generate with: python stereo_calibrate.py --in captures/stereo --camera-a rgb_cam1 --camera-b rgb_cam2
   stereo_captures:
     - captures/stereo
@@ -98,15 +99,17 @@ registration:
   # frames, 1 keeps everything (black borders). At the current as-built pose
   # (50.2 mm baseline, 17.5 deg convergence), alpha=0 crops to a tiny mutually
   # -valid region and compensates with an inflated focal length (32k px vs the
-  # camera's real ~10.7k px), which pushes the disparity range past the SGBM
-  # search window and zeroes dense coverage outright. alpha=1.0 measured
-  # 0%->7-12% dense coverage on the same captures. Re-check this after any
+  # camera's real ~10.7k px), which pushed the disparity range past the SGBM
+  # search window and zeroed dense coverage outright. alpha=1.0 measured
+  # 0%->7-12% SGBM dense coverage on the same captures (SGBM has since been
+  # retired, but the mechanism - an inflated focal length inflates disparity -
+  # applies equally to Fast-FoundationStereo's max_disp in
+  # register_foundationstereo.py). Re-check this after any
   # rig pose change — recompute with:
   #   python -c "from calibration.stereo import StereoExtrinsics, rectify; \
   #   ex = StereoExtrinsics.load_json('calibration/results/stereo_rgb_cam1_rgb_cam2/extrinsics.json'); \
   #   [print(a, rectify(ex, alpha=a, reference_depth=0.168).P1[0,0]) for a in (0.0, 0.5, 1.0)]"
   rectification_alpha: 1.0
-  rig: design/config/rig_as_built.yaml
 
 thermal:
   config_xml: OptrixThermalCamera/config/generic.xml

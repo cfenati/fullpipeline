@@ -506,6 +506,18 @@ class StereoExtrinsics:
         )
 
 
+def board_from_extrinsics(
+    extrinsics: StereoExtrinsics, extrinsics_path: Path, purpose: str,
+) -> TargetBoard:
+    """The board a stereo fit was calibrated with, or exit naming what ``purpose`` needs it for."""
+    if not extrinsics.board:
+        raise SystemExit(
+            f"{extrinsics_path} carries no board info; re-run stereo_calibrate.py "
+            f"(current version always records it) before {purpose}."
+        )
+    return TargetBoard.from_dict(extrinsics.board)
+
+
 def _distortion_flags(distortion_a: np.ndarray, distortion_b: np.ndarray) -> int:
     """Match the flags to the distortion vectors the intrinsics were fitted with."""
     longest = max(distortion_a.size, distortion_b.size)

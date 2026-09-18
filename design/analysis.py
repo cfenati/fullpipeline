@@ -93,9 +93,6 @@ class CoverageResult:
             }
         return out
 
-    def uncovered_points(self, k: int = 1) -> np.ndarray:
-        return self.points[self.n_views < k]
-
 
 def volume_coverage(rig: Rig, pitch: Optional[float] = None,
                     margin_px: Optional[float] = None) -> CoverageResult:

@@ -48,7 +48,9 @@ from registration_io import (  # noqa: E402
     PREVIEW_PANEL_WIDTH,
     default_extrinsics_path,
     downscale_pair,
+    labelled,
     load_session_images,
+    resize_to_width,
     undistort_pair,
 )
 from triangulate import (  # noqa: E402
@@ -782,19 +784,6 @@ def render_checker(
     return checker
 
 
-def _labelled(image: np.ndarray, text: str) -> np.ndarray:
-    frame = image.copy()
-    cv2.putText(frame, text, (16, 36), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2, cv2.LINE_AA)
-    return frame
-
-
-def _resize_to_width(image: np.ndarray, width: int) -> np.ndarray:
-    if image.shape[1] <= width:
-        return image
-    scale = width / image.shape[1]
-    return cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-
-
 def save_preview(
     path: Path, color_a: np.ndarray, warped_color: np.ndarray, checker: np.ndarray,
 ) -> None:
@@ -806,9 +795,9 @@ def save_preview(
     make np.hstack raise.
     """
     panels = [
-        _resize_to_width(_labelled(color_a, "camera A"), PREVIEW_PANEL_WIDTH),
-        _resize_to_width(_labelled(warped_color, "B warped onto A"), PREVIEW_PANEL_WIDTH),
-        _resize_to_width(_labelled(checker, "overlap (checker)"), PREVIEW_PANEL_WIDTH),
+        resize_to_width(labelled(color_a, "camera A"), PREVIEW_PANEL_WIDTH),
+        resize_to_width(labelled(warped_color, "B warped onto A"), PREVIEW_PANEL_WIDTH),
+        resize_to_width(labelled(checker, "overlap (checker)"), PREVIEW_PANEL_WIDTH),
     ]
     max_height = max(panel.shape[0] for panel in panels)
     padded = [
