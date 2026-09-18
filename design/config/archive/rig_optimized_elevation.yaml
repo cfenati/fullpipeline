@@ -1,4 +1,4 @@
-extends: rig_as_built.yaml
+extends: ../rig_as_built.yaml
 name: rgb2_thermal1_as_built_optimised
 cameras:
 - name: rgb_cam1
