@@ -20,6 +20,7 @@ import numpy as np
 from PIL import Image, ImageTk
 
 from gui import fit_to_box
+from touch_controls import CONFIRM_TIMEOUT_S, ConfirmGate, apply_touch_style
 from calibration.live_capture import (
     GateStatus,
     PHASE_ORDER,
@@ -48,10 +49,12 @@ class LiveCaptureGUI:
         camera_a: str,
         camera_b: str,
         window_size: str = "1500x950",
+        touch: bool = False,
     ) -> None:
         self.captures_dir = Path(captures_dir)
         self.camera_a = camera_a
         self.camera_b = camera_b
+        self._touch = touch
         self._closed = False
         self._paused = False
         self._refit_requested = False
@@ -70,7 +73,7 @@ class LiveCaptureGUI:
         self.root = tk.Tk()
         self.root.title("Guided Live Calibration")
         self.root.geometry(window_size)
-        self.root.minsize(1100, 760)
+        self.root.minsize(*((640, 400) if touch else (1100, 760)))
 
         self._header_var = tk.StringVar(value="Opening cameras...")
         self._status_var = tk.StringVar(value="")
@@ -91,51 +94,39 @@ class LiveCaptureGUI:
     # Layout
     # ------------------------------------------------------------------ #
     def _build_layout(self) -> None:
-        style = ttk.Style()
-        if "clam" in style.theme_names():
-            style.theme_use("clam")
-
         toolbar = ttk.Frame(self.root, padding=(10, 8))
         toolbar.pack(fill=tk.X)
-        ttk.Button(toolbar, text="Refit Now (r)", command=self.request_refit).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(toolbar, text="Capture More (u)", command=self.request_top_up).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(toolbar, text="Continue (c)", command=self.request_continue).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(toolbar, text="Discard Worst (w)", command=self.request_discard_worst).pack(
-            side=tk.LEFT, padx=(0, 6)
-        )
-        ttk.Button(toolbar, text="Discard & Restart (d)", command=self.request_discard).pack(
-            side=tk.LEFT, padx=(0, 6)
-        )
-        self._pause_button = ttk.Button(
-            toolbar, text="Pause Auto-Capture (space)", command=self.toggle_pause
-        )
-        self._pause_button.pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(toolbar, text="Open Captures Folder", command=self.open_captures_folder).pack(
-            side=tk.LEFT, padx=(0, 6)
-        )
-        ttk.Button(toolbar, text="Quit (q)", command=self.request_quit).pack(side=tk.RIGHT)
+        if self._touch:
+            apply_touch_style(self.root)
+            self._build_touch_toolbar(toolbar)
+        else:
+            style = ttk.Style()
+            if "clam" in style.theme_names():
+                style.theme_use("clam")
+            self._build_desktop_toolbar(toolbar)
 
         header = ttk.Frame(self.root, padding=(10, 0, 10, 4))
         header.pack(fill=tk.X)
         ttk.Label(header, textvariable=self._header_var, font=("TkDefaultFont", 12, "bold")).pack(anchor="w")
 
-        hint = ttk.Frame(self.root, padding=(10, 0, 10, 6))
-        hint.pack(fill=tk.X)
-        ttk.Label(
-            hint,
-            text=(
-                "Each phase is fit once, when its target is reached - not per capture. "
-                "READY just means calibrate_cameras.py/stereo_calibrate.py's own quality checks see "
-                "no warnings; Continue works either way, except moving from cam2 into the stereo "
-                "phase, which also needs both mono RMS/coverage over the --max-mono-rms-for-stereo/"
-                "--min-coverage-fraction bars (imprecise intrinsics make a bad stereo fit look like "
-                "a stereo problem). If not ready, 'Capture More' adds views without losing what you "
-                "have, 'Discard & Restart' starts the phase over."
-            ),
-            foreground="#888888",
-            wraplength=1450,
-            justify=tk.LEFT,
-        ).pack(anchor="w")
+        if not self._touch:
+            hint = ttk.Frame(self.root, padding=(10, 0, 10, 6))
+            hint.pack(fill=tk.X)
+            ttk.Label(
+                hint,
+                text=(
+                    "Each phase is fit once, when its target is reached - not per capture. "
+                    "READY just means calibrate_cameras.py/stereo_calibrate.py's own quality checks see "
+                    "no warnings; Continue works either way, except moving from cam2 into the stereo "
+                    "phase, which also needs both mono RMS/coverage over the --max-mono-rms-for-stereo/"
+                    "--min-coverage-fraction bars (imprecise intrinsics make a bad stereo fit look like "
+                    "a stereo problem). If not ready, 'Capture More' adds views without losing what you "
+                    "have, 'Discard & Restart' starts the phase over."
+                ),
+                foreground="#888888",
+                wraplength=1450,
+                justify=tk.LEFT,
+            ).pack(anchor="w")
 
         body = ttk.Frame(self.root, padding=(10, 0, 10, 8))
         body.pack(fill=tk.BOTH, expand=True)
@@ -160,6 +151,59 @@ class LiveCaptureGUI:
         ttk.Label(status, textvariable=self._status_var, wraplength=700, justify=tk.LEFT).pack(side=tk.LEFT)
         ttk.Label(status, textvariable=self._last_session_var).pack(side=tk.RIGHT, padx=(20, 0))
         ttk.Label(status, textvariable=self._count_var).pack(side=tk.RIGHT, padx=(20, 0))
+
+    def _build_desktop_toolbar(self, toolbar: ttk.Frame) -> None:
+        ttk.Button(toolbar, text="Refit Now (r)", command=self.request_refit).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(toolbar, text="Capture More (u)", command=self.request_top_up).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(toolbar, text="Continue (c)", command=self.request_continue).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(toolbar, text="Discard Worst (w)", command=self.request_discard_worst).pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
+        ttk.Button(toolbar, text="Discard & Restart (d)", command=self.request_discard).pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
+        self._pause_button = ttk.Button(
+            toolbar, text="Pause Auto-Capture (space)", command=self.toggle_pause
+        )
+        self._pause_button.pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(toolbar, text="Open Captures Folder", command=self.open_captures_folder).pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
+        ttk.Button(toolbar, text="Quit (q)", command=self.request_quit).pack(side=tk.RIGHT)
+
+    def _build_touch_toolbar(self, toolbar: ttk.Frame) -> None:
+        """Two rows of big buttons; the destructive ones need a second tap."""
+        top, bottom = ttk.Frame(toolbar), ttk.Frame(toolbar)
+        top.pack(fill=tk.X, pady=(0, 6))
+        bottom.pack(fill=tk.X)
+
+        def add(row: ttk.Frame, text: str, command, confirm: bool = False) -> ttk.Button:
+            button = ttk.Button(row, text=text, style="Touch.TButton")
+            button.configure(command=self._confirming(button, text, command) if confirm else command)
+            button.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=4)
+            return button
+
+        add(top, "Refit Now", self.request_refit)
+        add(top, "Capture More", self.request_top_up)
+        add(top, "Continue", self.request_continue)
+        self._pause_button = add(top, "Pause Auto-Capture", self.toggle_pause)
+        add(bottom, "Discard Worst", self.request_discard_worst, confirm=True)
+        add(bottom, "Discard & Restart", self.request_discard, confirm=True)
+        add(bottom, "Quit", self.request_quit)
+
+    def _confirming(self, button: ttk.Button, label: str, action):
+        """Wrap ``action`` so the first tap only relabels the button; a second tap runs it."""
+        gate = ConfirmGate()
+
+        def handler() -> None:
+            if gate.press():
+                button.configure(text=label)
+                action()
+                return
+            button.configure(text="Tap again to confirm")
+            self.root.after(int(CONFIRM_TIMEOUT_S * 1000) + 100,
+                            lambda: button.configure(text=label))
+        return handler
 
     def _create_preview_panel(self, parent: ttk.Frame, title: str) -> tuple:
         frame = ttk.LabelFrame(parent, text=title, padding=6)
@@ -320,7 +364,8 @@ class LiveCaptureGUI:
 
     def toggle_pause(self) -> None:
         self._paused = not self._paused
-        label = "Resume Auto-Capture (space)" if self._paused else "Pause Auto-Capture (space)"
+        suffix = "" if self._touch else " (space)"
+        label = f"Resume Auto-Capture{suffix}" if self._paused else f"Pause Auto-Capture{suffix}"
         self._pause_button.configure(text=label)
 
     def is_paused(self) -> bool:

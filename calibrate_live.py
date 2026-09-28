@@ -205,6 +205,9 @@ def parse_args() -> argparse.Namespace:
                               "generalize across a range of distances, which doesn't apply to a "
                               "fixed close-range setup; still present in report.txt regardless.")
     parser.add_argument("--no-preview", action="store_true", help="Headless mode: terminal keys only.")
+    parser.add_argument("--touch", action="store_true",
+                        help="Touchscreen mode: big two-row toolbar, no keyboard hints, "
+                             "tap-again-to-confirm on the discard buttons.")
     return parser.parse_args()
 
 
@@ -275,7 +278,7 @@ def main() -> int:
 
         if show_preview:
             from live_gui import LiveCaptureGUI
-            gui = LiveCaptureGUI(captures_dir, args.camera_a, args.camera_b)
+            gui = LiveCaptureGUI(captures_dir, args.camera_a, args.camera_b, touch=args.touch)
             gui.set_status("Ready")
         else:
             terminal_input = TerminalInput()
