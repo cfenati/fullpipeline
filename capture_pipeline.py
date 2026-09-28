@@ -261,6 +261,20 @@ def open_cameras(
     return cam1, cam2, thermal, blackfly
 
 
+def unique_session_dir(output_dir: Path, timestamp: str) -> Path:
+    """``output_dir/timestamp``, or ``timestamp_2``, ``timestamp_3``... if that name is taken.
+
+    The timestamp only has second precision, so two captures in the same second used to
+    share one folder and the second silently overwrote the first.
+    """
+    candidate = output_dir / timestamp
+    suffix = 1
+    while candidate.exists():
+        suffix += 1
+        candidate = output_dir / f"{timestamp}_{suffix}"
+    return candidate
+
+
 def save_capture(
     output_dir: Path,
     timestamp: str,
@@ -275,8 +289,8 @@ def save_capture(
     blackfly: Optional[BlackflyCamera] = None,
     color_corrector: Optional[RGBColorCorrector] = None,
 ) -> Path:
-    session_dir = output_dir / timestamp
-    session_dir.mkdir(parents=True, exist_ok=True)
+    session_dir = unique_session_dir(output_dir, timestamp)
+    session_dir.mkdir(parents=True, exist_ok=False)
 
     rgb1_path = session_dir / "rgb_cam1.jpg"
     rgb2_path = session_dir / "rgb_cam2.jpg"
