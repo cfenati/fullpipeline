@@ -216,6 +216,22 @@ are captured under the same `captures/stereo` the manual workflow uses
 migration step. `python calibrate_live.py --no-preview` runs headless
 (`f`/`q` in the terminal).
 
+## Touchscreen menu
+
+```bash
+python menu.py                     # home screen: capture, calibrate, measure, register, output folder
+python menu.py --install-shortcut  # desktop + application-menu launcher (run once on the Jetson)
+```
+
+A launcher for the touchscreen: every tile runs the existing script with `--touch`
+(`capture_pipeline.py`, `calibrate_live.py`, `measure_wound_depth.py`, `measure_points.py`
+take it; `register_features.py` has no window). `--touch` swaps keyboard/mouse-wheel controls
+for on-screen buttons (aim with a tap, nudge with the arrows, then **Place**; Reset, Finish
+and the calibration discard buttons need a second tap) and leaves everything else unchanged.
+Stage output goes to `logs/menu/`; the measure/registration tiles finish on a Result screen
+showing the newest `report.txt`/`report_features.txt` from `registration/results/`.
+Sessions from the calibration folders in `config.yaml` are hidden from the session picker.
+
 ## Calibration
 
 Board: `calibration/config/charuco_11x8.yaml` (printable PDF next to it).
