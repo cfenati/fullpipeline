@@ -224,6 +224,8 @@ class RimAndWoundSession:
         self.rim_indices: List[int] = []
         self.point_indices: List[int] = []
         self.points_mm: Dict[int, np.ndarray] = {}
+        # Latest live-estimate line for the touch status strip (print() output is invisible there).
+        self.last_live: Optional[str] = None
 
     def on_point(self, index: int, result: Dict[str, Any]) -> None:
         self.points_mm[index] = np.asarray(result["points_mm"][index], dtype=np.float64)
@@ -236,13 +238,17 @@ class RimAndWoundSession:
         try:
             live = nearest_rim_plane(self.points_mm[index], rim_points_mm, self.neighbors)
         except ValueError as exc:
+            self.last_live = f"point {len(self.point_indices)}: {exc}"
             print(f"  wound point {len(self.point_indices) - 1}: {exc}")
             return
+        self.last_live = (f"point {len(self.point_indices)}: "
+                          f"depth {live['depth_mm']:.2f} mm (live estimate)")
         print(f"  wound point {len(self.point_indices) - 1}: depth {live['depth_mm']:.3f} mm "
               f"(local plane rms {live['plane_rms_mm']:.4f} mm from {live['neighbor_count']} "
               f"rim points, farthest {live['farthest_neighbor_mm']:.1f} mm) [live estimate]")
 
     def on_undo(self, new_count: int) -> None:
+        self.last_live = None
         for index in list(self.points_mm):
             if index >= new_count:
                 del self.points_mm[index]
@@ -262,6 +268,17 @@ class RimAndWoundSession:
         self.rim_closed = True
         print(f"  rim locked: {len(self.rim_indices)} points")
         return None
+
+    def status_lines(self) -> List[str]:
+        """Two status-strip lines for touch mode, where print() output is not visible."""
+        if self.rim_closed:
+            rim = f"Rim locked: {len(self.rim_indices)} points"
+        elif len(self.rim_indices) >= self.neighbors:
+            rim = f"Rim: {len(self.rim_indices)} points - tap Lock rim when done"
+        else:
+            rim = f"Rim: {len(self.rim_indices)} of {self.neighbors} needed"
+        idle = "Tap points to measure" if self.rim_closed else "Tap rim points around the area"
+        return [rim, self.last_live or idle]
 
 
 # --------------------------------------------------------------------------- #
@@ -379,6 +396,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out", "--output", dest="output", default=None,
                         help="Output directory (default: registration.output_dir in "
                              f"config) / <session> / {DEFAULT_OUTPUT_SUBDIR}.")
+    parser.add_argument("--touch", action="store_true",
+                        help="Touchscreen mode: on-screen buttons (place, undo, zoom, lock rim, "
+                             "finish) and tap-to-aim instead of keyboard keys and the mouse wheel.")
     return parser.parse_args()
 
 
@@ -444,6 +464,8 @@ def main() -> int:
             float(reg_config.get("default_depth", DEFAULT_REFERENCE_DEPTH)),
             on_point=session.on_point, on_undo=session.on_undo,
             on_advance=session.on_advance,
+            on_status=session.status_lines if args.touch else None,
+            touch=args.touch,
         )
         if len(session.rim_indices) < args.neighbors or not session.point_indices:
             print(f"{session_dir.name}: no points measured (need the rim locked with "
