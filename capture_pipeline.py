@@ -556,6 +556,7 @@ def run_pipeline(
     sync_metrics: bool = False,
     sync_print: bool = False,
     output: Optional[str] = None,
+    touch: bool = False,
 ) -> int:
     config = load_config(config_path)
     output_dir = resolve_capture_output_dir(config["output_dir"], output)
@@ -574,6 +575,7 @@ def run_pipeline(
             gui = CaptureGUI(
                 output_dir=output_dir,
                 window_size=window_size,
+                touch=touch,
             )
             gui.set_blackfly_enabled(blackfly_enabled)
             gui.set_status("Opening cameras...")
@@ -590,7 +592,10 @@ def run_pipeline(
         )
 
         if gui is not None:
-            gui.set_status("Ready — Save button, S in terminal, or Ctrl+S")
+            gui.set_status(
+                "Ready — tap Take photo" if touch
+                else "Ready — Save button, S in terminal, or Ctrl+S"
+            )
         else:
             print("Pipeline ready.")
             print("Keys: s = save | q = quit (in this terminal)")
@@ -900,6 +905,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print grab timings on each save (or each sample with --sync-test)",
     )
+    parser.add_argument(
+        "--touch",
+        action="store_true",
+        help="Touchscreen mode: one large Take photo button, no keyboard hints",
+    )
     return parser.parse_args()
 
 
@@ -935,6 +945,7 @@ def main() -> int:
         sync_metrics=sync_metrics,
         sync_print=sync_print,
         output=args.output,
+        touch=args.touch,
     )
 
 

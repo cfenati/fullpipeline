@@ -11,6 +11,7 @@ import numpy as np
 from PIL import Image, ImageTk
 
 from cameras.thermal_camera import ThermalFrame
+from touch_controls import SAVE_DEBOUNCE_S, Debouncer, apply_touch_style
 
 
 def fit_to_box(image: np.ndarray, max_width: int, max_height: int) -> np.ndarray:
@@ -36,8 +37,11 @@ class CaptureGUI:
         self,
         output_dir: Path,
         window_size: str = "1400x920",
+        touch: bool = False,
     ) -> None:
         self.output_dir = output_dir
+        self._touch = touch
+        self._save_gate = Debouncer(SAVE_DEBOUNCE_S)
         self._closed = False
         self._save_requested = False
         self._quit_requested = False
@@ -47,7 +51,7 @@ class CaptureGUI:
         self.root = tk.Tk()
         self.root.title("Multi-Camera Capture Pipeline")
         self.root.geometry(window_size)
-        self.root.minsize(1000, 720)
+        self.root.minsize(*((640, 400) if touch else (1000, 720)))
 
         self._status_var = tk.StringVar(value="Initializing...")
         self._temp_var = tk.StringVar(value="Mean: -- °C")
@@ -60,29 +64,38 @@ class CaptureGUI:
         self.root.protocol("WM_DELETE_WINDOW", self.request_quit)
 
     def _build_layout(self) -> None:
-        style = ttk.Style()
-        if "clam" in style.theme_names():
-            style.theme_use("clam")
-
         toolbar = ttk.Frame(self.root, padding=(10, 8))
         toolbar.pack(fill=tk.X)
 
-        ttk.Button(
-            toolbar,
-            text="Save Capture",
-            command=self.request_save,
-        ).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(
-            toolbar,
-            text="Open Output Folder",
-            command=self.open_output_folder,
-        ).pack(side=tk.LEFT, padx=(0, 6))
+        if self._touch:
+            apply_touch_style(self.root)
+            ttk.Button(
+                toolbar, text="Take photo", style="TouchHuge.TButton",
+                command=self.request_save,
+            ).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 12))
+            ttk.Button(
+                toolbar, text="Done", style="Touch.TButton", command=self.request_quit,
+            ).pack(side=tk.RIGHT)
+        else:
+            style = ttk.Style()
+            if "clam" in style.theme_names():
+                style.theme_use("clam")
+            ttk.Button(
+                toolbar,
+                text="Save Capture",
+                command=self.request_save,
+            ).pack(side=tk.LEFT, padx=(0, 6))
+            ttk.Button(
+                toolbar,
+                text="Open Output Folder",
+                command=self.open_output_folder,
+            ).pack(side=tk.LEFT, padx=(0, 6))
 
-        ttk.Button(
-            toolbar,
-            text="Quit",
-            command=self.request_quit,
-        ).pack(side=tk.RIGHT)
+            ttk.Button(
+                toolbar,
+                text="Quit",
+                command=self.request_quit,
+            ).pack(side=tk.RIGHT)
 
         feeds = ttk.Frame(self.root, padding=(10, 0, 10, 8))
         feeds.pack(fill=tk.BOTH, expand=True)
@@ -137,6 +150,10 @@ class CaptureGUI:
         self.root.bind("q", lambda _event: self.request_quit())
 
     def request_save(self) -> None:
+        # A save blocks this loop for seconds, so a double-tap's second tap is only delivered
+        # after the save ends; refusing taps for a moment after completion drops it.
+        if self._touch and not self._save_gate.ready():
+            return
         self._save_requested = True
 
     def request_quit(self) -> None:
@@ -162,10 +179,14 @@ class CaptureGUI:
         self.pump()
 
     def note_capture_saved(self, session_dir: Path) -> None:
+        self._save_gate.mark()
         self._capture_count += 1
         self._count_var.set(f"Captures: {self._capture_count}")
         self._save_var.set(f"Last save: {session_dir.name}")
-        self.set_status("Ready — press Save Capture or S")
+        self.set_status(
+            "Saved. Tap Take photo for another." if self._touch
+            else "Ready — press Save Capture or S"
+        )
 
     def open_output_folder(self) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
