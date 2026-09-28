@@ -39,3 +39,6 @@ OptrixThermalCamera/python/image_screenshot_*
 # Fast-FoundationStereo: cloned third-party repo (has its own .git, ~290 MB), used only
 # by register_foundationstereo.py
 Fast-FoundationStereo/
+
+# Menu stage logs (one file per launched stage)
+logs/

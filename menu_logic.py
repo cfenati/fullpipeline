@@ -4,11 +4,15 @@ and results live. Kept free of Tk and of any camera import so it is unit-testabl
 
 from __future__ import annotations
 
+import os
 import re
+import signal
+import subprocess
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import yaml
 
@@ -187,3 +191,172 @@ def window_for_screen(width: int, height: int) -> Tuple[int, int]:
     """A cv2 window size that fits inside the screen (an oversized one never gets input)."""
     return (max(MIN_WINDOW[0], width - SCREEN_MARGIN_W),
             max(MIN_WINDOW[1], height - SCREEN_MARGIN_H))
+
+
+# --------------------------------------------------------------------------- #
+# Running a stage
+# --------------------------------------------------------------------------- #
+class StageRun:
+    """One stage as a subprocess: output to a log file, polled (never blocked on) by the UI.
+
+    The child runs in its own process group so Stop reaches everything it spawned. Stop
+    sends SIGINT first (Python ``finally`` blocks release the cameras), then escalates to
+    SIGTERM and SIGKILL if the child ignores it.
+    """
+
+    def __init__(self, command: List[str], log_path: Path, cwd: Path,
+                 term_after_s: float = 5.0, kill_after_s: float = 8.0,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self._command = command
+        self._log_path = log_path
+        self._cwd = cwd
+        self._term_after_s = term_after_s
+        self._kill_after_s = kill_after_s
+        self._clock = clock
+        self._proc: Optional[subprocess.Popen] = None
+        self._t0 = 0.0
+        self._stop_at: Optional[float] = None
+        self._termed = False
+        self._killed = False
+        self.started_at = 0.0
+
+    @property
+    def stopped(self) -> bool:
+        return self._stop_at is not None
+
+    def start(self) -> None:
+        self._log_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._log_path.open("wb") as log:
+            self._proc = subprocess.Popen(
+                self._command, cwd=str(self._cwd), stdin=subprocess.DEVNULL,
+                stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+            )
+        self._t0 = self._clock()
+        self.started_at = time.time()
+
+    def _signal(self, sig: int) -> None:
+        if self._proc is None:
+            return
+        try:
+            os.killpg(self._proc.pid, sig)  # pgid == pid because of start_new_session
+        except ProcessLookupError:
+            pass
+
+    def stop(self) -> None:
+        if self._stop_at is None:
+            self._stop_at = self._clock()
+            self._signal(signal.SIGINT)
+
+    def poll(self) -> Optional[int]:
+        """Exit code, or None while running. Also escalates a Stop the child is ignoring."""
+        if self._proc is None:
+            return None
+        code = self._proc.poll()
+        if code is None and self._stop_at is not None:
+            waited = self._clock() - self._stop_at
+            if waited >= self._kill_after_s and not self._killed:
+                self._killed = True
+                self._signal(signal.SIGKILL)
+            elif waited >= self._term_after_s and not self._termed:
+                self._termed = True
+                self._signal(signal.SIGTERM)
+        return code
+
+    def elapsed(self) -> float:
+        return self._clock() - self._t0
+
+    def log_text(self) -> str:
+        try:
+            return self._log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
+
+# --------------------------------------------------------------------------- #
+# Failure text and results
+# --------------------------------------------------------------------------- #
+GENERIC_FAILURE = "Something went wrong. Tap Show details for the technical message."
+
+# (substring found in the log, plain-language message); first match wins. The substrings are
+# the real messages raised in cameras/*.py, capture_pipeline.py and the measure tools.
+_FAILURE_HINTS: Tuple[Tuple[str, str], ...] = (
+    ("Cannot open rgb_cam", "An RGB camera could not be opened. Check both USB cables, then try again."),
+    ("evo_irimager_usb_init failed", "The thermal camera could not be started. Check its USB cable and power, then try again."),
+    ("Thermal config not found", "The thermal camera settings file is missing. Ask whoever maintains the rig."),
+    ("No FLIR/Spinnaker cameras found", "The FLIR camera was not found. Check its USB cable, then try again."),
+    ("Failed to grab from one or both RGB cameras", "The cameras stopped sending images. Check the USB cables, then try again."),
+    ("No stereo extrinsics", "This rig has not been calibrated yet. Run Calibrate cameras first."),
+    ("is missing rgb_cam", "That capture is missing a camera image. Pick a different capture."),
+    ("Failed to decode images", "That capture's images could not be read. Pick a different capture."),
+)
+
+
+def friendly_error(log_text: str) -> str:
+    for needle, message in _FAILURE_HINTS:
+        if needle in log_text:
+            return message
+    return GENERIC_FAILURE
+
+
+def tail_lines(text: str, count: int = 20) -> str:
+    return "\n".join(text.rstrip("\n").splitlines()[-count:])
+
+
+REPORT_GLOB = "report*.txt"
+REPORT_NAMES = ("report.txt", "report_features.txt")
+RESULT_IMAGE_NAMES = ("annotated.jpg", "measured.jpg", "preview_features.jpg")
+
+
+@dataclass(frozen=True)
+class Report:
+    report_path: Path
+    image_path: Optional[Path]
+
+
+def find_newest_report(results_dir: Path, since: float) -> Optional[Report]:
+    """The newest report written at or after ``since`` (epoch s), with the image beside it."""
+    if not results_dir.is_dir():
+        return None
+    newest: Optional[Tuple[float, Path]] = None
+    for path in results_dir.rglob(REPORT_GLOB):
+        if path.name not in REPORT_NAMES or not path.is_file():
+            continue
+        mtime = path.stat().st_mtime
+        if mtime >= since - 1.0 and (newest is None or mtime > newest[0]):
+            newest = (mtime, path)
+    if newest is None:
+        return None
+    folder = newest[1].parent
+    image = next((folder / name for name in RESULT_IMAGE_NAMES if (folder / name).is_file()), None)
+    return Report(newest[1], image)
+
+
+# --------------------------------------------------------------------------- #
+# Desktop shortcut
+# --------------------------------------------------------------------------- #
+def desktop_entry_text(python: str, menu_script: Path, project_root: Path) -> str:
+    return "\n".join([
+        "[Desktop Entry]",
+        "Type=Application",
+        "Name=FullPipeline",
+        "Comment=Capture, calibrate and measure",
+        f'Exec="{python}" "{menu_script}"',
+        f"Path={project_root}",
+        "Terminal=false",
+        "Categories=Utility;",
+        "",
+    ])
+
+
+def install_shortcut(python: str, menu_script: Path, project_root: Path,
+                     home: Optional[Path] = None) -> List[Path]:
+    home = home or Path.home()
+    text = desktop_entry_text(python, menu_script, project_root)
+    written: List[Path] = []
+    for directory in (home / "Desktop", home / ".local" / "share" / "applications"):
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / "FullPipeline.desktop"
+        target.write_text(text, encoding="utf-8")
+        target.chmod(0o755)
+        written.append(target)
+    return written
