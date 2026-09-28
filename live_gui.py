@@ -13,7 +13,7 @@ import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import ttk
-from typing import Optional
+from typing import Callable, Optional
 
 import cv2
 import numpy as np
@@ -191,18 +191,21 @@ class LiveCaptureGUI:
         add(bottom, "Discard & Restart", self.request_discard, confirm=True)
         add(bottom, "Quit", self.request_quit)
 
-    def _confirming(self, button: ttk.Button, label: str, action):
+    def _confirming(self, button: ttk.Button, label: str, action: Callable[[], None]) -> Callable[[], None]:
         """Wrap ``action`` so the first tap only relabels the button; a second tap runs it."""
         gate = ConfirmGate()
+        pending: list = []
 
         def handler() -> None:
+            if pending:
+                self.root.after_cancel(pending.pop())
             if gate.press():
                 button.configure(text=label)
                 action()
                 return
             button.configure(text="Tap again to confirm")
-            self.root.after(int(CONFIRM_TIMEOUT_S * 1000) + 100,
-                            lambda: button.configure(text=label))
+            pending.append(self.root.after(int(CONFIRM_TIMEOUT_S * 1000) + 100,
+                            lambda: button.configure(text=label)))
         return handler
 
     def _create_preview_panel(self, parent: ttk.Frame, title: str) -> tuple:
