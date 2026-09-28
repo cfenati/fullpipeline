@@ -48,6 +48,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from calibrate_cameras import load_config, resolve_path  # noqa: E402
+from touch_controls import BAR_HEIGHT as TOUCH_BAR_HEIGHT, TouchController  # noqa: E402
 from calibration.stereo import StereoExtrinsics  # noqa: E402
 from registration_io import (  # noqa: E402
     DEFAULT_DEPTH_MAX,
@@ -436,6 +437,7 @@ def render(state: Dict[str, Any]) -> np.ndarray:
 
 def build_status_lines(
     state: Dict[str, Any], on_status: Optional[Callable[[], List[str]]],
+    touch: bool = False,
 ) -> List[str]:
     """Build the window's bottom status-strip lines for one frame.
 
@@ -456,14 +458,28 @@ def build_status_lines(
             f"{state['text_prompt']}{state['text_buffer']}_",
             "type digits and , then Enter to confirm, Esc to cancel",
         ]
-    if on_status is not None:
+    if on_status is not None and not touch:
         return on_status()
     placed = len(state["clicks_a"])
-    head = (f"point {placed}: click the SAME feature in camera B, near the blue line"
-            if state["pending_a"] is not None
-            else f"point {placed}: click a feature in camera A")
+    if touch:
+        head = (f"point {placed}: tap the SAME feature in camera B, then Place"
+                if state["pending_a"] is not None
+                else f"point {placed}: tap a feature in camera A, then Place")
+        if on_status is not None:
+            return [head] + on_status()
+    else:
+        head = (f"point {placed}: click the SAME feature in camera B, near the blue line"
+                if state["pending_a"] is not None
+                else f"point {placed}: click a feature in camera A")
     recent = "   ".join(f"{i}->{i+1}: {d:.3f}mm"
                         for i, d in enumerate(state["consecutive"]))[-140:]
+    if touch:
+        return [
+            head,
+            f"measurements: {recent}" if recent else "measurements: (need two points)",
+            "drag = pan   Zoom +/- = zoom   arrows nudge the crosshair   Place = record the point",
+            "Undo | Reset | Lock rim (wound depth) | Finish = save and show the result",
+        ]
     return [
         head,
         f"measurements: {recent}" if recent else "measurements: (need two points)",
@@ -555,13 +571,18 @@ def run_interactive(image_a: np.ndarray, image_b: np.ndarray,
                     on_advance: Optional[Callable[[], Optional[str]]] = None,
                     on_text_submit: Optional[Callable[[str], Optional[str]]] = None,
                     on_status: Optional[Callable[[], List[str]]] = None,
+                    touch: bool = False,
                     ) -> Dict[str, Any]:
     fundamental = fundamental_for_undistorted(
         extrinsics.camera_matrix_a, extrinsics.camera_matrix_b, extrinsics.essential,
     )
     gray_a = cv2.cvtColor(image_a, cv2.COLOR_BGR2GRAY)
     gray_b = cv2.cvtColor(image_b, cv2.COLOR_BGR2GRAY)
-    panel_size = (max(320, max_window[0] // 2), max(320, max_window[1] - STATUS_HEIGHT))
+    # Touch mode adds a button bar under the status strip; the requested window size stays
+    # the total, so the canvas is still exactly 1:1 with screen pixels.
+    bar_height = TOUCH_BAR_HEIGHT if touch else 0
+    panel_size = (max(320, max_window[0] // 2),
+                  max(320, max_window[1] - STATUS_HEIGHT - bar_height))
 
     state: Dict[str, Any] = {
         "panel_a": Panel(image_a, panel_size), "panel_b": Panel(image_b, panel_size),
@@ -583,6 +604,10 @@ def run_interactive(image_a: np.ndarray, image_b: np.ndarray,
         "depth_hint": depth_m,
     }
     link_view(state["panel_a"], state["panel_b"], extrinsics, state["depth_hint"])
+
+    touch_controller: Optional[TouchController] = (
+        TouchController(state, STATUS_HEIGHT, show_lock=on_advance is not None)
+        if touch else None)
 
     def recompute() -> None:
         state["consecutive"] = []
@@ -674,11 +699,17 @@ def run_interactive(image_a: np.ndarray, image_b: np.ndarray,
     # match canvas pixels -- clicks land a few pixels from where you aimed, which is
     # fatal when a pixel is 0.019 mm. Fixing the canvas keeps the mapping exactly 1:1.
     cv2.namedWindow(window, cv2.WINDOW_AUTOSIZE)
-    cv2.setMouseCallback(window, on_mouse)
+    cv2.setMouseCallback(
+        window, on_mouse if touch_controller is None else touch_controller.wrap(on_mouse))
 
     while True:
-        state["status"] = build_status_lines(state, on_status)
-        cv2.imshow(window, render(state))
+        state["status"] = build_status_lines(state, on_status, touch=touch)
+        if touch_controller is not None:
+            touch_controller.sync()
+        frame = render(state)
+        if touch_controller is not None:
+            frame = touch_controller.compose(frame)
+        cv2.imshow(window, frame)
         key = cv2.waitKey(20)
         # Closing the window with its X button must end the session too, or the
         # loop would spin forever on an invisible window. Some OpenCV/Qt builds
@@ -690,6 +721,8 @@ def run_interactive(image_a: np.ndarray, image_b: np.ndarray,
             still_open = False
         if not still_open:
             break
+        if key == -1 and touch_controller is not None:
+            key = touch_controller.pop_key()
         if key == -1:
             continue
         key &= 0xFF
@@ -799,6 +832,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out", "--output", dest="output", default=None,
                         help="Output directory (default: registration.output_dir in "
                              f"config) / <session> / {DEFAULT_OUTPUT_SUBDIR}.")
+    parser.add_argument("--touch", action="store_true",
+                        help="Touchscreen mode: on-screen buttons (place, undo, zoom, finish) and "
+                             "tap-to-aim instead of keyboard keys and the mouse wheel.")
     return parser.parse_args()
 
 
@@ -851,6 +887,7 @@ def main() -> int:
         (int(args.window[0]), int(args.window[1])),
         max(3, args.blob_radius) if args.blob_snap else 0,
         float(reg_config.get("default_depth", DEFAULT_REFERENCE_DEPTH)),
+        touch=args.touch,
     )
     if not result:
         print("Nothing measured.")
