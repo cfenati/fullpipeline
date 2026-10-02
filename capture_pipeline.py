@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import select
 import sys
 import termios
@@ -42,9 +43,13 @@ def load_config(config_path: Path) -> dict:
         config = yaml.safe_load(config_file)
 
     output_dir = (PROJECT_ROOT / config["output_dir"]).resolve()
-    if not (output_dir.exists() or output_dir.parent.is_dir()):
+    if not (output_dir.exists() or os.path.ismount(output_dir.parent)):
         # e.g. output_dir points at an unmounted USB drive - fall back to the project's
         # own captures/ folder rather than mkdir(parents=True) creating a wrong-disk path.
+        # ismount(), not is_dir(): an unmounted drive's mountpoint directory (e.g.
+        # /mnt/usbdrive) commonly still exists on the internal disk, empty, even when
+        # nothing is plugged in - is_dir() alone would treat that as "usable" and silently
+        # write captures to the Jetson's internal disk under that empty mountpoint instead.
         output_dir = (PROJECT_ROOT / "captures").resolve()
     config["output_dir"] = output_dir
     config["thermal"]["config_xml"] = (

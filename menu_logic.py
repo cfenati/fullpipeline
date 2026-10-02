@@ -79,11 +79,24 @@ def load_menu_config(project_root: Path) -> Dict[str, Any]:
         return yaml.safe_load(handle) or {}
 
 
+def _storage_usable(path: Path, project_root: Path) -> bool:
+    """Whether ``mkdir(parents=True)``-ing under ``path`` is safe.
+
+    True if it already exists, or its parent is either the project itself (always
+    safe - that's where this code lives, never removable media) or an actual mounted
+    filesystem. Not ``parent.is_dir()``: an unmounted drive's mountpoint directory (e.g.
+    /mnt/usbdrive) commonly still exists on the internal disk, empty, even with nothing
+    plugged in - treating that as "usable" would silently write captures to the internal
+    disk under that empty mountpoint instead of refusing or falling back.
+    """
+    return path.exists() or path.parent == project_root or os.path.ismount(path.parent)
+
+
 def captures_dir_from(config: Dict[str, Any], project_root: Path) -> Path:
     """``output_dir`` may point at removable storage that isn't mounted right now; fall back
     to the project's own captures/ folder rather than blocking (see storage_problem())."""
     configured = (project_root / config.get("output_dir", "captures")).resolve()
-    if configured.exists() or configured.parent.is_dir():
+    if _storage_usable(configured, project_root):
         return configured
     return (project_root / "captures").resolve()
 
@@ -101,14 +114,13 @@ def hidden_capture_dirs(config: Dict[str, Any], project_root: Path) -> List[Path
     return [(project_root / name).resolve() for name in names if name]
 
 
-def storage_problem(captures_dir: Path) -> Optional[str]:
+def storage_problem(captures_dir: Path, project_root: Path) -> Optional[str]:
     """A plain-language message if the captures folder cannot be used, else None.
 
-    ``output_dir`` may point at removable storage (e.g. a USB drive at /mnt/usbdrive). When
-    that is not mounted neither the folder nor its parent exists, and creating it with
-    ``mkdir(parents=True)`` could silently write to the internal disk instead.
+    ``output_dir`` may point at removable storage (e.g. a USB drive at /mnt/usbdrive) -
+    see ``_storage_usable()`` for why a plain existence check isn't enough.
     """
-    if captures_dir.exists() or captures_dir.parent.is_dir():
+    if _storage_usable(captures_dir, project_root):
         return None
     return (f"The captures folder {captures_dir} was not found. If captures are saved to a "
             "USB drive, check that it is plugged in, then try again.")

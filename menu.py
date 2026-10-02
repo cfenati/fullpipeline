@@ -139,7 +139,7 @@ class MenuApp:
 
     def choose(self, stage: Stage) -> None:
         if stage.naming:  # a stage that writes new captures: refuse if the drive is missing
-            problem = storage_problem(self.captures_dir)
+            problem = storage_problem(self.captures_dir, self.project_root)
             if problem:
                 self.show_home(problem)
                 return
@@ -163,7 +163,7 @@ class MenuApp:
         self._title(f"{stage.title}: pick a capture")
         if not sessions:
             self._button(self.body, "Back", self.show_home).pack(side=tk.BOTTOM, anchor="w")
-            ttk.Label(self.body, text=storage_problem(self.captures_dir)
+            ttk.Label(self.body, text=storage_problem(self.captures_dir, self.project_root)
                       or "No captures yet. Use Take images first.",
                       style="Body.TLabel", wraplength=1000, justify=tk.LEFT).pack(anchor="w", pady=24)
             return
@@ -367,7 +367,7 @@ class MenuApp:
         self.show_home(f"{stage.title}: finished.")
 
     def open_output_folder(self) -> None:
-        problem = storage_problem(self.captures_dir)
+        problem = storage_problem(self.captures_dir, self.project_root)
         if problem:  # never mkdir(parents=True) a missing mount point
             self.show_home(problem)
             return

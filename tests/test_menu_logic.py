@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from menu_logic import (
     PROJECT_ROOT, STAGE_ORDER, STAGES, UNNAMED_FOLDER, build_command, captures_dir_from,
@@ -86,11 +87,12 @@ class ConfigHelpersTest(unittest.TestCase):
     def test_the_default_is_project_relative(self):
         self.assertEqual(captures_dir_from({}, Path("/proj")), Path("/proj/captures"))
 
-    def test_an_absolute_output_dir_is_kept_when_usable(self):
+    def test_an_absolute_output_dir_is_kept_when_actually_mounted(self):
         with tempfile.TemporaryDirectory() as tmp:
             usb = Path(tmp) / "usbdrive" / "captures"
-            usb.parent.mkdir()  # mounted: the parent exists even before first capture
-            self.assertEqual(captures_dir_from({"output_dir": str(usb)}, Path(tmp)), usb)
+            usb.parent.mkdir()
+            with mock.patch("menu_logic.os.path.ismount", return_value=True):
+                self.assertEqual(captures_dir_from({"output_dir": str(usb)}, Path(tmp)), usb)
 
     def test_an_unmounted_output_dir_falls_back_to_the_project_captures_folder(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -98,17 +100,38 @@ class ConfigHelpersTest(unittest.TestCase):
             self.assertEqual(captures_dir_from({"output_dir": str(unmounted)}, Path(tmp)),
                              Path(tmp) / "captures")
 
+    def test_an_unmounted_mountpoint_falls_back_even_though_the_directory_exists(self):
+        """Regression: an unmounted drive's mountpoint directory commonly still exists on
+        the internal disk, empty, even with nothing plugged in - must not be mistaken for
+        "usable" (that would silently write captures to the internal disk instead of
+        falling back). Caught on real Jetson hardware: /mnt/usbdrive existed and was
+        empty with nothing mounted there."""
+        with tempfile.TemporaryDirectory() as tmp:
+            usb = Path(tmp) / "usbdrive" / "captures"
+            usb.parent.mkdir()  # the empty mountpoint dir exists, but nothing is mounted
+            self.assertEqual(captures_dir_from({"output_dir": str(usb)}, Path(tmp)),
+                             Path(tmp) / "captures")
+
 
 class StorageProblemTest(unittest.TestCase):
-    def test_an_existing_folder_or_one_whose_parent_exists_is_fine(self):
+    def test_a_project_relative_folder_is_always_fine_even_before_first_capture(self):
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertIsNone(storage_problem(Path(tmp)))
-            self.assertIsNone(storage_problem(Path(tmp) / "captures"))  # will be created there
+            project_root = Path(tmp)
+            self.assertIsNone(storage_problem(project_root, project_root))
+            self.assertIsNone(storage_problem(project_root / "captures", project_root))
 
-    def test_a_missing_mount_is_reported_with_the_path_and_the_usb_hint(self):
+    def test_an_existing_non_default_folder_is_fine(self):
         with tempfile.TemporaryDirectory() as tmp:
-            missing = Path(tmp) / "usbdrive" / "captures"
-            message = storage_problem(missing)
+            existing = Path(tmp) / "usbdrive" / "captures"
+            existing.mkdir(parents=True)
+            self.assertIsNone(storage_problem(existing, Path("/some/other/project")))
+
+    def test_an_unmounted_mountpoint_is_reported_with_the_path_and_the_usb_hint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp)
+            missing = project_root / "usbdrive" / "captures"
+            missing.parent.mkdir()  # the empty mountpoint exists, but isn't mounted
+            message = storage_problem(missing, project_root)
             self.assertIn(str(missing), message)
             self.assertIn("USB drive", message)
 
