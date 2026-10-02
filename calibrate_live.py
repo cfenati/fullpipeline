@@ -356,6 +356,26 @@ def main() -> int:
                 quit_requested = True
                 break
 
+            session.poll()
+            if session.is_fitting():
+                # Skip the per-frame grab + two ChArUco detections entirely while a fit
+                # is running in the background thread: no capture can happen anyway
+                # (can_capture already requires not is_fitting()), and that per-frame
+                # work competes with the fit subprocess for CPU on a resource-constrained
+                # board (confirmed on a Jetson) - slowing the fit down and making the
+                # live preview lag, at the same time, for no benefit.
+                if gui is not None:
+                    gui.update(session, None, None, None)
+                    if gui.should_quit():
+                        quit_requested = True
+                        break
+                elif terminal_input is not None:
+                    if terminal_input.poll_key() == ord("q"):
+                        quit_requested = True
+                        break
+                time.sleep(GATE_CHECK_INTERVAL_S)
+                continue
+
             phase = session.phase
             need_a = phase in (Phase.CAM_A, Phase.STEREO)
             need_b = phase in (Phase.CAM_B, Phase.STEREO)
@@ -392,7 +412,6 @@ def main() -> int:
             preview_a = preview_frame(frame_a, preview_max_width) if frame_a is not None else None
             preview_b = preview_frame(frame_b, preview_max_width) if frame_b is not None else None
             gate = session.check_gate(preview_a, preview_b)
-            session.poll()
 
             now = time.time()
             paused = gui is not None and gui.is_paused()

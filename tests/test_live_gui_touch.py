@@ -7,6 +7,8 @@ from pathlib import Path
 from tkinter import ttk
 
 from touch_controls import confirming_command
+from calibration.live_capture import SequentialLiveCalibrationSession
+from calibration.target_board import TargetBoard
 
 
 @unittest.skipUnless(os.environ.get("DISPLAY"), "needs a display")
@@ -52,6 +54,24 @@ class LiveGuiTouchTest(unittest.TestCase):
     def test_pause_label_has_no_keyboard_hint_in_touch_mode(self):
         self.gui.toggle_pause()
         self.assertEqual(self.gui._pause_button.cget("text"), "Resume Auto-Capture")
+
+    def test_update_with_no_frames_while_fitting_shows_a_paused_placeholder(self):
+        """calibrate_live.py skips the per-frame grab + ChArUco detection entirely while
+        a fit is running (CPU contention with the fit subprocess, confirmed on a Jetson)
+        and calls update() with no frames instead - this must not crash, and both panels
+        (stereo phase: both cameras are in use) should say so, not "not used this phase"."""
+        board = TargetBoard(squares_x=11, squares_y=8, square_size_m=0.004, marker_size_m=0.002933)
+        with tempfile.TemporaryDirectory() as tmp:
+            session = SequentialLiveCalibrationSession(
+                board, Path(tmp) / "board.yaml", Path(tmp) / "captures", Path(tmp) / "results",
+            )
+            session._phase_index = 2  # Phase.STEREO
+            session._fitting = True
+
+            self.gui.update(session, None, None, None)
+
+            self.assertEqual(self.gui._panel_a.cget("text"), "fitting - preview paused")
+            self.assertEqual(self.gui._panel_b.cget("text"), "fitting - preview paused")
 
     def test_confirming_cancels_a_stale_revert_before_a_later_cycle_can_be_disturbed_by_it(self):
         """Regression test: a leftover root.after revert from a finished cycle

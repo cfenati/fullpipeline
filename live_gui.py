@@ -415,14 +415,17 @@ class LiveCaptureGUI:
                 if frame is not None:
                     self._draw_flash(frame)
 
+        fitting = session.is_fitting()
         if frame_a is not None:
             self._update_panel(self._panel_a, "preview_a", frame_a)
         else:
-            self._show_placeholder(self._panel_a, "not used this phase")
+            self._show_placeholder(
+                self._panel_a, "fitting - preview paused" if fitting and show_a else "not used this phase")
         if frame_b is not None:
             self._update_panel(self._panel_b, "preview_b", frame_b)
         else:
-            self._show_placeholder(self._panel_b, "not used this phase")
+            self._show_placeholder(
+                self._panel_b, "fitting - preview paused" if fitting and show_b else "not used this phase")
 
         self._update_result_panel(session)
         self.pump()
