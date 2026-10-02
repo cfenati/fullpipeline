@@ -43,7 +43,7 @@ class Stage:
 
 STAGES: Dict[str, Stage] = {
     "capture": Stage("capture", "Take images", "capture_pipeline.py", touch=True, naming=True),
-    "calibrate": Stage("calibrate", "Calibrate cameras", "calibrate_live.py", touch=True),
+    "calibrate": Stage("calibrate", "Calibration", "calibrate_live.py", touch=True),
     "depth": Stage("depth", "Measure wound depth", "measure_wound_depth.py",
                    touch=True, needs_session=True, window=True, result=True),
     "length": Stage("length", "Measure length", "measure_points.py",
@@ -80,7 +80,12 @@ def load_menu_config(project_root: Path) -> Dict[str, Any]:
 
 
 def captures_dir_from(config: Dict[str, Any], project_root: Path) -> Path:
-    return (project_root / config.get("output_dir", "captures")).resolve()
+    """``output_dir`` may point at removable storage that isn't mounted right now; fall back
+    to the project's own captures/ folder rather than blocking (see storage_problem())."""
+    configured = (project_root / config.get("output_dir", "captures")).resolve()
+    if configured.exists() or configured.parent.is_dir():
+        return configured
+    return (project_root / "captures").resolve()
 
 
 def results_dir_from(config: Dict[str, Any], project_root: Path) -> Path:
@@ -285,7 +290,7 @@ _FAILURE_HINTS: Tuple[Tuple[str, str], ...] = (
     ("Thermal config not found", "The thermal camera settings file is missing. Ask whoever maintains the rig."),
     ("No FLIR/Spinnaker cameras found", "The FLIR camera was not found. Check its USB cable, then try again."),
     ("Failed to grab from one or both RGB cameras", "The cameras stopped sending images. Check the USB cables, then try again."),
-    ("No stereo extrinsics", "This rig has not been calibrated yet. Run Calibrate cameras first."),
+    ("No stereo extrinsics", "This rig has not been calibrated yet. Run Calibration first."),
     ("is missing rgb_cam", "That capture is missing a camera image. Pick a different capture."),
     ("Failed to decode images", "That capture's images could not be read. Pick a different capture."),
 )

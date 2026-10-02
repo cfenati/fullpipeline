@@ -94,13 +94,14 @@ class MenuSmokeTest(unittest.TestCase):
             finally:
                 app.root.destroy()
 
-    def test_a_missing_usb_drive_is_reported_instead_of_being_silently_created(self):
+    def test_a_missing_usb_drive_falls_back_to_the_project_captures_folder(self):
         from menu import MenuApp
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "config.yaml").write_text(
                 f"output_dir: {Path(tmp) / 'unplugged' / 'captures'}\n", encoding="utf-8")
             app = MenuApp(project_root=Path(tmp), maximize=False)
             try:
+                self.assertEqual(app.captures_dir, Path(tmp) / "captures")
                 app.choose(STAGES["capture"])
                 app.root.update()
                 self.assertFalse((Path(tmp) / "unplugged").exists())
@@ -114,7 +115,8 @@ class MenuSmokeTest(unittest.TestCase):
                             pass
                         walk(child)
                 walk(app.body)
-                self.assertTrue(any("USB drive" in t for t in texts))
+                self.assertFalse(any("USB drive" in t for t in texts))
+                self.assertTrue(any("Name this capture" in t for t in texts))
             finally:
                 app.root.destroy()
 

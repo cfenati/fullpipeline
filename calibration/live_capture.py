@@ -795,9 +795,19 @@ class SequentialLiveCalibrationSession:
         nothing wrong) is a looser bar than a stereo fit actually needs, and
         a stereo phase built on an imprecise mono fit fails in a way that
         looks like a stereo-phase problem but isn't one.
+
+        Finishing the stereo phase (the whole session) is gated the same way:
+        a not-ready stereo fit - quality warnings, or stereo_calibrate.py
+        itself exiting non-zero - must not be able to reach is_done() and get
+        auto-promoted over the canonical calibration by promote_to_canonical().
         """
         if self.phase not in self._results:
             return False, "Run a fit first (Refit now) before continuing."
+        if self.phase is Phase.STEREO:
+            result = self._results[Phase.STEREO]
+            if not result.ready:
+                return False, "Stereo fit not ready - " + "; ".join(result.warnings)
+            return True, ""
         if self.phase is not Phase.CAM_B:
             return True, ""
 

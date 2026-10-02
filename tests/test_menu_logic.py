@@ -83,10 +83,20 @@ class ConfigHelpersTest(unittest.TestCase):
     def test_no_calibration_config_hides_nothing(self):
         self.assertEqual(hidden_capture_dirs({}, Path("/proj")), [])
 
-    def test_an_absolute_output_dir_is_kept_and_the_default_is_project_relative(self):
-        self.assertEqual(captures_dir_from({"output_dir": "/mnt/usbdrive/captures"}, Path("/proj")),
-                         Path("/mnt/usbdrive/captures"))
+    def test_the_default_is_project_relative(self):
         self.assertEqual(captures_dir_from({}, Path("/proj")), Path("/proj/captures"))
+
+    def test_an_absolute_output_dir_is_kept_when_usable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            usb = Path(tmp) / "usbdrive" / "captures"
+            usb.parent.mkdir()  # mounted: the parent exists even before first capture
+            self.assertEqual(captures_dir_from({"output_dir": str(usb)}, Path(tmp)), usb)
+
+    def test_an_unmounted_output_dir_falls_back_to_the_project_captures_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            unmounted = Path(tmp) / "usbdrive" / "captures"  # neither it nor its parent exists
+            self.assertEqual(captures_dir_from({"output_dir": str(unmounted)}, Path(tmp)),
+                             Path(tmp) / "captures")
 
 
 class StorageProblemTest(unittest.TestCase):

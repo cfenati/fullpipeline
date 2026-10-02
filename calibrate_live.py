@@ -35,9 +35,11 @@ from calibrate_cameras import (  # noqa: E402
     load_config as load_raw_config,
     resolve_path,
 )
-from calibration.opencv_calibrate import DEFAULT_MIN_CORNERS, CameraIntrinsics  # noqa: E402
+from calibration.opencv_calibrate import CameraIntrinsics  # noqa: E402
 from calibration.stereo import DEFAULT_MIN_SHARED_CORNERS, StereoExtrinsics  # noqa: E402
-from calibration.live_capture import Phase, SequentialLiveCalibrationSession  # noqa: E402
+from calibration.live_capture import (  # noqa: E402
+    THIN_VIEW_CORNER_FRACTION, Phase, SequentialLiveCalibrationSession,
+)
 from calibration.target_board import DEFAULT_BOARD_CONFIG, TargetBoard  # noqa: E402
 from capture_pipeline import TerminalInput, load_config as load_pipeline_config, preview_frame  # noqa: E402
 from cameras.rgb_camera import RGBCamera, controls_for  # noqa: E402
@@ -136,6 +138,47 @@ def review_and_prune(camera_a: str, camera_b: str, captures_dir: Path, output_ro
               f"--results {output_root} --count 5 --apply")
 
 
+def default_min_corners(board: TargetBoard) -> int:
+    """Live-session admission floor: half the board's corners, stricter than
+    calibrate_cameras.py's own DEFAULT_MIN_CORNERS - a thin/partial view under this is
+    rejected at capture time instead of counting toward the phase target and feeding the fit.
+    """
+    return int(board.total_corners * THIN_VIEW_CORNER_FRACTION)
+
+
+def promote_to_canonical(
+    camera_a: str, camera_b: str, output_root: Path, canonical_root: Path, run_timestamp: str,
+) -> Dict[str, Path]:
+    """Move a finished live run's results over the canonical calibration/results/ folders
+    that measure_wound_depth.py/measure_points.py/register_features.py read from by default.
+
+    Only reachable once can_advance() has let the session finish - the stereo phase (and so
+    the whole session) can't reach is_done() while its own fit isn't ready. One camera/pair at
+    a time, so a failure partway through (disk full, permissions) leaves whichever targets
+    weren't reached yet in their prior state instead of a half-promoted canonical calibration.
+
+    Returns the backup path for each name that had something to back up, so the caller can
+    report where the previous calibration went.
+    """
+    names = (camera_a, camera_b, f"stereo_{camera_a}_{camera_b}")
+    backups: Dict[str, Path] = {}
+    if output_root.resolve() == canonical_root.resolve():
+        return backups
+
+    for name in names:
+        source = output_root / name
+        if not source.is_dir():
+            continue
+        destination = canonical_root / name
+        if destination.exists():
+            backup_dir = canonical_root / f"backup_before_live_{run_timestamp}" / name
+            backup_dir.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(destination), str(backup_dir))
+            backups[name] = backup_dir
+        shutil.copytree(source, destination)
+    return backups
+
+
 def parse_args() -> argparse.Namespace:
     calibration_config = load_raw_config().get("geometric_calibration", {}) or {}
 
@@ -165,14 +208,19 @@ def parse_args() -> argparse.Namespace:
                               "explicitly to overwrite a specific location instead).")
     parser.add_argument("--interval", type=float, default=3.0,
                          help="Seconds between auto-capture attempts (default: %(default)s).")
-    parser.add_argument("--min-corners", type=int, default=DEFAULT_MIN_CORNERS,
-                         help="Minimum ChArUco corners per camera view (default: %(default)s).")
+    parser.add_argument("--min-corners", type=int, default=None,
+                         help="Minimum ChArUco corners per camera view to count toward the phase "
+                              "target (default: half the board's corners - a thinner/more-partial "
+                              "view is rejected at capture time instead of feeding a fit; this is "
+                              "stricter than the offline calibrate_cameras.py's own floor on purpose, "
+                              "since a run of thin views is the leading cause of a distortion "
+                              "coefficient blowing up despite a fine RMS).")
     parser.add_argument("--min-shared-corners", type=int, default=DEFAULT_MIN_SHARED_CORNERS,
                          help="Minimum corners shared by both cameras, stereo phase only "
                               "(default: %(default)s).")
     parser.add_argument("--mono-views", type=int, default=20,
                          help="Target view count for each intrinsics phase (default: %(default)s).")
-    parser.add_argument("--stereo-views", type=int, default=15,
+    parser.add_argument("--stereo-views", type=int, default=20,
                          help="Target view count for the stereo phase (default: %(default)s).")
     parser.add_argument("--top-up", type=int, default=5,
                          help="Extra views to capture when 'capture more' is requested after a "
@@ -225,14 +273,21 @@ def _discard_worst(session: SequentialLiveCalibrationSession, discard_count: int
 
 
 def _print_done(session: SequentialLiveCalibrationSession, args: argparse.Namespace,
-                 captures_dir: Path, output_root: Path) -> None:
-    print(f"\nDone. All three phases fit. Results written under {output_root}.")
-    print("Nothing under calibration/results/ or design/config/rig_as_built.yaml changed.")
-    print("Once you're happy with this result, promote it by re-running with the default output:")
-    print(f"  python calibrate_cameras.py --camera {args.camera_a} --in {captures_dir}")
-    print(f"  python calibrate_cameras.py --camera {args.camera_b} --in {captures_dir}")
-    print(f"  python stereo_calibrate.py --camera-a {args.camera_a} --camera-b {args.camera_b} "
-          f"--in {captures_dir}")
+                 captures_dir: Path, output_root: Path, canonical_root: Path,
+                 backups: Dict[str, Path]) -> None:
+    print(f"\nDone. All three phases fit and passed their quality gates. "
+          f"Raw run written under {output_root}.")
+    if output_root.resolve() == canonical_root.resolve():
+        print(f"That is already the canonical location ({canonical_root}) - nothing to promote.")
+    else:
+        print(f"Promoted to the canonical calibration at {canonical_root}:")
+        for name in (args.camera_a, args.camera_b, f"stereo_{args.camera_a}_{args.camera_b}"):
+            backup = backups.get(name)
+            if backup is not None:
+                print(f"  {name}: previous version backed up to {backup}")
+            else:
+                print(f"  {name}: written (nothing previous to back up)")
+        print("design/config/rig_as_built.yaml was not touched.")
 
 
 def main() -> int:
@@ -249,16 +304,18 @@ def main() -> int:
     board_path = resolve_path(args.board)
     board = TargetBoard.from_yaml(board_path)
     config = load_pipeline_config(args.config)
+    min_corners = args.min_corners if args.min_corners is not None else default_min_corners(board)
 
     print(f"Captures: {captures_dir}")
     print(f"Results will be written to: {output_root}")
     print(f"Target: {board.squares_x}x{board.squares_y} ChArUco, {board.dictionary}, "
           f"square={board.square_size_m * 1000:.1f} mm")
+    print(f"Minimum corners per view: {min_corners} of {board.total_corners}")
 
     session = SequentialLiveCalibrationSession(
         board, board_path, captures_dir, output_root,
         camera_a=args.camera_a, camera_b=args.camera_b,
-        min_corners=args.min_corners, min_shared_corners=args.min_shared_corners,
+        min_corners=min_corners, min_shared_corners=args.min_shared_corners,
         mono_target=args.mono_views, stereo_target=args.stereo_views, top_up=args.top_up,
         max_mono_rms_for_stereo=None if args.no_mono_quality_gate else args.max_mono_rms_for_stereo,
         min_coverage_fraction=None if args.no_mono_quality_gate else args.min_coverage_fraction,
@@ -415,7 +472,11 @@ def main() -> int:
             gui.close()
 
         if session.is_done():
-            _print_done(session, args, captures_dir, output_root)
+            canonical_root = resolve_path(output_base)
+            backups = promote_to_canonical(
+                args.camera_a, args.camera_b, output_root, canonical_root, run_timestamp,
+            )
+            _print_done(session, args, captures_dir, output_root, canonical_root, backups)
             review_and_prune(args.camera_a, args.camera_b, captures_dir, output_root)
         elif quit_requested:
             print(f"\nQuit before finishing all phases. Captured sessions remain in {captures_dir} - "

@@ -41,7 +41,12 @@ def load_config(config_path: Path) -> dict:
     with config_path.open("r", encoding="utf-8") as config_file:
         config = yaml.safe_load(config_file)
 
-    config["output_dir"] = (PROJECT_ROOT / config["output_dir"]).resolve()
+    output_dir = (PROJECT_ROOT / config["output_dir"]).resolve()
+    if not (output_dir.exists() or output_dir.parent.is_dir()):
+        # e.g. output_dir points at an unmounted USB drive - fall back to the project's
+        # own captures/ folder rather than mkdir(parents=True) creating a wrong-disk path.
+        output_dir = (PROJECT_ROOT / "captures").resolve()
+    config["output_dir"] = output_dir
     config["thermal"]["config_xml"] = (
         PROJECT_ROOT / config["thermal"]["config_xml"]
     ).resolve()
