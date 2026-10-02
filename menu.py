@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -38,7 +39,7 @@ from menu_logic import (
     load_menu_config, paginate, results_dir_from, sanitize_session_name, storage_problem,
     tail_lines, window_for_screen,
 )
-from touch_controls import apply_touch_style
+from touch_controls import apply_touch_style, confirming_command
 
 POLL_MS = 300
 FOLDERS_PER_PAGE = 8
@@ -188,13 +189,29 @@ class MenuApp:
         grid = ttk.Frame(self.body)
         grid.pack(fill=tk.BOTH, expand=True)
         for index, session in enumerate(chunk.items):
+            card = ttk.Frame(grid)
+            card.grid(row=index // 3, column=index % 3, sticky="nsew", padx=6, pady=6)
+            card.columnconfigure(0, weight=1)
             photo = self._load_photo(session.path / "rgb_cam1.jpg", THUMB_BOX)
-            button = ttk.Button(grid, text=session.display, style="Touch.TButton",
+            button = ttk.Button(card, text=session.display, style="Touch.TButton",
                                 command=lambda s=session: self.start_stage(stage, session=s.path))
             if photo is not None:
                 button.configure(image=photo, compound=tk.TOP)
-            button.grid(row=index // 3, column=index % 3, sticky="nsew", padx=6, pady=6)
+            button.grid(row=0, column=0, sticky="nsew")
+            delete_button = ttk.Button(card, text="Delete")
+            delete_button.configure(command=confirming_command(
+                self.root, delete_button, "Delete",
+                lambda s=session: self._delete_session(s, stage, folder, page)))
+            delete_button.grid(row=1, column=0, sticky="ew", pady=(4, 0))
         grid.columnconfigure((0, 1, 2), weight=1, uniform="cards")
+
+    def _delete_session(self, session: Session, stage: Stage, folder: str, page: int) -> None:
+        shutil.rmtree(session.path, ignore_errors=True)
+        members = [s for s in find_sessions(self.captures_dir, self.hidden_dirs) if s.folder == folder]
+        if members:
+            self.show_session_picker(stage, folder, page)
+        else:
+            self.show_session_picker(stage)
 
     def show_name_keyboard(self, stage: Stage) -> None:
         self._reset()
@@ -354,9 +371,18 @@ class MenuApp:
         if problem:  # never mkdir(parents=True) a missing mount point
             self.show_home(problem)
             return
+        self.captures_dir.mkdir(exist_ok=True)
+        opener = shutil.which("xdg-open")
+        if opener is None:
+            # A kiosk/touchscreen image often has no file manager installed at all, so
+            # xdg-open itself is missing - Popen would otherwise fail silently (stderr is
+            # discarded below) and look like the button does nothing. Show the path at
+            # least, since that's still useful without a GUI file browser available.
+            self.show_home(f"No file manager is available to open a folder.\n"
+                           f"Captures are at: {self.captures_dir}")
+            return
         try:
-            self.captures_dir.mkdir(exist_ok=True)
-            subprocess.Popen(["xdg-open", str(self.captures_dir)],
+            subprocess.Popen([opener, str(self.captures_dir)],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError as error:
             self.show_home(f"Could not open the output folder: {error}")

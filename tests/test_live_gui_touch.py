@@ -6,6 +6,8 @@ import unittest
 from pathlib import Path
 from tkinter import ttk
 
+from touch_controls import confirming_command
+
 
 @unittest.skipUnless(os.environ.get("DISPLAY"), "needs a display")
 class LiveGuiTouchTest(unittest.TestCase):
@@ -39,7 +41,7 @@ class LiveGuiTouchTest(unittest.TestCase):
     def test_destructive_button_needs_a_second_tap(self):
         called = []
         button = ttk.Button(self.gui.root, text="Discard")
-        handler = self.gui._confirming(button, "Discard", lambda: called.append(1))
+        handler = confirming_command(self.gui.root, button, "Discard", lambda: called.append(1))
         handler()
         self.assertEqual(called, [])
         self.assertEqual(button.cget("text"), "Tap again to confirm")
@@ -85,7 +87,7 @@ class LiveGuiTouchTest(unittest.TestCase):
 
         calls = []
         button = ttk.Button(self.gui.root, text="Discard")
-        handler = self.gui._confirming(button, "Discard", lambda: calls.append(1))
+        handler = confirming_command(self.gui.root, button, "Discard", lambda: calls.append(1))
 
         handler()  # cycle 1: first tap arms
         self.assertEqual(len(scheduled), 1)

@@ -20,7 +20,7 @@ import numpy as np
 from PIL import Image, ImageTk
 
 from gui import fit_to_box
-from touch_controls import CONFIRM_TIMEOUT_S, ConfirmGate, apply_touch_style
+from touch_controls import apply_touch_style, confirming_command
 from calibration.live_capture import (
     GateStatus,
     PHASE_ORDER,
@@ -28,8 +28,10 @@ from calibration.live_capture import (
     SequentialLiveCalibrationSession,
 )
 
-# How long the "just captured" flash border stays on screen after a save.
-FLASH_DURATION_S = 0.6
+# How long the "just captured" flash border stays on screen after a save. The stereo
+# phase detects on both cameras every loop iteration (vs. one for a mono phase), so its
+# render cadence is less regular - a longer window makes the flash harder to miss there.
+FLASH_DURATION_S = 1.2
 
 COLOR_OPEN = (0, 200, 0)      # BGR green: gate open, this frame will be saved
 COLOR_PARTIAL = (0, 165, 255)  # BGR amber: board seen here, but gate not open yet
@@ -179,7 +181,9 @@ class LiveCaptureGUI:
 
         def add(row: ttk.Frame, text: str, command, confirm: bool = False) -> ttk.Button:
             button = ttk.Button(row, text=text, style="Touch.TButton")
-            button.configure(command=self._confirming(button, text, command) if confirm else command)
+            button.configure(
+                command=confirming_command(self.root, button, text, command) if confirm else command
+            )
             button.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=4)
             return button
 
@@ -190,23 +194,6 @@ class LiveCaptureGUI:
         add(bottom, "Discard Worst", self.request_discard_worst, confirm=True)
         add(bottom, "Discard & Restart", self.request_discard, confirm=True)
         add(bottom, "Quit", self.request_quit)
-
-    def _confirming(self, button: ttk.Button, label: str, action: Callable[[], None]) -> Callable[[], None]:
-        """Wrap ``action`` so the first tap only relabels the button; a second tap runs it."""
-        gate = ConfirmGate()
-        pending: list = []
-
-        def handler() -> None:
-            if pending:
-                self.root.after_cancel(pending.pop())
-            if gate.press():
-                button.configure(text=label)
-                action()
-                return
-            button.configure(text="Tap again to confirm")
-            pending.append(self.root.after(int(CONFIRM_TIMEOUT_S * 1000) + 100,
-                            lambda: button.configure(text=label)))
-        return handler
 
     def _create_preview_panel(self, parent: ttk.Frame, title: str) -> tuple:
         frame = ttk.LabelFrame(parent, text=title, padding=6)

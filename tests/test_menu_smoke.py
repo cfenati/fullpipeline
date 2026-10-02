@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from tkinter import ttk
 
 import cv2
 import numpy as np
@@ -71,6 +72,32 @@ class MenuSmokeTest(unittest.TestCase):
         app.show_result(STAGES["depth"], None)
         app.root.update()
         self.assertIn("Done", self._texts())
+
+    def test_delete_button_removes_a_session_after_two_taps(self):
+        app = self.app
+        app.show_session_picker(STAGES["depth"], folder="wound_a")
+        app.root.update()
+
+        def find_delete_buttons(widget):
+            found = []
+            for child in widget.winfo_children():
+                if isinstance(child, ttk.Button) and child.cget("text") == "Delete":
+                    found.append(child)
+                found.extend(find_delete_buttons(child))
+            return found
+
+        wound_a = self.root_dir / "captures" / "wound_a"
+        self.assertEqual(len(list(wound_a.iterdir())), 2)
+
+        button = find_delete_buttons(app.body)[0]
+        button.invoke()  # first tap: arms, does not delete
+        app.root.update()
+        self.assertEqual(button.cget("text"), "Tap again to confirm")
+        self.assertEqual(len(list(wound_a.iterdir())), 2)
+
+        button.invoke()  # second tap: confirms
+        app.root.update()
+        self.assertEqual(len(list(wound_a.iterdir())), 1)
 
     def test_empty_captures_shows_a_message_not_a_crash(self):
         from menu import MenuApp

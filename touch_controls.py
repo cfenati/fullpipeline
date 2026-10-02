@@ -54,6 +54,31 @@ class ConfirmGate:
         self._armed_at = None
 
 
+def confirming_command(widget: Any, button: Any, label: str,
+                       action: Callable[[], None]) -> Callable[[], None]:
+    """Wrap a Tk button's ``action`` so a first tap only relabels it; a second tap within
+    the timeout runs it and a timeout with no second tap reverts the label.
+
+    ``widget`` is any Tk widget used only for its ``.after``/``.after_cancel`` scheduling -
+    ``button`` itself works. Shared by live_gui.py's toolbar and menu.py's session-delete
+    buttons so the two destructive-action touch patterns don't drift apart.
+    """
+    gate = ConfirmGate()
+    pending: List[Any] = []
+
+    def handler() -> None:
+        if pending:
+            widget.after_cancel(pending.pop())
+        if gate.press():
+            button.configure(text=label)
+            action()
+            return
+        button.configure(text="Tap again to confirm")
+        pending.append(widget.after(int(CONFIRM_TIMEOUT_S * 1000) + 100,
+                       lambda: button.configure(text=label)))
+    return handler
+
+
 class Debouncer:
     """Rejects events that arrive within ``min_gap_s`` of the last ``mark()``."""
 
