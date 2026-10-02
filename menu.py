@@ -12,6 +12,7 @@ down. Only one stage runs at a time, so two stages can never fight over the came
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -22,6 +23,18 @@ from tkinter import ttk
 from typing import Callable, List, Optional, Tuple
 
 from PIL import Image, ImageTk
+
+# Works around a glibc heap-corruption bug ("malloc_consolidate(): unaligned fastbin
+# chunk detected") in calibrate_cameras.py/stereo_calibrate.py's native (OpenCV/numpy)
+# cleanup code, after all of that run's real work already succeeded. Confirmed present
+# both on the host (numpy 1.24.4 + unbounded opencv-contrib-python 5.0.0) AND inside the
+# irimager-test container (numpy 2.5.3 + the same opencv 5.0.0) - MALLOC_CHECK_=0 only
+# looked like a fix because it tells glibc to silently ignore corruption it still finds,
+# not because the corruption wasn't happening; leaving it fully unset lets the default
+# allocator's own unconditional consistency check catch it and abort, confirmed on real
+# hardware. Every stage runs as a subprocess (see module docstring), so setting this
+# before any subprocess.Popen call propagates it down the whole chain.
+os.environ.setdefault("MALLOC_CHECK_", "3")
 
 from menu_logic import (
     PROJECT_ROOT, STAGE_ORDER, STAGES, Page, Report, Session, Stage, StageRun,
