@@ -183,6 +183,7 @@ class SequentialLiveCalibrationSession:
         camera_a: str = "rgb_cam1",
         camera_b: str = "rgb_cam2",
         min_corners: int = DEFAULT_MIN_CORNERS,
+        stereo_min_corners: int = DEFAULT_MIN_CORNERS,
         min_shared_corners: int = DEFAULT_MIN_SHARED_CORNERS,
         min_spread: float = DEFAULT_MIN_SPREAD,
         mono_target: int = 20,
@@ -200,6 +201,7 @@ class SequentialLiveCalibrationSession:
         self.camera_a = camera_a
         self.camera_b = camera_b
         self.min_corners = min_corners
+        self.stereo_min_corners = stereo_min_corners
         self.min_shared_corners = min_shared_corners
         self.min_spread = min_spread
         self.top_up = max(1, top_up)
@@ -354,11 +356,16 @@ class SequentialLiveCalibrationSession:
         if self.phase is Phase.CAM_B:
             return self._check_gate_mono(preview_b, is_camera_a=False)
 
+        # Deliberately NOT self.min_corners: that bar was raised specifically to reject
+        # thin mono-phase views feeding intrinsics (see THIN_VIEW_CORNER_FRACTION). The
+        # stereo phase's real quality control is min_shared_corners below; gating each
+        # camera's raw detection at the same high bar first made simultaneous two-camera
+        # board visibility far harder to hit live, with no accuracy benefit to show for it.
         raw_a = detect_board_in_frame(
-            preview_a, self._detector, self._object_points, self.min_corners, self.min_spread
+            preview_a, self._detector, self._object_points, self.stereo_min_corners, self.min_spread
         )
         raw_b = detect_board_in_frame(
-            preview_b, self._detector, self._object_points, self.min_corners, self.min_spread
+            preview_b, self._detector, self._object_points, self.stereo_min_corners, self.min_spread
         )
         left = self._wrap(raw_a, Path("<live>") / "preview_a") if raw_a.ok else None
         right = self._wrap(raw_b, Path("<live>") / "preview_b") if raw_b.ok else None

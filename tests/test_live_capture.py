@@ -4,6 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from calibration.opencv_calibrate import DEFAULT_MIN_CORNERS
+
 from calibrate_live import default_min_corners, promote_to_canonical
 from calibration.live_capture import Phase, PhaseFitResult, SequentialLiveCalibrationSession
 from calibration.target_board import TargetBoard
@@ -22,6 +24,22 @@ class DefaultMinCornersTest(unittest.TestCase):
         # 11x8 squares -> 10x7 interior corners = 70; half of that is 35.
         self.assertEqual(BOARD.total_corners, 70)
         self.assertEqual(default_min_corners(BOARD), 35)
+
+
+class StereoMinCornersTest(unittest.TestCase):
+    def test_raising_mono_min_corners_does_not_raise_the_stereo_floor(self):
+        """Regression: the stricter mono-phase thin-view floor must not also gate the
+        stereo phase's per-camera check - that made simultaneous two-camera board
+        visibility far harder to hit live, with no accuracy benefit (min_shared_corners
+        is the stereo phase's real quality control, untouched by this)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            session = SequentialLiveCalibrationSession(
+                BOARD, Path(tmp) / "board.yaml", Path(tmp) / "captures", Path(tmp) / "results",
+                min_corners=default_min_corners(BOARD),
+            )
+            self.assertEqual(session.min_corners, 35)
+            self.assertEqual(session.stereo_min_corners, DEFAULT_MIN_CORNERS)
+            self.assertLess(session.stereo_min_corners, session.min_corners)
 
 
 class CanAdvanceTest(unittest.TestCase):

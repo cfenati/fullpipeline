@@ -12,6 +12,7 @@ down. Only one stage runs at a time, so two stages can never fight over the came
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import time
@@ -21,6 +22,14 @@ from tkinter import ttk
 from typing import Callable, List, Optional, Tuple
 
 from PIL import Image, ImageTk
+
+# Works around a glibc heap-corruption bug ("malloc_consolidate(): unaligned fastbin
+# chunk detected") hit on Jetson hardware, inside calibrate_cameras.py/stereo_calibrate.py's
+# native (OpenCV/numpy) cleanup code, after all of that run's real work already succeeded -
+# confirmed fixed by MALLOC_CHECK_=3 on real hardware. Every stage runs as a subprocess (see
+# module docstring), so setting this before any subprocess.Popen call propagates it down
+# the whole chain; harmless on platforms that never hit this (the dev machine included).
+os.environ.setdefault("MALLOC_CHECK_", "3")
 
 from menu_logic import (
     PROJECT_ROOT, STAGE_ORDER, STAGES, Page, Report, Session, Stage, StageRun,

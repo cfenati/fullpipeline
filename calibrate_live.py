@@ -35,7 +35,7 @@ from calibrate_cameras import (  # noqa: E402
     load_config as load_raw_config,
     resolve_path,
 )
-from calibration.opencv_calibrate import CameraIntrinsics  # noqa: E402
+from calibration.opencv_calibrate import DEFAULT_MIN_CORNERS, CameraIntrinsics  # noqa: E402
 from calibration.stereo import DEFAULT_MIN_SHARED_CORNERS, StereoExtrinsics  # noqa: E402
 from calibration.live_capture import (  # noqa: E402
     THIN_VIEW_CORNER_FRACTION, Phase, SequentialLiveCalibrationSession,
@@ -315,7 +315,8 @@ def main() -> int:
     session = SequentialLiveCalibrationSession(
         board, board_path, captures_dir, output_root,
         camera_a=args.camera_a, camera_b=args.camera_b,
-        min_corners=min_corners, min_shared_corners=args.min_shared_corners,
+        min_corners=min_corners, stereo_min_corners=DEFAULT_MIN_CORNERS,
+        min_shared_corners=args.min_shared_corners,
         mono_target=args.mono_views, stereo_target=args.stereo_views, top_up=args.top_up,
         max_mono_rms_for_stereo=None if args.no_mono_quality_gate else args.max_mono_rms_for_stereo,
         min_coverage_fraction=None if args.no_mono_quality_gate else args.min_coverage_fraction,
